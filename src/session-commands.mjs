@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { LiaisonError, remoteCodeOf } from './errors.mjs'
+import { hostTempWritableRoots, pathsOverlap } from './host-writable-roots.mjs'
 import { normalizeSessionTitle } from './title.mjs'
 
 function normalizeModel(model) {
@@ -24,6 +25,12 @@ function sameModel(left, right) {
 
 const HISTORY_PAGE_MESSAGES = 500
 const HISTORY_MAX_PAGES = 100
+const REQUEST_EVIDENCE_TYPES = new Set([
+  'assistant/attempt',
+  'assistant/message',
+  'tool/call',
+  'tool/result',
+])
 
 function eventList(page) {
   return page.records.map(record => record.event)
@@ -91,6 +98,7 @@ export class SessionCommands {
     }
     const expectedModel = normalizeModel(model)
     const canonicalCwd = await this.#canonicalDirectory(cwd)
+    await this.#assertIsolatableWorkspace(canonicalCwd, delegationId)
 
     const catalog = await this.#adapter.modelCatalog()
     this.#requireAdvertised(catalog, expectedModel)
@@ -350,6 +358,17 @@ export class SessionCommands {
         { sessionId, requestId, requestSeq: user.seq },
       )
     }
+    const evidence = pages.flat().find(event =>
+      event.seq > user.seq
+      && event.seq <= turnEnd.seq
+      && REQUEST_EVIDENCE_TYPES.has(event.type))
+    if (evidence === undefined) {
+      throw new LiaisonError(
+        'delegation/request-not-proven',
+        `request "${requestId}" has no persisted model request evidence in its turn`,
+        { sessionId, requestId, requestSeq: user.seq, turnEndSeq: turnEnd.seq },
+      )
+    }
 
     const pinned = []
     let pinnedBefore
@@ -402,6 +421,35 @@ export class SessionCommands {
       )
     }
     return canonical
+  }
+
+  /**
+   * Reject an implicit shared-temp workspace or one nested with another active
+   * delegation. Multiple delegations may intentionally share the exact same
+   * workspace root; distinct overlapping roots would break write isolation.
+   */
+  async #assertIsolatableWorkspace(cwd, delegationId) {
+    for (const tempRoot of await hostTempWritableRoots()) {
+      if (pathsOverlap(cwd, tempRoot)) {
+        throw new LiaisonError(
+          'delegation/workspace-unisolatable',
+          `delegation working directory "${cwd}" overlaps globally writable temp root "${tempRoot}"`,
+          { cwd, tempRoot },
+        )
+      }
+    }
+    const records = await this.#registry.list()
+    for (const record of records) {
+      if (record.delegationId === delegationId || record.cwd === cwd) continue
+      if (record.state !== 'creating' && record.state !== 'ready') continue
+      if (pathsOverlap(cwd, record.cwd)) {
+        throw new LiaisonError(
+          'delegation/workspace-overlap',
+          `delegation working directory "${cwd}" overlaps active delegation "${record.delegationId}" at "${record.cwd}"`,
+          { cwd, conflictingDelegationId: record.delegationId, conflictingCwd: record.cwd },
+        )
+      }
+    }
   }
 
   #requireAdvertised(catalog, model) {

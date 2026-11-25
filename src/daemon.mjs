@@ -262,12 +262,14 @@ async function dispatch(request) {
 async function shutdown(code = 0) {
   if (shuttingDown) return
   shuttingDown = true
+  await delegationRegistry.close().catch(() => {})
   await operator.close().catch(() => {})
   await server?.close().catch(() => {})
   process.exit(code)
 }
 
 async function main() {
+  await delegationRegistry.acquireWriter()
   server = await startIpcServer({
     stateDir,
     socketPath,

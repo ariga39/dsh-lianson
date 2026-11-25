@@ -10,6 +10,7 @@ import { DelegationRegistry } from '../src/delegation-registry.mjs'
 import { SessionCommands } from '../src/session-commands.mjs'
 import { createOperatorAdapter, createRemoteAdapter } from '../src/operator-adapter.mjs'
 import { startScriptedAgentServer } from './support/scripted-agent-server.mjs'
+import { createScratchRoot } from './support/scratch.mjs'
 import { startDshWeb } from './support/dsh-web-harness.mjs'
 import { connectOperator } from './support/operator.mjs'
 
@@ -87,7 +88,7 @@ async function sessionsInWorkspace(adapter, cwd) {
 test('slice2: delegation ledger, conflict-safe creation, per-session models, idempotent prompts, worktree isolation', {
   timeout: 900_000,
 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-slice2-'))
+  const root = await createScratchRoot('slice2-delegation-')
   const workspaceDir = join(root, 'workspace')
   const canonicalWorkspace = join(await realpath(root), 'workspace')
   const dshHome = join(root, 'home')
@@ -244,6 +245,33 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     assert.equal(record.sessionId, sessionId)
     assert.equal(record.substitutedSessionId, undefined)
     assert.equal(record.returnedSessionId, undefined)
+  })
+
+  await t.test('shared temp roots and overlapping workspaces fail before creation', async () => {
+    const { registry, commands } = newCommands('workspace-roots')
+    const shared = await mkdtemp(join(tmpdir(), 'dsh-shared-temp-'))
+    t.after(async () => { await rm(shared, { recursive: true, force: true }) })
+    const tempParams = input('shared-temp', { cwd: shared })
+    await assert.rejects(commands.createDelegation(tempParams), errorCode('delegation/workspace-unisolatable'))
+    assert.equal(await registry.get(tempParams.delegationId), undefined,
+      'the shared-temp rejection must precede workspace/session creation')
+
+    const overlapRoot = join(root, 'overlap-root')
+    const outer = join(overlapRoot, 'outer')
+    const nested = join(outer, 'nested')
+    await mkdir(nested, { recursive: true })
+    await commands.createDelegation(input('overlap-outer', { cwd: outer }))
+    await assert.rejects(
+      commands.createDelegation(input('overlap-nested', { cwd: nested })),
+      errorCode('delegation/workspace-overlap'),
+    )
+    await assert.rejects(
+      commands.createDelegation(input('overlap-parent', { cwd: overlapRoot })),
+      errorCode('delegation/workspace-overlap'),
+    )
+
+    const same = await commands.createDelegation(input('overlap-same', { cwd: outer }))
+    assert.equal(same.state, 'ready', 'multiple delegations may intentionally share one workspace root')
   })
 
   await t.test('silent Host session substitution is rejected without binding', async () => {

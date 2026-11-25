@@ -2,7 +2,7 @@ import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
 import { spawnSync } from 'node:child_process'
 import { mkdir, mkdtemp, readFile, realpath, rm, writeFile } from 'node:fs/promises'
-import { homedir, tmpdir } from 'node:os'
+import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { loadUpstream } from '../src/upstream.mjs'
@@ -13,6 +13,7 @@ import { call } from '../src/ipc-client.mjs'
 import { startScriptedAgentServer } from './support/scripted-agent-server.mjs'
 import { createKeylessEnvironment } from './support/keyless-environment.mjs'
 import { dropIpcResponse } from './support/ipc-loss.mjs'
+import { createScratchRoot } from './support/scratch.mjs'
 import { runCli, sleep, waitForExit } from './support/cli-harness.mjs'
 
 function eventsOf(page) {
@@ -46,7 +47,7 @@ function git(args, cwd) {
 test('slice2 integration: normal CLI and IPC through a real daemon with same-id replay', {
   timeout: 900_000,
 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-slice2-cli-'))
+  const root = await createScratchRoot('slice2-cli-')
   const mock = await startScriptedAgentServer()
   const fixture = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
   const stateDir = join(root, 'state')

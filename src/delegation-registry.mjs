@@ -4,11 +4,17 @@ import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { LiaisonError } from './errors.mjs'
+import { tryAcquireKernelWriterLock } from './kernel-lock.mjs'
 
 const ACTIVE_STATES = new Set(['creating', 'ready'])
+const MAX_CREATE_REPLAYS = 4_096
 
 function clone(value) {
   return structuredClone(value)
+}
+
+function cloneMap(map) {
+  return new Map([...map.entries()].map(([key, value]) => [key, clone(value)]))
 }
 
 function normalizeModel(model) {
@@ -30,11 +36,11 @@ function emptyLedger() {
 }
 
 /**
- * A single-process ledger with a serialized write queue.
+ * A durable ledger with one lifetime writer per ledger file.
  *
- * Every mutation is persisted to a `0600` temporary file, fsynced, and renamed
- * over the ledger before the caller is allowed to issue the corresponding Host
- * RPC. Reads never observe a partially written JSON document.
+ * Mutations are made on a draft copy, atomically persisted, and only then
+ * published in memory. A write failure therefore leaves both the retry view and
+ * the restarted view at the previous durable state.
  */
 export class DelegationRegistry {
   #filePath
@@ -42,6 +48,8 @@ export class DelegationRegistry {
   #createReplays = new Map()
   #loadPromise
   #tail = Promise.resolve()
+  #readOnly = false
+  #writerLock = null
 
   /** @param {{ filePath: string }} options - absolute ledger path. */
   constructor({ filePath }) {
@@ -52,6 +60,41 @@ export class DelegationRegistry {
   /** @returns the ledger path. */
   get filePath() {
     return this.#filePath
+  }
+
+  /** @returns whether this process failed to acquire the lifetime writer lock. */
+  get readOnly() {
+    return this.#readOnly
+  }
+
+  /**
+   * Acquire the one lifetime writer lock shared by every runtime directory.
+   * When another process owns it, reads continue from fresh disk state and
+   * mutations fail closed.
+   * @returns true when this registry became the writer.
+   */
+  async acquireWriter() {
+    if (this.#writerLock !== null) return true
+    await mkdir(dirname(this.#filePath), { recursive: true, mode: 0o700 })
+    const lock = await tryAcquireKernelWriterLock(`${this.#filePath}.lock`)
+    if (!lock.acquired) {
+      this.#readOnly = true
+      this.#loadPromise = undefined
+      await this.#load()
+      return false
+    }
+    this.#writerLock = lock
+    this.#readOnly = false
+    this.#loadPromise = undefined
+    await this.#load()
+    return true
+  }
+
+  /** Release the lifetime writer lock. Process exit releases it as well. */
+  async close() {
+    const lock = this.#writerLock
+    this.#writerLock = null
+    await lock?.release()
   }
 
   /** @param {string} delegationId - delegation identity. @returns a copy or undefined. */
@@ -84,8 +127,6 @@ export class DelegationRegistry {
 
   /**
    * Find the ready delegation bound to one Host session id.
-   * Interaction routing and state observation use this narrower lookup so a
-   * creating, attach-failed, or conflicted record is never treated as bound.
    * @param {string} sessionId - Host session identity.
    * @returns a copy or undefined.
    */
@@ -105,9 +146,11 @@ export class DelegationRegistry {
   async beginCreate(input) {
     return this.#enqueue(async () => {
       await this.#load()
+      this.#assertWritable()
+      const draft = this.#draft()
       const now = new Date().toISOString()
       const expectedModel = normalizeModel(input.expectedModel)
-      const existing = this.#records.get(input.delegationId)
+      const existing = draft.records.get(input.delegationId)
       if (existing !== undefined) {
         if (existing.state === 'attach-failed') {
           throw new LiaisonError(
@@ -141,11 +184,11 @@ export class DelegationRegistry {
         }
         this.#assertRetryMatches(existing, { ...input, expectedModel })
         existing.updatedAt = now
-        await this.#persist()
+        await this.#commit(draft)
         return clone(existing)
       }
 
-      const titleConflict = [...this.#records.values()].find(candidate =>
+      const titleConflict = [...draft.records.values()].find(candidate =>
         candidate.workspaceId === input.workspaceId
         && candidate.title === input.title
         && ACTIVE_STATES.has(candidate.state))
@@ -169,15 +212,14 @@ export class DelegationRegistry {
         createdAt: now,
         updatedAt: now,
       }
-      this.#records.set(record.delegationId, record)
-      await this.#persist()
+      draft.records.set(record.delegationId, record)
+      await this.#commit(draft)
       return clone(record)
     })
   }
 
   /**
-   * Record a Host identity conflict, preserving the requested session id.
-   * A late result never changes a ready binding.
+   * Record a Host identity conflict. A late result never changes a ready binding.
    * @param {string} delegationId - delegation identity.
    * @param {{ upstreamCode?: string, message?: string, substitutedSessionId?: string }} conflict - conflict details.
    * @returns the persisted record.
@@ -185,7 +227,9 @@ export class DelegationRegistry {
   async markConflict(delegationId, conflict) {
     return this.#enqueue(async () => {
       await this.#load()
-      const record = this.#require(delegationId)
+      this.#assertWritable()
+      const draft = this.#draft()
+      const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') return clone(record)
       record.state = 'conflict'
       record.updatedAt = new Date().toISOString()
@@ -197,7 +241,7 @@ export class DelegationRegistry {
         record.substitutedSessionId = conflict.substitutedSessionId
         record.returnedSessionId = conflict.substitutedSessionId
       }
-      await this.#persist()
+      await this.#commit(draft)
       return clone(record)
     })
   }
@@ -211,7 +255,9 @@ export class DelegationRegistry {
   async markAttachFailed(delegationId, failure) {
     return this.#enqueue(async () => {
       await this.#load()
-      const record = this.#require(delegationId)
+      this.#assertWritable()
+      const draft = this.#draft()
+      const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') return clone(record)
       if (failure.sessionId !== undefined && failure.sessionId !== record.sessionId) {
         record.state = 'conflict'
@@ -222,7 +268,7 @@ export class DelegationRegistry {
           code: 'session/workspace-attach-failed',
           message: failure.message ?? 'session was created but could not attach to its workspace',
         }
-        await this.#persist()
+        await this.#commit(draft)
         throw new LiaisonError(
           'delegation/session-substituted',
           `Host attached session "${failure.sessionId}" after requesting "${record.sessionId}"; `
@@ -242,7 +288,7 @@ export class DelegationRegistry {
         code: 'session/workspace-attach-failed',
         message: failure.message ?? 'session was created but could not attach to its workspace',
       }
-      await this.#persist()
+      await this.#commit(draft)
       return clone(record)
     })
   }
@@ -257,17 +303,19 @@ export class DelegationRegistry {
   async markReady(delegationId, replay = {}) {
     return this.#enqueue(async () => {
       await this.#load()
-      const record = this.#require(delegationId)
+      this.#assertWritable()
+      const draft = this.#draft()
+      const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') {
         if (replay.ipcRequestId !== undefined && replay.ipcFingerprint !== undefined
-          && !this.#createReplays.has(replay.ipcRequestId)) {
-          this.#createReplays.set(replay.ipcRequestId, {
+          && !draft.createReplays.has(replay.ipcRequestId)) {
+          draft.createReplays.set(replay.ipcRequestId, {
             requestId: replay.ipcRequestId,
             fingerprint: replay.ipcFingerprint,
             response: clone(record),
           })
-          this.#pruneCreateReplays()
-          await this.#persist()
+          this.#pruneCreateReplays(draft.createReplays)
+          await this.#commit(draft)
         }
         return clone(record)
       }
@@ -276,14 +324,14 @@ export class DelegationRegistry {
       delete record.lastError
       const response = clone(record)
       if (replay.ipcRequestId !== undefined && replay.ipcFingerprint !== undefined) {
-        this.#createReplays.set(replay.ipcRequestId, {
+        draft.createReplays.set(replay.ipcRequestId, {
           requestId: replay.ipcRequestId,
           fingerprint: replay.ipcFingerprint,
           response,
         })
-        this.#pruneCreateReplays()
+        this.#pruneCreateReplays(draft.createReplays)
       }
-      await this.#persist()
+      await this.#commit(draft)
       return clone(record)
     })
   }
@@ -299,12 +347,6 @@ export class DelegationRegistry {
     return entry === undefined ? undefined : clone(entry)
   }
 
-  #pruneCreateReplays() {
-    while (this.#createReplays.size > 4_096) {
-      this.#createReplays.delete(this.#createReplays.keys().next().value)
-    }
-  }
-
   /**
    * Persist the model proven by a request header.
    * @param {string} delegationId - delegation identity.
@@ -314,12 +356,43 @@ export class DelegationRegistry {
   async setVerifiedModel(delegationId, model) {
     return this.#enqueue(async () => {
       await this.#load()
-      const record = this.#require(delegationId)
+      this.#assertWritable()
+      const draft = this.#draft()
+      const record = this.#require(draft.records, delegationId)
       record.verifiedModel = normalizeModel(model)
       record.updatedAt = new Date().toISOString()
-      await this.#persist()
+      await this.#commit(draft)
       return clone(record)
     })
+  }
+
+  #draft() {
+    return {
+      records: cloneMap(this.#records),
+      createReplays: cloneMap(this.#createReplays),
+    }
+  }
+
+  #assertWritable() {
+    if (!this.#readOnly) return
+    throw new LiaisonError(
+      'delegation/ledger-readonly',
+      `delegation ledger "${this.#filePath}" is owned by another writer`,
+      { filePath: this.#filePath },
+    )
+  }
+
+  async #commit(draft) {
+    this.#assertWritable()
+    await this.#persist(draft.records, draft.createReplays)
+    this.#records = draft.records
+    this.#createReplays = draft.createReplays
+  }
+
+  #pruneCreateReplays(replays) {
+    while (replays.size > MAX_CREATE_REPLAYS) {
+      replays.delete(replays.keys().next().value)
+    }
   }
 
   #assertRetryMatches(record, input) {
@@ -355,8 +428,8 @@ export class DelegationRegistry {
     }
   }
 
-  #require(delegationId) {
-    const record = this.#records.get(delegationId)
+  #require(records, delegationId) {
+    const record = records.get(delegationId)
     if (record === undefined) {
       throw new LiaisonError(
         'delegation/not-found',
@@ -374,54 +447,65 @@ export class DelegationRegistry {
   }
 
   async #load() {
-    this.#loadPromise ??= this.#read()
+    if (this.#readOnly) {
+      await this.#readInto()
+      return
+    }
+    this.#loadPromise ??= this.#readInto()
     return this.#loadPromise
   }
 
-  async #read() {
+  async #readInto() {
+    const records = new Map()
+    const createReplays = new Map()
     let text
     try {
       text = await readFile(this.#filePath, 'utf8')
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error
+      this.#records = records
+      this.#createReplays = createReplays
       return
     }
-    if (text.trim() === '') return
-    let parsed
-    try {
-      parsed = JSON.parse(text)
-    } catch (error) {
-      throw new LiaisonError('delegation/ledger-corrupt', `cannot parse delegation ledger ${this.#filePath}`, {}, { cause: error })
-    }
-    if (parsed?.version !== 1 || !Array.isArray(parsed.delegations)) {
-      throw new LiaisonError('delegation/ledger-corrupt', `unsupported delegation ledger ${this.#filePath}`)
-    }
-    for (const record of parsed.delegations) {
-      if (typeof record?.delegationId !== 'string' || typeof record?.sessionId !== 'string') {
-        throw new LiaisonError('delegation/ledger-corrupt', `invalid delegation record in ${this.#filePath}`)
+    if (text.trim() !== '') {
+      let parsed
+      try {
+        parsed = JSON.parse(text)
+      } catch (error) {
+        throw new LiaisonError('delegation/ledger-corrupt', `cannot parse delegation ledger ${this.#filePath}`, {}, { cause: error })
       }
-      if (this.#records.has(record.delegationId)) {
-        throw new LiaisonError('delegation/ledger-corrupt', `duplicate delegation id "${record.delegationId}"`)
+      if (parsed?.version !== 1 || !Array.isArray(parsed.delegations)) {
+        throw new LiaisonError('delegation/ledger-corrupt', `unsupported delegation ledger ${this.#filePath}`)
       }
-      this.#records.set(record.delegationId, record)
-    }
-    if (Array.isArray(parsed.createReplays)) {
-      for (const entry of parsed.createReplays) {
-        if (typeof entry?.requestId !== 'string' || typeof entry?.fingerprint !== 'string') continue
-        if (entry.response === null || typeof entry.response !== 'object') continue
-        this.#createReplays.set(entry.requestId, entry)
+      for (const record of parsed.delegations) {
+        if (typeof record?.delegationId !== 'string' || typeof record?.sessionId !== 'string') {
+          throw new LiaisonError('delegation/ledger-corrupt', `invalid delegation record in ${this.#filePath}`)
+        }
+        if (records.has(record.delegationId)) {
+          throw new LiaisonError('delegation/ledger-corrupt', `duplicate delegation id "${record.delegationId}"`)
+        }
+        records.set(record.delegationId, record)
+      }
+      if (Array.isArray(parsed.createReplays)) {
+        for (const entry of parsed.createReplays) {
+          if (typeof entry?.requestId !== 'string' || typeof entry?.fingerprint !== 'string') continue
+          if (entry.response === null || typeof entry.response !== 'object') continue
+          createReplays.set(entry.requestId, entry)
+        }
       }
     }
+    this.#records = records
+    this.#createReplays = createReplays
   }
 
-  async #persist() {
+  async #persist(records, createReplays) {
     const directory = dirname(this.#filePath)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const temporary = `${this.#filePath}.${process.pid}.${randomUUID()}.tmp`
     const body = `${JSON.stringify({
       ...emptyLedger(),
-      delegations: [...this.#records.values()],
-      createReplays: [...this.#createReplays.values()],
+      delegations: [...records.values()],
+      createReplays: [...createReplays.values()],
     }, null, 2)}\n`
     let handle
     try {
