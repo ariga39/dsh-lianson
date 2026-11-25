@@ -152,6 +152,51 @@ for (const field of ['status', 'body', 'cacheControl', 'contentType']) {
 }
 
 test(
+  'truncated response body rejects promptly and reaps the fixture server',
+  { timeout: 20_000 },
+  async (t) => {
+    const fixture = await withFixture(t);
+    const worktree = await fixture.addWorktree('truncated-body');
+    await fixture.mutateServer(worktree, MUTATIONS.truncatedBody);
+
+    let serverPid;
+    const startedAt = Date.now();
+    await assert.rejects(
+      captureObservations(worktree, {
+        onServerStart: ({ pid }) => {
+          serverPid = pid;
+        },
+      }),
+      (error) =>
+        error.message.includes('truncated response') &&
+        error.message.includes('GET /health'),
+    );
+    const captureElapsed = Date.now() - startedAt;
+    assert.ok(captureElapsed < 4_000, `truncated capture took ${captureElapsed}ms`);
+    assert.ok(Number.isInteger(serverPid) && serverPid > 0, 'onServerStart must expose a pid');
+    assert.throws(() => process.kill(serverPid, 0), { code: 'ESRCH' });
+
+    // The standalone CLI must fail fast, after the same finally-based cleanup.
+    const cliStartedAt = Date.now();
+    let cliError;
+    try {
+      await execFileAsync(
+        process.execPath,
+        [path.join(fixture.directory, 'verify-138.mjs'), '--dir', worktree],
+        { encoding: 'utf8', env: childTestEnvironment() },
+      );
+    } catch (error) {
+      cliError = error;
+    }
+    const cliElapsed = Date.now() - cliStartedAt;
+    assert.ok(cliError, 'verifier CLI must exit nonzero for a truncated response');
+    assert.equal(cliError.code, 1);
+    assert.match(`${cliError.stdout}${cliError.stderr}`, /truncated response for GET \/health/);
+    assert.ok(cliElapsed < 4_000, `truncated CLI took ${cliElapsed}ms`);
+  },
+);
+
+test(
   'independent modular refactor and legacy test migration preserve 138/138',
   { timeout: 30_000 },
   async (t) => {

@@ -16,10 +16,8 @@
  */
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { once } from 'node:events';
 import { writeFile } from 'node:fs/promises';
 import path from 'node:path';
-import { setTimeout as delay } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
 
 export const METHODS = ['GET', 'POST', 'DELETE'];
@@ -65,6 +63,16 @@ export function observationKey(observation) {
 
 function request({ port, path: requestPath, method, headers }) {
   return new Promise((resolve, reject) => {
+    const label = `${method} ${requestPath}`;
+    let settled = false;
+
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      req.destroy();
+      reject(error instanceof Error ? error : new Error(String(error)));
+    };
+
     const req = http.request(
       {
         host: '127.0.0.1',
@@ -77,19 +85,47 @@ function request({ port, path: requestPath, method, headers }) {
       (res) => {
         const chunks = [];
         res.on('data', (chunk) => chunks.push(chunk));
+        res.on('aborted', () => {
+          fail(
+            new Error(
+              `truncated response for ${label}: connection aborted before the body completed`,
+            ),
+          );
+        });
+        res.on('error', (error) => {
+          fail(new Error(`response stream failed for ${label}: ${error.message}`));
+        });
         res.on('end', () => {
+          if (settled) return;
+          if (!res.complete) {
+            fail(new Error(`truncated response for ${label}: incomplete body`));
+            return;
+          }
+          settled = true;
           resolve({
             status: res.statusCode,
             headers: res.headers,
             body: Buffer.concat(chunks).toString('utf8'),
           });
         });
+        res.on('close', () => {
+          if (!settled && !res.complete) {
+            fail(
+              new Error(
+                `truncated response for ${label}: connection closed before the body completed`,
+              ),
+            );
+          }
+        });
       },
     );
+
     req.setTimeout(REQUEST_TIMEOUT_MS, () => {
-      req.destroy(new Error(`request timed out: ${method} ${requestPath}`));
+      req.destroy(new Error(`request timed out: ${label}`));
     });
-    req.on('error', reject);
+    req.on('error', (error) => {
+      fail(new Error(`request failed for ${label}: ${error.message}`));
+    });
     req.end();
   });
 }
@@ -149,23 +185,42 @@ function startServer(directory) {
   });
 }
 
+function waitForExit(child, timeoutMs) {
+  return new Promise((resolve) => {
+    if (child.exitCode !== null || child.signalCode !== null) {
+      resolve(true);
+      return;
+    }
+
+    const onExit = () => {
+      clearTimeout(timer);
+      resolve(true);
+    };
+    const timer = setTimeout(() => {
+      child.off('exit', onExit);
+      resolve(false);
+    }, timeoutMs);
+    child.once('exit', onExit);
+  });
+}
+
 async function stopServer(child) {
   if (child.exitCode !== null || child.signalCode !== null) return;
   child.kill('SIGTERM');
-  await Promise.race([once(child, 'exit'), delay(SHUTDOWN_TIMEOUT_MS)]);
-  if (child.exitCode !== null || child.signalCode !== null) return;
+  if (await waitForExit(child, SHUTDOWN_TIMEOUT_MS)) return;
   child.kill('SIGKILL');
-  await Promise.race([once(child, 'exit'), delay(SHUTDOWN_TIMEOUT_MS)]);
+  await waitForExit(child, SHUTDOWN_TIMEOUT_MS);
 }
 
 /**
  * Capture all 138 observations from a fixture directory by running its server
  * over real HTTP.
  */
-export async function captureObservations(directory) {
+export async function captureObservations(directory, options = {}) {
   const { child, port } = await startServer(directory);
   const observations = [];
   try {
+    options.onServerStart?.({ pid: child.pid, port });
     for (const requestPath of PATHS) {
       for (const method of METHODS) {
         for (const auth of AUTH_STATES) {

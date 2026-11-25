@@ -32,6 +32,30 @@ export const MUTATIONS = {
     replace:
       "json(200, { session: 'fixture-token', user: 1 }, 'no-store', 'text/plain; charset=utf-8')",
   },
+  /**
+   * Real transport failure: commit a Content-Length larger than the body, flush
+   * a partial JSON payload, then destroy the socket. The verifier must reject
+   * (not crash) and still reap its child server.
+   */
+  truncatedBody: {
+    find: `export function handleRequest(request, response) {
+  const { pathname } = new URL(request.url, 'http://127.0.0.1');
+`,
+    replace: `export function handleRequest(request, response) {
+  const { pathname } = new URL(request.url, 'http://127.0.0.1');
+  if (pathname === '/health') {
+    response.writeHead(200, {
+      'cache-control': 'no-store',
+      'content-type': 'application/json; charset=utf-8',
+      'content-length': '64',
+    });
+    response.write('{"status":', () => {
+      response.destroy();
+    });
+    return;
+  }
+`,
+  },
 };
 
 export function applyServerMutation(source, mutation) {
