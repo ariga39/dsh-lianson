@@ -8,7 +8,7 @@ import { loadUpstream } from '../src/upstream.mjs'
 import { startScriptedMessagesServer } from './support/scripted-messages-server.mjs'
 import { startDshWeb } from './support/dsh-web-harness.mjs'
 import { connectOperator } from './support/operator.mjs'
-import { openSessionInBrowser } from './support/browser.mjs'
+import { assertNoWriterHeld, assertNoWriterHeldInPage, openSessionInBrowser } from './support/browser.mjs'
 
 const PROMPT = 'SLICE0_KEYLESS_PROMPT: read the fixture and ask to proceed.'
 const PREFIX = 'SLICE0_STREAM_PREFIX '
@@ -37,6 +37,7 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   const question = Promise.withResolvers()
   const answerGate = Promise.withResolvers()
   const pageErrors = []
+  const consoleMessages = []
   let mock
   let upstream
   let web
@@ -136,7 +137,7 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   await withTimeout(question.promise, 30_000, 'question event')
   browser = await upstream.chromium.launch()
   let page = await openSessionInBrowser({
-    browser, launchUrl: web.launchUrl, sessionId, title, workspaceTitle: workspace.title, pageErrors,
+    browser, launchUrl: web.launchUrl, sessionId, title, workspaceTitle: workspace.title, pageErrors, consoleMessages,
   })
   await page.getByText(PROMPT, { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 })
   assert.equal(await page.getByText(PROMPT, { exact: true }).count(), 1, 'original prompt appears once')
@@ -152,6 +153,7 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   const fixture = page.getByText(FIXTURE_CONTENT, { exact: false }).first()
   await fixture.waitFor({ state: 'visible', timeout: 30_000 })
   await page.getByText('Proceed with slice0?', { exact: true }).first().waitFor({ state: 'visible', timeout: 30_000 })
+  await assertNoWriterHeldInPage(page, consoleMessages, 'browser visit 1')
   await page.close()
   await browser.close()
   browser = undefined
@@ -161,10 +163,11 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
 
   browser = await upstream.chromium.launch()
   page = await openSessionInBrowser({
-    browser, launchUrl: web.launchUrl, sessionId, title, workspaceTitle: workspace.title, pageErrors,
+    browser, launchUrl: web.launchUrl, sessionId, title, workspaceTitle: workspace.title, pageErrors, consoleMessages,
   })
   const streaming = page.locator('[data-streaming="true"]').filter({ hasText: PREFIX })
   await streaming.first().waitFor({ state: 'visible', timeout: 30_000 })
+  await assertNoWriterHeldInPage(page, consoleMessages, 'browser visit 2')
   await page.close()
   await browser.close()
   browser = undefined
@@ -173,6 +176,8 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   const idle = unwrap(await remote.session.wait({ sessionId, afterSeq: before.cursor, timeoutMs: 60_000 }))
   assert.equal(idle.reason, 'idle')
   assert.deepEqual(pageErrors, [], 'both browser visits must produce no page errors')
+  assertNoWriterHeld({ consoleMessages, uiTexts: [], label: 'both browser visits' })
+  assert.doesNotMatch(web.output(), /session\/writer-held|writer[- ]held/iu, 'Host logs must not report writer contention')
 
   assert.equal(mock.requests.length, 3, 'exactly three scripted model requests')
   assert.match(mock.requests[0].url, /^\/v1\/messages$/u)

@@ -63,7 +63,7 @@ export async function startDshWeb({ root, cwd, dshHome, overlayPath }) {
     startupMs: Math.round(performance.now() - started),
     output: () => output,
     close: async () => {
-      if (child.exitCode !== null) return
+      if (child.exitCode !== null || child.signalCode !== null) return
       const exited = new Promise(resolve => child.once('exit', resolve))
       child.kill('SIGTERM')
       const forced = setTimeout(() => child.kill('SIGKILL'), 10_000)

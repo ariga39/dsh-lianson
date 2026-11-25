@@ -1,8 +1,8 @@
 import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { join } from 'node:path'
 
-export const REPO_ROOT = new URL('..', import.meta.url).pathname
+export const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 export const UPSTREAM_ROOT = join(REPO_ROOT, 'deepseek-harness')
 
 const ANCHORS = {

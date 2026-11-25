@@ -31,8 +31,8 @@ function output(command, args, options = {}) {
   return result.stdout.trim()
 }
 
-function pnpm(args) {
-  run('corepack', ['pnpm', ...args], { cwd: UPSTREAM })
+function pnpm(args, options = {}) {
+  run('corepack', ['pnpm', ...args], { cwd: UPSTREAM, ...options })
 }
 
 function hasNamedFile(path, name) {
@@ -84,7 +84,7 @@ if (head !== COMMIT) throw new Error(`upstream HEAD is ${head}, expected ${COMMI
 const dirty = output('git', ['-C', UPSTREAM, 'status', '--porcelain'])
 if (dirty !== '') throw new Error(`upstream checkout is dirty:\n${dirty}`)
 
-pnpm(['install', '--frozen-lockfile'])
+pnpm(['install', '--frozen-lockfile'], { env: { ...process.env, CI: 'true' } })
 
 const platformPackage = join(UPSTREAM, 'native/system/packages', `${process.platform}-${process.arch}`)
 const missing = ARTIFACTS.filter(path => !existsSync(join(UPSTREAM, path)))
