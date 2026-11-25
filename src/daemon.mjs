@@ -113,24 +113,30 @@ async function dispatch(request) {
       }
     }
     if (key === 'host.stop') {
-      return await exclusive(async () => {
-        const keep = params.stopHost === false
-        const previous = host
-        const stopped = keep
-          ? { stopped: false, reason: 'kept', pid: previous?.pid ?? null }
-          : await manager.stopHost()
-        await operator.close()
-        host = null
-        return {
-          envelope: success(command, {
-            daemonPid: process.pid,
-            hostPid: stopped.pid ?? previous?.pid ?? null,
-            stoppedHost: stopped.stopped,
-            stopReason: stopped.reason,
-          }, id),
-          shutdown: true,
-        }
-      })
+      const keep = params.stopHost === false
+      const previous = host
+      // Close first: this aborts any persistent background reconnect before the
+      // stop path waits on process or filesystem state.
+      await operator.close()
+      const stopped = keep
+        ? await manager.inspectHost({ probe: false }).catch(() => null).then(hostInfo => ({
+          stopped: false,
+          reason: 'kept',
+          pid: hostInfo?.pid ?? previous?.pid ?? null,
+          retained: false,
+        }))
+        : await manager.stopHost()
+      host = null
+      return {
+        envelope: success(command, {
+          daemonPid: process.pid,
+          hostPid: stopped.pid ?? previous?.pid ?? null,
+          stoppedHost: stopped.stopped,
+          stopReason: stopped.reason,
+          stopRetained: stopped.retained === true,
+        }, id),
+        shutdown: true,
+      }
     }
     return { envelope: failure(command, {
       code: 'UNKNOWN_COMMAND',

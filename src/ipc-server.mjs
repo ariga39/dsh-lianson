@@ -3,7 +3,7 @@
 import { createServer } from 'node:net'
 import { chmod, lstat, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
-import { FileLock, ensurePrivateDir, resolveStateDir } from './host-manager.mjs'
+import { createLock, ensurePrivateDir, resolveStateDir } from './host-manager.mjs'
 import { probe } from './ipc-client.mjs'
 import { failure } from './ipc-protocol.mjs'
 import { redactSecrets } from './redaction.mjs'
@@ -31,7 +31,7 @@ export async function startIpcServer({
   onShutdown,
 }) {
   await ensurePrivateDir(stateDir)
-  const lock = new FileLock(join(stateDir, 'daemon.lock'))
+  const lock = await createLock(join(stateDir, 'daemon.lock'))
   let release
   try {
     // The winning daemon holds this lock for its whole lifetime. A second
@@ -67,7 +67,10 @@ export async function startIpcServer({
       if (error?.code !== 'ENOENT') throw error
     }
 
+    const connections = new Set()
     const server = createServer(socket => {
+      connections.add(socket)
+      socket.once('close', () => { connections.delete(socket) })
       let buffer = ''
       let handled = false
       socket.setEncoding('utf8')
@@ -108,6 +111,7 @@ export async function startIpcServer({
           const envelope = outcome?.envelope ?? outcome
           const responseLine = `${JSON.stringify(envelope)}\n`
           if (outcome?.shutdown === true) {
+            await withdraw()
             socket.end(responseLine, () => { setImmediate(() => { void onShutdown?.() }) })
           } else {
             socket.end(responseLine)
@@ -136,24 +140,35 @@ export async function startIpcServer({
     await chmod(socketPath, 0o600)
     const identity = await lstat(socketPath)
     let closed = false
+    let withdrawn = false
+    let closeComplete = Promise.resolve()
+    const withdraw = async () => {
+      if (withdrawn) return
+      withdrawn = true
+      if (server.listening) {
+        closeComplete = new Promise(resolve => { server.close(() => resolve()) })
+      }
+      try {
+        const current = await lstat(socketPath)
+        if (current.ino === identity.ino) await unlink(socketPath)
+      } catch (error) {
+        if (error?.code !== 'ENOENT') throw error
+      }
+    }
     retainLock = true
 
     return {
       reused: false,
       socketPath,
       server,
+      withdraw,
       close: async () => {
         if (closed) return
         closed = true
         try {
-          server.closeAllConnections?.()
-          await new Promise(resolve => server.close(() => resolve()))
-          try {
-            const current = await lstat(socketPath)
-            if (current.ino === identity.ino) await unlink(socketPath)
-          } catch (error) {
-            if (error?.code !== 'ENOENT') throw error
-          }
+          await withdraw()
+          for (const socket of connections) socket.destroy()
+          await closeComplete
         } finally {
           await releaseLock()
         }

@@ -63,6 +63,7 @@ export class OperatorConnection {
     reconnectDelayMs = 0,
     reconnectMaxDelayMs = 1_000,
     readyTimeoutMs = 30_000,
+    foregroundWaitMs = 10_000,
   } = {}) {
     this.host = host
     this.hostManager = hostManager
@@ -73,6 +74,7 @@ export class OperatorConnection {
     this.reconnectDelayMs = reconnectDelayMs
     this.reconnectMaxDelayMs = reconnectMaxDelayMs
     this.readyTimeoutMs = readyTimeoutMs
+    this.foregroundWaitMs = foregroundWaitMs
 
     this.generation = undefined
     this.opening = undefined
@@ -126,11 +128,40 @@ export class OperatorConnection {
     return host
   }
 
-  async ensureConnected() {
+  async ensureConnected({ timeoutMs = this.foregroundWaitMs } = {}) {
     if (this.stopping) throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
-    if (this.reconnectPromise !== undefined) await this.reconnectPromise
+    if (this.reconnectPromise !== undefined) {
+      await this.#waitForReconnect(this.reconnectPromise, timeoutMs)
+      if (this.generation?.ready === true) return
+    }
     if (this.generation?.ready === true) return
-    await this.#scheduleReconnect(new LiaisonError('OPERATOR_DISCONNECTED', 'Operator is not connected'))
+    await this.#waitForReconnect(
+      this.#scheduleReconnect(new LiaisonError('OPERATOR_DISCONNECTED', 'Operator is not connected')),
+      timeoutMs,
+    )
+  }
+
+  async #waitForReconnect(promise, timeoutMs) {
+    if (timeoutMs === undefined || timeoutMs <= 0) return promise
+    let timer
+    let abort
+    try {
+      return await Promise.race([
+        promise,
+        new Promise((_resolve, reject) => {
+          timer = setTimeout(() => {
+            reject(new LiaisonError('OPERATOR_RECONNECTING',
+              'Operator is still reconnecting in the background'))
+          }, timeoutMs)
+          timer.unref?.()
+          abort = () => reject(new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed'))
+          this.lifecycle.signal.addEventListener('abort', abort, { once: true })
+        }),
+      ])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (abort !== undefined) this.lifecycle.signal.removeEventListener('abort', abort)
+    }
   }
 
   /**

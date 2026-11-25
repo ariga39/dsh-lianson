@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { HostManager, resolveStateDir } from './host-manager.mjs'
+import { HostManager, createLock, resolveStateDir } from './host-manager.mjs'
 import { call, probe } from './ipc-client.mjs'
 import { failure } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
@@ -98,6 +98,42 @@ async function stopWithoutDaemon({ stateDir, keepHost }) {
     hostPid: stopped.pid ?? null,
     stoppedHost: stopped.stopped,
     stopReason: stopped.reason,
+    stopRetained: stopped.retained === true,
+  }
+}
+
+async function stopWithOwnership({ socketPath, stateDir, keepHost }) {
+  const lock = await createLock(join(stateDir, 'daemon.lock'))
+  const deadline = Date.now() + 15_000
+  while (true) {
+    if (await probe(socketPath, 500)) {
+      return await call(socketPath, {
+        command: 'host stop',
+        params: { stopHost: !keepHost },
+        timeoutMs: STOP_TIMEOUT_MS,
+      })
+    }
+    let release
+    try {
+      release = await lock.acquire({ timeoutMs: 0 })
+    } catch (error) {
+      if (error?.code !== 'HOST_LOCK_TIMEOUT') throw error
+      if (Date.now() >= deadline) {
+        throw new LiaisonError('DAEMON_STARTING',
+          'A daemon is starting but did not expose its socket; refusing to race it')
+      }
+      await sleep(100)
+      continue
+    }
+    try {
+      return {
+        ok: true,
+        command: 'host stop',
+        data: await stopWithoutDaemon({ stateDir, keepHost }),
+      }
+    } finally {
+      await release()
+    }
   }
 }
 
@@ -131,23 +167,19 @@ async function execute(argv, io) {
 
   let envelope
   try {
-    if (action === 'stop' && !(await probe(socketPath, 1_000))) {
-      envelope = {
-        ok: true,
-        command,
-        data: await stopWithoutDaemon({
-          stateDir,
-          keepHost: values['keep-host'] === true,
-        }),
-      }
+    if (action === 'stop') {
+      envelope = await stopWithOwnership({
+        socketPath,
+        stateDir,
+        keepHost: values['keep-host'] === true,
+      })
     } else {
       await ensureDaemon(socketPath)
       if (action === 'status') params.ensure = values.ensure === true
-      if (action === 'stop') params.stopHost = values['keep-host'] !== true
       envelope = await call(socketPath, {
         command,
         params,
-        timeoutMs: action === 'stop' ? STOP_TIMEOUT_MS : START_TIMEOUT_MS,
+        timeoutMs: START_TIMEOUT_MS,
       })
     }
   } catch (error) {

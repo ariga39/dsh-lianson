@@ -2,15 +2,17 @@
 
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { chmod, link, lstat, mkdir, open, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { chmod, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
+import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
 import { basename, dirname, join, resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
 
 export const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 export const DSH_BIN = join(REPO_ROOT, 'deepseek-harness/apps/cli/lib/bin.js')
+const FLOCK_ANCHOR = join(REPO_ROOT, 'deepseek-harness/native/system/packages/entry/package.json')
 export const HOST_MARKER_ENV = 'DSH_LIAISON_HOST_MARKER'
 const RECORD_VERSION = 1
 const LOCK_VERSION = 1
@@ -164,14 +166,37 @@ async function readProcStat(pid, procRoot = '/proc') {
 }
 
 /** Stable process identity: boot id plus /proc start time, resistant to PID reuse. */
-export async function processStartToken(pid) {
-  const info = await readProcStat(pid)
+export async function processStartToken(pid, procRoot = '/proc') {
+  const info = await readProcStat(pid, procRoot)
   if (info?.startTime === undefined) return undefined
   return `${await bootId()}:${info.startTime}`
 }
 
 async function readProcessEnvironment(pid, procRoot = '/proc') {
   try { return await readFile(join(procRoot, String(pid), 'environ'), 'utf8') } catch { return undefined }
+}
+
+/**
+ * Find live processes carrying one launch marker. Only used for a write-ahead
+ * record whose pid update was lost; multiple matches are deliberately ambiguous.
+ */
+async function findProcessesByMarker(marker, procRoot = '/proc') {
+  if (!await procfsAvailable(procRoot)) return { ok: false, reason: 'unsupported', matches: [] }
+  let names
+  try { names = await readdir(procRoot) } catch { return { ok: false, reason: 'unsupported', matches: [] } }
+  const matches = []
+  for (const name of names) {
+    if (!/^\d+$/u.test(name)) continue
+    const pid = Number(name)
+    if (pid <= 0) continue
+    const environment = await readProcessEnvironment(pid, procRoot)
+    if (environment === undefined) continue
+    if (!environment.split('\0').includes(`${HOST_MARKER_ENV}=${marker}`)) continue
+    const info = await readProcStat(pid, procRoot).catch(() => undefined)
+    if (info === undefined || info.state === 'Z') continue
+    matches.push({ pid, procStart: `${await bootId()}:${info.startTime}` })
+  }
+  return { ok: true, reason: 'found', matches }
 }
 
 /**
@@ -224,8 +249,37 @@ export async function inspectProcess(record, { procRoot = '/proc' } = {}) {
 
 function validateHostRecord(value) {
   if (!isRecord(value)) throw new LiaisonError('HOST_RECORD_INVALID', 'Host record is not an object')
+  const state = value.state
+  if (state !== 'launching' && state !== 'starting' && state !== 'ready') {
+    throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no valid state')
+  }
+  const marker = value.marker
+  if (typeof marker !== 'string' || marker === '') {
+    throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no launch marker')
+  }
+  const dshHome = typeof value.dshHome === 'string' ? resolve(value.dshHome) : undefined
+  if (dshHome === undefined) throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no dshHome')
+
+  const record = {
+    ...value,
+    version: RECORD_VERSION,
+    state,
+    marker,
+    dshHome,
+    cwd: typeof value.cwd === 'string' ? resolve(value.cwd) : undefined,
+    requestedPort: Number.isInteger(value.requestedPort) ? value.requestedPort : undefined,
+    startedAt: typeof value.startedAt === 'string' ? value.startedAt : new Date().toISOString(),
+    pid: undefined,
+    procStart: typeof value.procStart === 'string' ? value.procStart : undefined,
+  }
+
+  if (state === 'launching') return record
+
   const pid = Number(value.pid)
   if (!Number.isInteger(pid) || pid <= 0) throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no valid pid')
+  record.pid = pid
+  if (state === 'starting') return record
+
   const origin = assertLoopbackOrigin(value.origin)
   const port = Number(value.port ?? new URL(origin).port)
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
@@ -235,133 +289,97 @@ function validateHostRecord(value) {
   if (typeof launchToken !== 'string' || launchToken.length < 16) {
     throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no launch token')
   }
-  const dshHome = typeof value.dshHome === 'string' ? resolve(value.dshHome) : undefined
-  if (dshHome === undefined) throw new LiaisonError('HOST_RECORD_INVALID', 'Host record has no dshHome')
-  return {
-    ...value,
-    version: RECORD_VERSION,
-    pid,
-    origin,
-    port,
-    launchToken,
-    dshHome,
-    startedAt: typeof value.startedAt === 'string' ? value.startedAt : new Date().toISOString(),
-    marker: typeof value.marker === 'string' ? value.marker : undefined,
-    procStart: typeof value.procStart === 'string' ? value.procStart : undefined,
-  }
+  return { ...record, origin, port, launchToken }
 }
 
-/** One atomically-created lock file with stale-PID recovery. */
-export class FileLock {
-  constructor(path) {
+let cachedFlock
+async function loadFlock() {
+  if (cachedFlock !== undefined) return cachedFlock
+  try {
+    const resolved = createRequire(FLOCK_ANCHOR).resolve('@deepseek-ai/node-addon-system/flock')
+    cachedFlock = await import(pathToFileURL(resolved).href)
+  } catch {
+    cachedFlock = null
+  }
+  return cachedFlock
+}
+
+/** Kernel-released flock on a persistent lock file. The path is never unlinked. */
+class FlockLock {
+  constructor(path, flock) {
     this.path = path
-    this.content = undefined
+    this.flock = flock
   }
 
   async acquire({ timeoutMs = 30_000 } = {}) {
+    const handle = await open(this.path, 'a+', 0o600)
+    await chmod(this.path, 0o600).catch(() => {})
     const started = Date.now()
-    const identity = {
-      version: LOCK_VERSION,
-      pid: process.pid,
-      procStart: await processStartToken(process.pid),
-      createdAt: new Date().toISOString(),
-    }
-    const content = `${JSON.stringify(identity)}\n`
-    while (true) {
-      const temporary = join(dirname(this.path),
-        `.${basename(this.path)}.${String(process.pid)}.${randomUUID()}.tmp`)
-      let created = false
-      try {
-        // Build the complete owner record before publishing the lock name, then
-        // publish it with the OS hard-link primitive. A contender can never see
-        // an empty lock owned by a live writer.
-        const handle = await open(temporary, 'wx', 0o600)
+    try {
+      while (true) {
         try {
-          await handle.writeFile(content)
-          await handle.sync()
-        } finally {
-          await handle.close()
-        }
-        try {
-          await link(temporary, this.path)
-          created = true
+          await this.flock.tryLockExclusive(handle.fd)
+          break
         } catch (error) {
-          if (error?.code !== 'EEXIST') throw error
+          if (error?.code !== 'EAGAIN' && error?.code !== 'EWOULDBLOCK') throw error
+          if (Date.now() - started >= timeoutMs) {
+            throw new LiaisonError('HOST_LOCK_TIMEOUT', 'Timed out waiting for the Host lock')
+          }
+          await sleep(25)
         }
-      } catch (error) {
-        if (error?.code !== 'EEXIST') throw error
-      } finally {
-        await unlink(temporary).catch(() => {})
       }
-      if (created) {
-        this.content = content
-        return () => this.release()
+      const identity = {
+        version: LOCK_VERSION,
+        pid: process.pid,
+        procStart: await processStartToken(process.pid),
+        createdAt: new Date().toISOString(),
       }
-      if (await this.#clearStale()) continue
-      if (Date.now() - started >= timeoutMs) {
-        throw new LiaisonError('HOST_LOCK_TIMEOUT', 'Timed out waiting for the Host lock')
+      await handle.truncate(0)
+      await handle.writeFile(`${JSON.stringify(identity)}\n`)
+      let released = false
+      return async () => {
+        if (released) return
+        released = true
+        await handle.close().catch(() => {})
       }
-      await sleep(25)
-    }
-  }
-
-  async release() {
-    if (this.content === undefined) return
-    const content = this.content
-    this.content = undefined
-    await removeIfUnchanged(this.path, content).catch(() => {})
-  }
-
-  async #clearStale() {
-    let snapshot
-    let raw
-    try {
-      snapshot = await lstat(this.path)
-      raw = await readFile(this.path, 'utf8')
     } catch (error) {
-      return error?.code === 'ENOENT'
-    }
-    let parsed
-    try { parsed = JSON.parse(raw) } catch { parsed = undefined }
-    const incomplete = parsed === undefined
-      || !Number.isInteger(parsed.pid)
-      || parsed.pid <= 0
-    // Atomic hard-link publication never exposes a partial record. A legacy or
-    // externally created empty record gets a short grace period so a concurrent
-    // writer is never mistaken for a dead holder; after that it is reclaimable.
-    const stale = incomplete
-      ? Date.now() - snapshot.mtimeMs > 10_000
-      : await this.#ownerGone(parsed)
-    if (!stale) return false
-    try {
-      const current = await lstat(this.path)
-      if (current.ino !== snapshot.ino) return true
-      if (await readFile(this.path, 'utf8') !== raw) return true
-      await unlink(this.path)
-      return true
-    } catch (error) {
-      return error?.code === 'ENOENT'
+      await handle.close().catch(() => {})
+      throw error
     }
   }
+}
 
-  async #ownerGone(owner) {
+/**
+ * The only lock protocol: the pinned upstream kernel flock. The lock file is
+ * persistent; process death releases the kernel lock. A host without the
+ * public native entry fails clearly instead of switching protocols.
+ */
+export async function createLock(path) {
+  const flock = await loadFlock()
+  if (flock === null) {
+    throw new LiaisonError('LOCK_UNAVAILABLE',
+      'Pinned kernel flock support (@deepseek-ai/node-addon-system/flock) is unavailable')
+  }
+  let handle
+  try {
+    handle = await open(path, 'a+', 0o600)
+    await chmod(path, 0o600).catch(() => {})
     try {
-      if (!await procfsAvailable()) {
-        return await pidLiveness(owner.pid) === 'dead'
+      await flock.tryLockExclusive(handle.fd)
+    } catch (error) {
+      if (error?.code !== 'EAGAIN' && error?.code !== 'EWOULDBLOCK') {
+        throw new LiaisonError('LOCK_UNAVAILABLE',
+          `Kernel flock probe failed: ${String(error?.code ?? error?.message ?? 'unknown')}`)
       }
-      const info = await readProcStat(owner.pid)
-      if (info === undefined || info.state === 'Z') {
-        return await pidLiveness(owner.pid) === 'dead'
-      }
-      if (typeof owner.procStart === 'string') {
-        const current = `${await bootId()}:${info.startTime}`
-        if (current !== undefined && current !== owner.procStart) return true
-      }
-      return false
-    } catch {
-      // An unreadable process entry never proves the holder exited.
-      return await pidLiveness(owner.pid) === 'dead'
     }
+    await handle.close()
+    handle = undefined
+    return new FlockLock(path, flock)
+  } catch (error) {
+    await handle?.close().catch(() => {})
+    if (error instanceof LiaisonError) throw error
+    throw new LiaisonError('LOCK_UNAVAILABLE',
+      `Kernel flock is unavailable: ${String(error?.code ?? error?.message ?? 'unknown')}`)
   }
 }
 
@@ -420,6 +438,7 @@ export class HostManager {
     port = 0,
     probeTimeoutMs = 5_000,
     spawnTimeoutMs = 120_000,
+    procRoot = '/proc',
   } = {}) {
     this.stateDir = resolve(stateDir)
     this.env = env
@@ -430,8 +449,29 @@ export class HostManager {
     this.defaultPort = port
     this.probeTimeoutMs = probeTimeoutMs
     this.spawnTimeoutMs = spawnTimeoutMs
+    this.procRoot = procRoot
     this.recordPath = join(this.stateDir, 'host.json')
-    this.lock = new FileLock(join(this.stateDir, 'host.lock'))
+    this.lockPath = join(this.stateDir, 'host.lock')
+    this.lockPromise = undefined
+  }
+
+  async #getLock() {
+    if (this.lockPromise === undefined) this.lockPromise = createLock(this.lockPath)
+    return this.lockPromise
+  }
+
+  async #inspect(record) {
+    return inspectProcess(record, { procRoot: this.procRoot })
+  }
+
+  async #removeRecordByMarker(marker) {
+    const file = await readJsonFile(this.recordPath)
+    if (file === null) return true
+    if (file.invalid === true) return false
+    let markerOnDisk
+    try { markerOnDisk = JSON.parse(file.raw)?.marker } catch { return false }
+    if (markerOnDisk !== marker) return false
+    return removeIfUnchanged(this.recordPath, file.raw)
   }
 
   async #loadRecord() {
@@ -446,11 +486,12 @@ export class HostManager {
     }
   }
 
-  /** Read and verify the current managed Host without spawning or probing. */
+  /** Read and verify the current ready managed Host without spawning or probing. */
   async readOwnedHost() {
     const loaded = await this.#loadRecord()
     if (loaded === null || loaded.invalid === true) return null
-    const verification = await inspectProcess(loaded.record)
+    if (loaded.record.state !== 'ready') return null
+    const verification = await this.#inspect(loaded.record)
     if (!verification.ok) {
       throw new LiaisonError('HOST_RECORD_UNOWNED', `Host record is ${verification.reason}`)
     }
@@ -462,31 +503,143 @@ export class HostManager {
     const loaded = await this.#loadRecord()
     if (loaded === null) return null
     if (loaded.invalid === true) return { verified: false, reason: loaded.reason }
-    const verification = await inspectProcess(loaded.record)
-    const reachable = probe && verification.ok ? await probeOrigin(loaded.record.origin, timeoutMs) : false
+    const record = loaded.record
+    const verification = record.pid === undefined
+      ? { ok: false, reason: 'launching' }
+      : await this.#inspect(record)
+    const reachable = probe && verification.ok && record.state === 'ready'
+      ? await probeOrigin(record.origin, timeoutMs)
+      : false
     return {
-      pid: loaded.record.pid,
-      origin: loaded.record.origin,
-      port: loaded.record.port,
-      dshHome: loaded.record.dshHome,
-      startedAt: loaded.record.startedAt,
+      pid: record.pid ?? null,
+      state: record.state,
+      origin: record.origin ?? null,
+      port: record.port ?? null,
+      dshHome: record.dshHome,
+      startedAt: record.startedAt,
       verified: verification.ok,
       reachable,
       reason: verification.reason,
     }
   }
 
+  async #resolveRecordPid(record) {
+    if (Number.isInteger(record.pid) && record.pid > 0) return { ok: true, record }
+    const found = await findProcessesByMarker(record.marker, this.procRoot)
+    if (!found.ok) return { ok: false, reason: 'unverified' }
+    if (found.matches.length === 0) return { ok: true, record: null, missing: true }
+    if (found.matches.length > 1) return { ok: false, reason: 'unverified', ambiguous: true }
+    return { ok: true, record: { ...record, state: 'starting', ...found.matches[0] } }
+  }
+
+  async #terminateOutcome(record, verification, signal) {
+    if (verification.reason === 'dead' || verification.reason === 'reused') {
+      await this.#removeRecordByMarker(record.marker)
+      return {
+        stopped: true,
+        reason: signal === 'SIGKILL' ? 'killed' : 'exited',
+        pid: record.pid,
+        signal,
+        retained: false,
+      }
+    }
+    return {
+      stopped: false,
+      reason: verification.ok ? 'still-running' : verification.reason,
+      pid: record.pid,
+      ...signal === undefined ? {} : { signal },
+      retained: true,
+    }
+  }
+
+  async #terminateRecord(record, { timeoutMs = 10_000, killTimeoutMs = 2_000 }) {
+    const initial = await this.#inspect(record)
+    if (!initial.ok) return await this.#terminateOutcome(record, initial, undefined)
+
+    try { process.kill(record.pid, 'SIGTERM') } catch (error) {
+      if (error?.code !== 'ESRCH') throw error
+    }
+    const deadline = Date.now() + timeoutMs
+    let unverifiedSince
+    while (Date.now() < deadline) {
+      const current = await this.#inspect(record)
+      if (!current.ok) {
+        if (current.reason === 'dead' || current.reason === 'reused') {
+          return await this.#terminateOutcome(record, current, 'SIGTERM')
+        }
+        if (current.reason === 'unverified') {
+          if (await pidLiveness(record.pid) === 'dead') {
+            return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGTERM')
+          }
+          unverifiedSince ??= Date.now()
+          if (Date.now() - unverifiedSince >= 500) return await this.#terminateOutcome(record, current, 'SIGTERM')
+          await sleep(50)
+          continue
+        }
+        return await this.#terminateOutcome(record, current, 'SIGTERM')
+      }
+      unverifiedSince = undefined
+      await sleep(100)
+    }
+
+    // Re-verify immediately before escalation so a recycled pid cannot be hit.
+    const final = await this.#inspect(record)
+    if (!final.ok) return await this.#terminateOutcome(record, final, 'SIGTERM')
+    try { process.kill(record.pid, 'SIGKILL') } catch (error) {
+      if (error?.code !== 'ESRCH') throw error
+    }
+    const killDeadline = Date.now() + killTimeoutMs
+    while (Date.now() < killDeadline) {
+      const current = await this.#inspect(record)
+      if (!current.ok) {
+        if (current.reason === 'dead' || current.reason === 'reused') {
+          return await this.#terminateOutcome(record, current, 'SIGKILL')
+        }
+        if (current.reason === 'unverified' && await pidLiveness(record.pid) === 'dead') {
+          return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGKILL')
+        }
+        // A dying process can briefly lose readable identity; give the kernel
+        // signal time to complete before reporting the retained record.
+        await sleep(50)
+        continue
+      }
+      await sleep(50)
+    }
+    const last = await this.#inspect(record)
+    return await this.#terminateOutcome(record, last, 'SIGKILL')
+  }
+
+  async #recoverStarting(record) {
+    const resolved = await this.#resolveRecordPid(record)
+    if (!resolved.ok) {
+      throw new LiaisonError('HOST_RECORD_UNOWNED',
+        'A write-ahead Host launch marker cannot be tied to a verified process')
+    }
+    if (resolved.record === null) {
+      await this.#removeRecordByMarker(record.marker)
+      return { recovered: false, reason: 'missing' }
+    }
+    const outcome = await this.#terminateRecord(resolved.record, { timeoutMs: 2_000, killTimeoutMs: 1_000 })
+    if (outcome.retained === true) {
+      throw new LiaisonError('HOST_RECORD_UNOWNED',
+        `A write-ahead Host launch is still ${outcome.reason}; refusing to spawn a duplicate`)
+    }
+    return { recovered: true, reason: outcome.reason }
+  }
+
   /** Attach to a verified live Host, reclaim a stale record, or spawn exactly one Host. */
   async ensureHost(options = {}) {
     await ensurePrivateDir(this.stateDir)
-    const release = await this.lock.acquire()
+    const release = await (await this.#getLock()).acquire()
     try {
       const loaded = await this.#loadRecord()
       if (loaded !== null) {
         if (loaded.invalid === true) {
           await removeIfUnchanged(this.recordPath, loaded.raw)
+        } else if (loaded.record.state !== 'ready') {
+          await this.#recoverStarting(loaded.record)
         } else {
-          const verification = await inspectProcess(loaded.record)
+          const verification = await this.#inspect(loaded.record)
           if (verification.ok) {
             const reachable = await this.#probeWithRetry(loaded.record.origin, this.probeTimeoutMs)
             if (reachable) return hostHandle(loaded.record)
@@ -516,7 +669,21 @@ export class HostManager {
     return false
   }
 
+  async #assertProcessIdentitySupported() {
+    if (!await procfsAvailable(this.procRoot)) {
+      throw new LiaisonError('HOST_IDENTITY_UNSUPPORTED',
+        'Managed Host spawn requires readable procfs process identity support')
+    }
+    const selfStart = await processStartToken(process.pid, this.procRoot)
+    const selfEnvironment = await readProcessEnvironment(process.pid, this.procRoot)
+    if (selfStart === undefined || selfEnvironment === undefined) {
+      throw new LiaisonError('HOST_IDENTITY_UNSUPPORTED',
+        'Managed Host spawn cannot verify process start time and environment identity')
+    }
+  }
+
   async #spawnHost(options) {
+    await this.#assertProcessIdentitySupported()
     const dshHome = resolve(options.dshHome ?? this.defaultDshHome ?? this.env.DSH_HOME ?? join(homedir(), '.dsh'))
     const cwd = resolve(options.cwd ?? this.defaultCwd ?? process.cwd())
     const patches = (options.patches ?? this.defaultPatches).map(path => resolve(path))
@@ -526,6 +693,17 @@ export class HostManager {
     }
 
     const marker = randomUUID()
+    const launchRecord = {
+      version: RECORD_VERSION,
+      state: 'launching',
+      marker,
+      dshHome,
+      cwd,
+      requestedPort: port,
+      startedAt: new Date().toISOString(),
+    }
+    await writePrivateAtomic(this.recordPath, launchRecord)
+    let ownershipRecord
     const env = {
       ...process.env,
       ...this.env,
@@ -542,8 +720,10 @@ export class HostManager {
     const child = spawn(process.execPath, args, {
       cwd,
       env,
+      detached: true,
       stdio: ['ignore', stdout.handle.fd, stderr.handle.fd],
     })
+    child.unref()
     await unlink(stdout.path).catch(() => {})
     await unlink(stderr.path).catch(() => {})
 
@@ -556,6 +736,19 @@ export class HostManager {
     child.once('error', error => { spawnError = error })
     const started = Date.now()
     try {
+      if (child.pid === undefined) {
+        throw new LiaisonError('HOST_SPAWN_FAILED', 'dsh web did not provide a pid')
+      }
+      const procStart = await processStartToken(child.pid, this.procRoot)
+      if (procStart !== undefined) {
+        ownershipRecord = {
+          ...launchRecord,
+          state: 'starting',
+          pid: child.pid,
+          procStart,
+        }
+        await writePrivateAtomic(this.recordPath, ownershipRecord)
+      }
       while (Date.now() - started < this.spawnTimeoutMs) {
         if (spawnError !== undefined) {
           throw new LiaisonError('HOST_SPAWN_FAILED',
@@ -602,21 +795,25 @@ export class HostManager {
       }
 
       const record = {
-        version: RECORD_VERSION,
-        pid: child.pid,
+        ...(ownershipRecord ?? {
+          ...launchRecord,
+          state: 'starting',
+          pid: child.pid,
+          procStart: await processStartToken(child.pid, this.procRoot),
+        }),
+        state: 'ready',
         origin,
         port: Number(url.port),
         launchToken,
-        dshHome,
-        startedAt: new Date().toISOString(),
-        marker,
-        procStart: await processStartToken(child.pid),
-        cwd,
       }
       await writePrivateAtomic(this.recordPath, record)
       return hostHandle(record)
     } catch (error) {
-      if (child.exitCode === null) child.kill('SIGTERM')
+      if (ownershipRecord !== undefined && child.exitCode === null) {
+        await this.#terminateRecord(ownershipRecord, { timeoutMs: 2_000, killTimeoutMs: 1_000 }).catch(() => {})
+      } else if (child.pid === undefined || child.exitCode !== null) {
+        await this.#removeRecordByMarker(marker)
+      }
       throw error
     } finally {
       await stdout.handle.close().catch(() => {})
@@ -626,53 +823,27 @@ export class HostManager {
 
   /**
    * Stop only a Host whose process identity is still the exact one recorded.
-   * A dead, reused, or unverified pid receives no signal.
+   * A dead or reused pid is reclaimed; an unverified live process is reported
+   * and its record is retained instead of being declared gone.
    */
   async stopHost({ timeoutMs = 10_000, killTimeoutMs = 2_000 } = {}) {
     await ensurePrivateDir(this.stateDir)
-    const release = await this.lock.acquire()
+    const release = await (await this.#getLock()).acquire()
     try {
       const loaded = await this.#loadRecord()
       if (loaded === null || loaded.invalid === true) {
         if (loaded?.invalid === true) await removeIfUnchanged(this.recordPath, loaded.raw)
-        return { stopped: false, reason: 'missing', pid: null }
+        return { stopped: false, reason: 'missing', pid: null, retained: false }
       }
-      const { record, raw } = loaded
-      const verification = await inspectProcess(record)
-      if (!verification.ok) {
-        if (verification.reason === 'dead' || verification.reason === 'reused') {
-          await removeIfUnchanged(this.recordPath, raw)
-        }
-        return { stopped: false, reason: verification.reason, pid: record.pid }
+      const resolved = await this.#resolveRecordPid(loaded.record)
+      if (!resolved.ok) {
+        return { stopped: false, reason: 'unverified', pid: loaded.record.pid ?? null, retained: true }
       }
-
-      try { process.kill(record.pid, 'SIGTERM') } catch (error) {
-        if (error?.code !== 'ESRCH') throw error
+      if (resolved.record === null) {
+        await this.#removeRecordByMarker(loaded.record.marker)
+        return { stopped: false, reason: 'missing', pid: null, retained: false }
       }
-      const deadline = Date.now() + timeoutMs
-      while (Date.now() < deadline) {
-        const current = await inspectProcess(record)
-        if (!current.ok) {
-          await removeIfUnchanged(this.recordPath, raw)
-          return { stopped: true, reason: 'exited', pid: record.pid, signal: 'SIGTERM' }
-        }
-        await sleep(100)
-      }
-
-      // Re-verify immediately before escalation so a recycled pid cannot be hit.
-      const final = await inspectProcess(record)
-      if (!final.ok) {
-        await removeIfUnchanged(this.recordPath, raw)
-        return { stopped: true, reason: 'exited', pid: record.pid, signal: 'SIGTERM' }
-      }
-      process.kill(record.pid, 'SIGKILL')
-      const killDeadline = Date.now() + killTimeoutMs
-      while (Date.now() < killDeadline) {
-        if (!(await inspectProcess(record)).ok) break
-        await sleep(50)
-      }
-      await removeIfUnchanged(this.recordPath, raw)
-      return { stopped: true, reason: 'killed', pid: record.pid, signal: 'SIGKILL' }
+      return await this.#terminateRecord(resolved.record, { timeoutMs, killTimeoutMs })
     } finally {
       await release()
     }
