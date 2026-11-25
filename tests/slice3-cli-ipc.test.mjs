@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict'
 import { randomUUID } from 'node:crypto'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { readFile, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { test } from 'node:test'
 import { loadUpstream } from '../src/upstream.mjs'
@@ -10,12 +9,13 @@ import { OperatorConnection } from '../src/operator-connection.mjs'
 import { createOperatorAdapter } from '../src/operator-adapter.mjs'
 import { startScriptedAgentServer } from './support/scripted-agent-server.mjs'
 import { createKeylessEnvironment } from './support/keyless-environment.mjs'
+import { createScratchRoot } from './support/scratch.mjs'
 import { runCli, sleep, waitFor } from './support/cli-harness.mjs'
 
 test('slice3 CLI/IPC: status, wait and events over the real daemon keep delegations independent', {
   timeout: 900_000,
 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'dsh-slice3-cli-'))
+  const root = await createScratchRoot('slice3-cli-')
   const mock = await startScriptedAgentServer()
   const fixture = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
   const stateDir = join(root, 'state')
@@ -190,6 +190,25 @@ test('slice3 CLI/IPC: status, wait and events over the real daemon keep delegati
     Array.from({ length: fullB.data.cursor + 1 }, (_, index) => index),
     'an explicit negative --after-seq reads from seq 0',
   )
+
+  const tree = await create('wait-tree')
+  const beforeTree = await cli(['status', '--delegation-id', 'wait-tree'])
+  await cli(['prompt', '--delegation-id', 'wait-tree', '--content', 'SUBAGENT 2000'])
+  const waitedTree = await cli([
+    'wait',
+    '--delegation-id', 'wait-tree',
+    '--after-seq', String(beforeTree.data.state.cursor),
+    '--timeout-ms', '30000',
+    '--slice-timeout-ms', '1000',
+    '--wait-for-subagents',
+  ])
+  assert.equal(waitedTree.data.reason, 'idle')
+  assert.equal(waitedTree.data.indeterminate, false)
+  assert.equal(waitedTree.data.sessionId, tree.data.sessionId)
+  assert.equal(waitedTree.data.subagentCatalog.length, 1)
+  assert.equal(waitedTree.data.subagents.localSubagents.length, 1)
+  assert.deepEqual(waitedTree.data.subagents.activeSubagents, [])
+  assert.deepEqual(waitedTree.data.subagents.externalSubagents, [])
 
   const missing = await runCli(['status', '--delegation-id', 'missing-delegation'], {
     cwd: fixture.cwd, env,

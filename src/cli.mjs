@@ -46,7 +46,7 @@ Delegation commands:
   prompt        submit one idempotent prompt
   verify-model  verify the persisted request-header model for a prompt
   status        read passive status, pending input and subagent catalog
-  wait          wait across Host wait windows without losing assistant output
+  wait          wait across Host wait windows; unprovable child work is indeterminate
   events        read a contiguous event range with structured views
 
 Options:

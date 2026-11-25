@@ -90,12 +90,19 @@ export class EventReader {
    *
    * The tail page's cursor is pinned for every older page. The final range is
    * checked against `[afterSeq + 1 .. pinnedCursor]` with step 1.
-   * @param {{ sessionId: string, afterSeq?: number, throughSeq?: number, pageSize?: number }} request - session and range.
+   * @param {{ sessionId: string, address?: object, afterSeq?: number, throughSeq?: number, pageSize?: number }} request - session, optional public address and range.
    * @returns {{ sessionId: string, cursor: number, pinnedCursor: number, afterSeq: number, events: object[], pagesRead: number }} the contiguous range.
    * @throws {LiaisonError} `events/sequence-gap`, `events/pagination-stalled`, `events/cursor-moved` or `events/page-contract`.
    */
-  async readRange({ sessionId, afterSeq = -1, throughSeq, pageSize }) {
+  async readRange({ sessionId, address, afterSeq = -1, throughSeq, pageSize }) {
     if (typeof sessionId !== 'string' || sessionId === '') throw new TypeError('sessionId is required')
+    if (address !== undefined && (address === null || typeof address !== 'object'
+      || typeof address.kind !== 'string')) {
+      throw new TypeError('address must be a SessionAddress')
+    }
+    if (address?.kind === 'subagent' && address.childSessionId !== sessionId) {
+      throw new TypeError('subagent address must name sessionId as its child')
+    }
     if (!Number.isSafeInteger(afterSeq) || afterSeq < -1) {
       throw new TypeError('afterSeq must be an integer greater than or equal to -1')
     }
@@ -106,10 +113,10 @@ export class EventReader {
       throw new TypeError('pageSize must be a positive safe integer')
     }
 
-    const address = { kind: 'session', sessionId }
+    const target = address ?? { kind: 'session', sessionId }
     const pageRequest = pageSize === undefined ? {} : { maxMessages: pageSize }
     const first = await this.#adapter.sessionEvents({
-      address,
+      address: target,
       ...(throughSeq === undefined ? {} : { throughSeq }),
       ...pageRequest,
     })
@@ -141,7 +148,7 @@ export class EventReader {
       }
       const beforeSeq = earliest
       const older = await this.#adapter.sessionEvents({
-        address,
+        address: target,
         throughSeq: pinnedCursor,
         beforeSeq,
         ...pageRequest,
@@ -359,7 +366,11 @@ function emptySubagentStatus(reason, errorCode = null) {
     reason,
     errorCode,
     asOfSeq: null,
+    complete: true,
     catalog: [],
+    descendants: [],
+    localSubagents: [],
+    settledLocalSubagents: [],
     activeSubagents: [],
     unknownSubagents: [],
     externalSubagents: [],
@@ -367,17 +378,32 @@ function emptySubagentStatus(reason, errorCode = null) {
   }
 }
 
+function subagentIdentity(entry, parentSessionId, depth) {
+  return {
+    id: entry.id,
+    mode: entry.mode ?? 'unknown',
+    createdAt: entry.createdAt ?? null,
+    ...(entry.label === undefined ? {} : { label: entry.label }),
+    ...(entry.name === undefined ? {} : { name: entry.name }),
+    parentSessionId,
+    depth,
+  }
+}
+
 /**
- * Read direct-child discovery facts and passive child state.
+ * Read the observable direct-child catalog and every local descendant.
  *
- * `unknown` and `external` catalog modes have no readable local session, so
- * they are reported with `active: null` / `settled: null` and never probed.
- * A local child whose state cannot be read is reported as `unavailable`.
+ * Local descendants are walked recursively through their own `subagentCatalog`
+ * projection because the root catalog names only direct children. `unknown` and
+ * `external` rows have no readable local session; they are reported with
+ * `active: null` / `settled: null` and never probed. A local child whose state
+ * or catalog cannot be read is reported as `unavailable`.
  * @param {object} adapter - Host Remote adapter with `sessionProjections` and `sessionState`.
  * @param {string} sessionId - parent session.
- * @returns the catalog plus honest per-child observation.
+ * @param {{ maxNodes?: number, recursive?: boolean }} [options] - traversal ceiling and descendant walk.
+ * @returns the direct catalog, flattened descendants and honest per-node observation.
  */
-export async function readSubagentStatus(adapter, sessionId) {
+export async function readSubagentStatus(adapter, sessionId, { maxNodes = 256, recursive = true } = {}) {
   let projections
   try {
     projections = await adapter.sessionProjections({ sessionId })
@@ -389,90 +415,126 @@ export async function readSubagentStatus(adapter, sessionId) {
   if (!Array.isArray(values.subagentCatalog)) {
     return emptySubagentStatus('subagent-catalog-unavailable')
   }
-  const raw = values.subagentCatalog
-  const catalog = []
 
-  for (const entry of raw) {
-    const identity = {
-      id: entry.id,
-      mode: entry.mode ?? 'unknown',
-      createdAt: entry.createdAt ?? null,
-      ...(entry.label === undefined ? {} : { label: entry.label }),
-      ...(entry.name === undefined ? {} : { name: entry.name }),
-    }
-    if (identity.mode !== 'one-shot' && identity.mode !== 'continuable') {
-      catalog.push({
-        ...identity,
-        local: false,
-        observation: identity.mode === 'external' ? 'external' : 'unknown-mode',
-        active: null,
-        settled: null,
-        live: null,
-        running: null,
-        pendingInput: null,
-        timing: null,
-      })
-      continue
-    }
+  const descendants = []
+  const seen = new Set([sessionId])
+  let complete = true
 
-    let state
-    try {
-      state = await adapter.sessionState({ sessionId: entry.id })
-    } catch (error) {
-      catalog.push({
+  const observe = async (parentSessionId, entries, depth) => {
+    for (const entry of entries) {
+      if (descendants.length >= maxNodes) {
+        complete = false
+        return
+      }
+      const identity = subagentIdentity(entry, parentSessionId, depth)
+      if (identity.mode !== 'one-shot' && identity.mode !== 'continuable') {
+        descendants.push({
+          ...identity,
+          local: false,
+          observation: identity.mode === 'external' ? 'external' : 'unknown-mode',
+          active: null,
+          settled: null,
+          live: null,
+          running: null,
+          pendingInput: null,
+          timing: null,
+        })
+        continue
+      }
+      if (seen.has(identity.id)) {
+        descendants.push({
+          ...identity,
+          local: true,
+          observation: 'unavailable',
+          errorCode: 'subagent/cycle',
+          active: null,
+          settled: null,
+          live: null,
+          running: null,
+          pendingInput: null,
+          timing: null,
+        })
+        continue
+      }
+      seen.add(identity.id)
+
+      let state
+      try {
+        state = await adapter.sessionState({ sessionId: identity.id })
+      } catch (error) {
+        descendants.push({
+          ...identity,
+          local: true,
+          observation: 'unavailable',
+          errorCode: remoteCodeOf(error) ?? null,
+          active: null,
+          settled: null,
+          live: null,
+          running: null,
+          pendingInput: null,
+          timing: null,
+        })
+        continue
+      }
+
+      let timing = null
+      let timingErrorCode = null
+      let children = null
+      try {
+        const childProjections = await adapter.sessionProjections({ sessionId: identity.id })
+        const childValues = projectionValues(childProjections)
+        timing = childValues?.subagentTiming ?? null
+        if (Array.isArray(childValues?.subagentCatalog)) {
+          children = childValues.subagentCatalog
+        }
+      } catch (error) {
+        timingErrorCode = remoteCodeOf(error) ?? null
+      }
+
+      const pendingInput = Array.isArray(state?.pendingInput) ? state.pendingInput : []
+      const queueLength = Array.isArray(state?.queue) ? state.queue.length : 0
+      const running = state?.running === true
+      const live = state?.active === true
+      const node = {
         ...identity,
         local: true,
-        observation: 'unavailable',
-        errorCode: remoteCodeOf(error) ?? null,
-        active: null,
-        settled: null,
-        live: null,
-        running: null,
-        pendingInput: null,
-        timing: null,
-      })
-      continue
+        observation: 'state',
+        active: running || queueLength > 0,
+        settled: !running && queueLength === 0 && pendingInput.length === 0 && live === false,
+        live,
+        running,
+        queueLength,
+        pendingInput,
+        cursor: state?.cursor ?? null,
+        ...(timingErrorCode === null ? {} : { timingErrorCode }),
+        ...(children === null ? { catalogUnavailable: true } : {}),
+        timing,
+      }
+      descendants.push(node)
+      if (recursive && children !== null && children.length > 0) {
+        await observe(identity.id, children, depth + 1)
+      }
     }
-
-    let timing = null
-    let timingErrorCode = null
-    try {
-      const childProjections = await adapter.sessionProjections({ sessionId: entry.id })
-      const childValues = projectionValues(childProjections)
-      timing = childValues?.subagentTiming ?? null
-    } catch (error) {
-      timingErrorCode = remoteCodeOf(error) ?? null
-    }
-
-    const pendingInput = Array.isArray(state?.pendingInput) ? state.pendingInput : []
-    const queueLength = Array.isArray(state?.queue) ? state.queue.length : 0
-    const running = state?.running === true
-    const live = state?.active === true
-    catalog.push({
-      ...identity,
-      local: true,
-      observation: 'state',
-      active: running || queueLength > 0,
-      settled: !running && queueLength === 0 && pendingInput.length === 0 && live === false,
-      live,
-      running,
-      queueLength,
-      pendingInput,
-      cursor: state?.cursor ?? null,
-      ...(timingErrorCode === null ? {} : { timingErrorCode }),
-      timing,
-    })
   }
 
+  await observe(sessionId, values.subagentCatalog, 0)
+  const catalog = descendants.filter(entry => entry.depth === 0)
+  const localSubagents = descendants.filter(entry => entry.local === true)
   return {
     available: true,
     reason: null,
     errorCode: null,
     asOfSeq: Number.isSafeInteger(projections.asOfSeq) ? projections.asOfSeq : null,
+    complete,
     catalog,
-    activeSubagents: catalog.filter(entry => entry.active === true),
-    unknownSubagents: catalog.filter(entry => entry.mode === 'unknown'),
-    externalSubagents: catalog.filter(entry => entry.mode === 'external'),
-    unavailableSubagents: catalog.filter(entry => entry.observation === 'unavailable'),
+    descendants,
+    localSubagents,
+    settledLocalSubagents: localSubagents.filter(entry =>
+      entry.observation === 'state' && entry.settled === true),
+    activeSubagents: localSubagents.filter(entry => entry.active === true),
+    unknownSubagents: descendants.filter(entry => entry.mode === 'unknown'),
+    externalSubagents: descendants.filter(entry => entry.mode === 'external'),
+    unavailableSubagents: localSubagents.filter(entry =>
+      entry.observation === 'unavailable' || entry.catalogUnavailable === true),
   }
 }

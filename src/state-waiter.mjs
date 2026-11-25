@@ -33,9 +33,8 @@ function assertPositiveInteger(value, name) {
 }
 
 /**
- * Whether background child work cannot be ruled out from one observation.
- * Unknown/external catalog rows are historical and have no local status; they
- * are reported but never make an otherwise healthy idle result indeterminate.
+ * Whether local background work cannot be ruled out from one observation.
+ * External/unknown rows are handled separately as unprovable boundaries.
  * @param {object} subagents - `readSubagentStatus` result.
  * @returns {string|null} stable indeterminate reason, or null when status is trustworthy.
  */
@@ -57,7 +56,13 @@ export class StateWaiter {
   /**
    * @param {{ registry: object, adapter: object, clock?: () => number, sleep?: (ms: number) => Promise<unknown>, subagentPollMs?: number }} options - ledger, Host seam and time sources.
    */
-  constructor({ registry, adapter, clock = () => Date.now(), sleep = defaultSleep, subagentPollMs = 250 }) {
+  constructor({
+    registry,
+    adapter,
+    clock = () => Date.now(),
+    sleep = defaultSleep,
+    subagentPollMs = 250,
+  }) {
     if (registry === null || typeof registry !== 'object' || typeof registry.get !== 'function') {
       throw new TypeError('StateWaiter requires a registry with get')
     }
@@ -97,8 +102,12 @@ export class StateWaiter {
 
   /**
    * Wait across multiple Host wait windows until input is required or idle.
+   *
+   * Root-only waits are unchanged. With `waitForSubagents`, the observable
+   * local descendant tree is joined; durable external/unknown children and
+   * unreadable local nodes are reported as indeterminate rather than idle.
    * @param {{ delegationId: string, afterSeq?: number, timeoutMs?: number, sliceTimeoutMs?: number, waitForSubagents?: boolean, maxMessages?: number }} request - delegation, output cursor and bounds.
-   * @returns the stopping reason, last state, chronological assistant messages and subagent observation.
+   * @returns the stopping reason (`idle`, `input-required`, `timeout` or `indeterminate`), last state, chronological assistant messages and subagent observation.
    * @throws {LiaisonError} Host failures other than a per-slice `session/wait-timeout`.
    */
   async wait({
@@ -125,6 +134,11 @@ export class StateWaiter {
     let backfilled = 0
     let outputTruncated = false
     const collected = new Map()
+    const noticeCursors = new Map()
+    const observedActive = new Set()
+    const settledDuringWait = new Set()
+    const noticeVerified = new Set()
+    let pendingNoticeReason = null
 
     const absorb = records => {
       for (const record of records ?? []) {
@@ -132,6 +146,79 @@ export class StateWaiter {
         if (event?.type !== 'assistant/message' || !Number.isSafeInteger(event.seq)) continue
         if (!collected.has(event.seq)) collected.set(event.seq, event)
       }
+    }
+
+    const noteTree = tree => {
+      for (const node of tree.localSubagents ?? []) {
+        if (node.active === true) {
+          observedActive.add(node.id)
+          noticeVerified.delete(node.id)
+        }
+        if (observedActive.has(node.id) && node.active !== true) {
+          settledDuringWait.add(node.id)
+        }
+        if (!noticeCursors.has(node.id) && Number.isSafeInteger(node.cursor)) {
+          noticeCursors.set(node.id, node.cursor)
+        }
+      }
+    }
+
+    const verifyNotices = async (tree, rootState) => {
+      // Upstream finishDisposal deletes the child before notifySettlement
+      // (packages/subagent/subagent/src/manager.ts:1119-1122), so "child
+      // settled + parent idle" does not prove the notice turn was scheduled.
+      // The public evidence is the durable parent user/message carrying
+      // source.kind === 'subagent-settled' and senderSessionId === child id
+      // (continuation-messages.ts:168-174).
+      const byId = new Map((tree.descendants ?? tree.catalog ?? [])
+        .map(node => [node.id, node]))
+      const pending = []
+      for (const childId of settledDuringWait) {
+        if (noticeVerified.has(childId)) continue
+        const node = byId.get(childId)
+        if (node === undefined) {
+          return { pending, unavailableReason: 'subagent-settlement-notice-unavailable' }
+        }
+        const parentId = node.parentSessionId
+        const parentNode = parentId === sessionId ? null : byId.get(parentId)
+        if (parentNode === undefined) {
+          return { pending, unavailableReason: 'subagent-settlement-notice-unavailable' }
+        }
+        // Upstream skips delivery when no live parent Agent exists; no parent
+        // turn can start in that case.
+        const parentLive = parentNode === null ? rootState?.active === true : parentNode.live === true
+        if (!parentLive) {
+          noticeVerified.add(childId)
+          continue
+        }
+        const address = parentNode === null
+          ? undefined
+          : {
+              kind: 'subagent',
+              parentSessionId: parentNode.parentSessionId,
+              childSessionId: parentNode.id,
+              mode: parentNode.mode,
+            }
+        let page
+        try {
+          page = await this.#reader.readRange({
+            sessionId: parentId,
+            ...(address === undefined ? {} : { address }),
+            afterSeq: noticeCursors.get(parentId) ?? 0,
+            pageSize: 500,
+          })
+        } catch (error) {
+          return { pending, unavailableReason: 'subagent-settlement-notice-unavailable' }
+        }
+        noticeCursors.set(parentId, page.cursor)
+        const notice = page.events.some(event =>
+          event.type === 'user/message'
+          && event.data?.source?.kind === 'subagent-settled'
+          && event.data.source.senderSessionId === childId)
+        if (notice) noticeVerified.add(childId)
+        else pending.push(childId)
+      }
+      return { pending, unavailableReason: null }
     }
 
     for (;;) {
@@ -175,6 +262,9 @@ export class StateWaiter {
       }
       cursor = Math.max(cursor, stateCursor)
       lastState = value.state ?? lastState
+      if (Number.isSafeInteger(value.state?.cursor) && !noticeCursors.has(sessionId)) {
+        noticeCursors.set(sessionId, value.state.cursor)
+      }
 
       if (value.reason === 'input-required') {
         return this.#snapshot({
@@ -198,6 +288,7 @@ export class StateWaiter {
           // A nonempty root queue means work is pending even while no turn is
           // running. Never report idle; wait for the queued turn within the
           // caller's deadline.
+          pendingNoticeReason = null
           const left = deadline - this.#clock()
           if (left <= 0) {
             return this.#snapshot({
@@ -218,9 +309,82 @@ export class StateWaiter {
           continue
         }
 
-        const subagents = await this.#readSubagents(sessionId)
-        const indeterminateReason = waitForSubagents ? subagentIndeterminate(subagents) : null
+        const subagents = await this.#readSubagents(sessionId, { recursive: waitForSubagents })
+        if (!waitForSubagents) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'idle',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+          })
+        }
+        noteTree(subagents)
+
+        // A durable external/unknown row names a child with no local session to
+        // observe. Its mere presence proves neither running nor finished, so
+        // the tree is explicitly indeterminate instead of waiting forever.
+        if ((subagents.externalSubagents?.length ?? 0) > 0) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'indeterminate',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+            indeterminate: true,
+            indeterminateReason: 'subagent-external-status-unavailable',
+          })
+        }
+        if ((subagents.unknownSubagents?.length ?? 0) > 0) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'indeterminate',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+            indeterminate: true,
+            indeterminateReason: 'subagent-unknown-status-unavailable',
+          })
+        }
+        if (subagents.complete === false) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'indeterminate',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+            indeterminate: true,
+            indeterminateReason: 'subagent-tree-truncated',
+          })
+        }
+
+        const indeterminateReason = subagentIndeterminate(subagents)
         if (indeterminateReason !== null) {
+          pendingNoticeReason = null
           const left = deadline - this.#clock()
           if (left <= 0) {
             return this.#snapshot({
@@ -260,7 +424,24 @@ export class StateWaiter {
           continue
         }
 
-        if (waitForSubagents && subagents.activeSubagents.length > 0) {
+        if ((subagents.localSubagents?.length ?? 0) === 0) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'idle',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+          })
+        }
+
+        if (subagents.activeSubagents.length > 0) {
+          pendingNoticeReason = null
           const left = deadline - this.#clock()
           if (left <= 0) {
             return this.#snapshot({
@@ -280,17 +461,126 @@ export class StateWaiter {
           await this.#sleep(Math.min(this.#subagentPollMs, left))
           continue
         }
+
+        // Every observable local descendant is settled. Success requires the
+        // child's durable settlement notice in its direct parent's history, not
+        // a quiet timer. Then recheck the parent/root state and queue.
+        const verification = await verifyNotices(subagents, lastState)
+        if (verification.unavailableReason !== null) {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'indeterminate',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+            indeterminate: true,
+            indeterminateReason: verification.unavailableReason,
+          })
+        }
+        if (verification.pending.length > 0) {
+          pendingNoticeReason = 'subagent-settlement-notice-unobserved'
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'timeout',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-notice-unobserved',
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          continue
+        }
+
+        pendingNoticeReason = null
+        let freshRoot
+        let freshTree
+        try {
+          freshRoot = await this.#adapter.sessionState({ sessionId })
+          freshTree = await this.#readSubagents(sessionId, { recursive: true })
+        } catch {
+          return this.#snapshot({
+            delegationId,
+            sessionId,
+            reason: 'indeterminate',
+            state: lastState,
+            startedAt,
+            cursor,
+            slices,
+            backfilled,
+            outputTruncated,
+            subagents,
+            collected,
+            indeterminate: true,
+            indeterminateReason: 'subagent-settlement-recheck-unavailable',
+          })
+        }
+        noteTree(freshTree)
+        const unverified = [...settledDuringWait].some(childId => !noticeVerified.has(childId))
+        if (unverified) {
+          pendingNoticeReason = 'subagent-settlement-notice-unobserved'
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'timeout',
+              state: freshRoot,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents: freshTree,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-notice-unobserved',
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          continue
+        }
+        if (freshTree.activeSubagents.length > 0
+          || freshRoot?.running === true
+          || (freshRoot?.queue?.length ?? 0) > 0) {
+          continue
+        }
+        if ((freshTree.externalSubagents?.length ?? 0) > 0
+          || (freshTree.unknownSubagents?.length ?? 0) > 0
+          || freshTree.available !== true
+          || (freshTree.unavailableSubagents?.length ?? 0) > 0
+          || freshTree.complete === false) {
+          // Handle the boundary with its explicit indeterminate reason on the
+          // next idle observation.
+          continue
+        }
+
         return this.#snapshot({
           delegationId,
           sessionId,
           reason: 'idle',
-          state: lastState,
+          state: freshRoot,
           startedAt,
           cursor,
           slices,
           backfilled,
           outputTruncated,
-          subagents,
+          subagents: freshTree,
           collected,
         })
       }
@@ -317,6 +607,8 @@ export class StateWaiter {
       outputTruncated,
       subagents,
       collected,
+      indeterminate: pendingNoticeReason !== null,
+      indeterminateReason: pendingNoticeReason,
     })
   }
 
@@ -350,9 +642,9 @@ export class StateWaiter {
     }
   }
 
-  async #readSubagents(sessionId) {
+  async #readSubagents(sessionId, options = {}) {
     try {
-      return await readSubagentStatus(this.#adapter, sessionId)
+      return await readSubagentStatus(this.#adapter, sessionId, options)
     } catch (error) {
       return {
         available: false,
