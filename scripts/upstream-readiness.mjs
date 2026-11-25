@@ -11,6 +11,13 @@ const STATIC_ARTIFACTS = [
   'apps/web/dist/index.html',
 ]
 
+/** Platform packages documented by native/system: Linux/macOS only; Windows uses its own lock path. */
+const NATIVE_SYSTEM_PLATFORMS = new Set(['linux-x64', 'linux-arm64', 'darwin-x64', 'darwin-arm64'])
+
+export function requiresNativeSystem(platform = process.platform, arch = process.arch) {
+  return NATIVE_SYSTEM_PLATFORMS.has(`${platform}-${arch}`)
+}
+
 function hasNamedFile(path, name) {
   if (!existsSync(path)) return false
   for (const entry of readdirSync(path)) {
@@ -24,7 +31,7 @@ function hasNamedFile(path, name) {
   return false
 }
 
-export function missingArtifacts(root) {
+export function missingArtifacts(root, { platform = process.platform, arch = process.arch } = {}) {
   const missing = []
   for (const entry of UPSTREAM_ENTRIES) {
     try {
@@ -37,9 +44,11 @@ export function missingArtifacts(root) {
   for (const path of STATIC_ARTIFACTS) {
     if (!existsSync(join(root, path))) missing.push(path)
   }
-  const platformPackage = join(root, 'native/system/packages', `${process.platform}-${process.arch}`)
-  if (!hasNamedFile(platformPackage, 'system.node')) {
-    missing.push(`native/system/packages/${process.platform}-${process.arch}/**/system.node`)
+  if (requiresNativeSystem(platform, arch)) {
+    const platformPackage = join(root, 'native/system/packages', `${platform}-${arch}`)
+    if (!hasNamedFile(platformPackage, 'system.node')) {
+      missing.push(`native/system/packages/${platform}-${arch}/**/system.node`)
+    }
   }
   return missing
 }

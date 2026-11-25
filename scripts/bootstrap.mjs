@@ -5,6 +5,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync, mkdtempSync, renameSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { ensureUpstreamReady } from './upstream-readiness.mjs'
+import { pnpmInvocation } from './pnpm-invocation.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const UPSTREAM = join(ROOT, 'deepseek-harness')
@@ -27,7 +28,13 @@ function output(command, args, options = {}) {
 }
 
 function pnpm(args, options = {}) {
-  run('corepack', ['pnpm', ...args], { cwd: UPSTREAM, ...options })
+  const invocation = pnpmInvocation(args)
+  run(invocation.command, invocation.args, { cwd: UPSTREAM, ...options })
+}
+
+function pnpmOutput(args, options = {}) {
+  const invocation = pnpmInvocation(args)
+  return output(invocation.command, invocation.args, { cwd: ROOT, ...options })
 }
 
 function stageUpstream() {
@@ -47,8 +54,8 @@ function stageUpstream() {
 if (process.versions.node !== NODE) {
   throw new Error(`node ${NODE} is required; this process is ${process.versions.node}`)
 }
-const pnpmVersion = output('corepack', ['pnpm', '--version'], { cwd: ROOT })
-if (pnpmVersion !== PNPM) throw new Error(`pnpm ${PNPM} is required; corepack resolved ${pnpmVersion}`)
+const pnpmVersion = pnpmOutput(['--version'])
+if (pnpmVersion !== PNPM) throw new Error(`pnpm ${PNPM} is required; lifecycle pnpm resolved ${pnpmVersion}`)
 
 if (existsSync(UPSTREAM) && !existsSync(join(UPSTREAM, '.git'))) {
   throw new Error(`${UPSTREAM} exists without .git; refusing to modify it. Move it aside so bootstrap can create the pinned checkout`)
