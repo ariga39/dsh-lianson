@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { LiaisonError } from './errors.mjs'
-import { tryAcquireKernelWriterLock } from './kernel-lock.mjs'
+import { createLock } from './host-manager.mjs'
 
 const ACTIVE_STATES = new Set(['creating', 'ready'])
 const MAX_CREATE_REPLAYS = 4_096
@@ -76,14 +76,18 @@ export class DelegationRegistry {
   async acquireWriter() {
     if (this.#writerLock !== null) return true
     await mkdir(dirname(this.#filePath), { recursive: true, mode: 0o700 })
-    const lock = await tryAcquireKernelWriterLock(`${this.#filePath}.lock`)
-    if (!lock.acquired) {
+    let release
+    try {
+      const lock = await createLock(`${this.#filePath}.lock`)
+      release = await lock.acquire({ timeoutMs: 0 })
+    } catch (error) {
+      if (error?.code !== 'HOST_LOCK_TIMEOUT' && error?.code !== 'LOCK_UNAVAILABLE') throw error
       this.#readOnly = true
       this.#loadPromise = undefined
       await this.#load()
       return false
     }
-    this.#writerLock = lock
+    this.#writerLock = release
     this.#readOnly = false
     this.#loadPromise = undefined
     await this.#load()
@@ -92,9 +96,9 @@ export class DelegationRegistry {
 
   /** Release the lifetime writer lock. Process exit releases it as well. */
   async close() {
-    const lock = this.#writerLock
+    const release = this.#writerLock
     this.#writerLock = null
-    await lock?.release()
+    await release?.()
   }
 
   /** @param {string} delegationId - delegation identity. @returns a copy or undefined. */
