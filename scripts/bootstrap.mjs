@@ -73,10 +73,8 @@ await ensureUpstreamReady({
   build: async () => { pnpm(['run', 'build:artifacts']) },
 })
 
-const playwright = await import('node:module').then(({ createRequire }) =>
-  createRequire(join(UPSTREAM, 'apps/web/package.json'))('playwright'))
-if (!existsSync(playwright.chromium.executablePath())) {
-  pnpm(['--filter', '@deepseek-ai/dsh-web-frontend', 'exec', 'playwright', 'install', 'chromium'])
-}
+const shellInstall = ['--filter', '@deepseek-ai/dsh-web-frontend', 'exec', 'playwright', 'install', 'chromium', '--only-shell']
+console.log('bootstrap: ensuring Playwright headless shell (default chromium.launch target)')
+pnpm(shellInstall)
 
 console.log(`bootstrap: ready at ${COMMIT}`)
