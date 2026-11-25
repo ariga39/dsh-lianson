@@ -8,6 +8,8 @@
     "node": "24.22.3"
   },
   "scripts": {
-    "smoke:slice0": "node scripts/bootstrap.mjs && node --test tests/bootstrap-readiness.test.mjs tests/git-checkout.test.mjs tests/harness-diagnostics.test.mjs tests/slice0-keyless.e2e.test.mjs"
+    "smoke:slice0": "node scripts/bootstrap.mjs && node --test tests/bootstrap-readiness.test.mjs tests/git-checkout.test.mjs tests/harness-diagnostics.test.mjs tests/slice0-keyless.e2e.test.mjs",
+    "test:slice1": "node scripts/bootstrap.mjs && node --test tests/slice1-host-ipc.test.mjs",
+    "test:all": "node scripts/bootstrap.mjs && node --test tests/*.test.mjs"
   }
 }
