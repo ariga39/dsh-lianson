@@ -5,7 +5,7 @@ import { chmod, lstat, unlink } from 'node:fs/promises'
 import { join } from 'node:path'
 import { createLock, ensurePrivateDir, resolveStateDir } from './host-manager.mjs'
 import { probe } from './ipc-client.mjs'
-import { failure } from './ipc-protocol.mjs'
+import { failure, requestFingerprint } from './ipc-protocol.mjs'
 import { redactSecrets } from './redaction.mjs'
 
 const MAX_REQUEST_BYTES = 1_000_000
@@ -33,6 +33,62 @@ export async function startIpcServer({
 }) {
   await ensurePrivateDir(stateDir)
   const lock = await createLock(join(stateDir, 'daemon.lock'))
+  const completedIds = new Map()
+  const pendingIds = new Map()
+  const MAX_COMPLETED_IDS = 4_096
+  const REPLAYABLE_COMMANDS = new Set(['delegation.create', 'delegation.prompt'])
+
+  // Only successful create/prompt mutations are replayable after a lost socket
+  // response. Failed calls stay retryable (the write-ahead ledger and Host
+  // request id make an identical retry safe), while reads such as get/list/
+  // verifyModel always execute live even when they reuse an id.
+  async function dispatchIdempotent(request, command) {
+    const id = typeof request?.id === 'string' && request.id !== '' ? request.id : undefined
+    if (id === undefined || !REPLAYABLE_COMMANDS.has(command)) return dispatch(request)
+    const fingerprint = requestFingerprint(command, request?.params)
+    const completed = completedIds.get(id)
+    if (completed !== undefined) {
+      if (completed.fingerprint !== fingerprint) {
+        return {
+          envelope: failure(command, {
+            code: 'IPC_ID_CONFLICT',
+            message: `Request id "${id}" was already used with different command parameters`,
+          }, id),
+        }
+      }
+      return completed.outcome
+    }
+    const pending = pendingIds.get(id)
+    if (pending !== undefined) {
+      if (pending.fingerprint !== fingerprint) {
+        return {
+          envelope: failure(command, {
+            code: 'IPC_ID_CONFLICT',
+            message: `Request id "${id}" is already in flight with different command parameters`,
+          }, id),
+        }
+      }
+      return pending.promise
+    }
+    const promise = (async () => {
+      const outcome = await dispatch(request)
+      const envelope = outcome?.envelope ?? outcome
+      if (envelope?.ok === true) {
+        completedIds.set(id, { fingerprint, outcome })
+        if (completedIds.size > MAX_COMPLETED_IDS) {
+          completedIds.delete(completedIds.keys().next().value)
+        }
+      }
+      return outcome
+    })()
+    pendingIds.set(id, { fingerprint, promise })
+    try {
+      return await promise
+    } finally {
+      pendingIds.delete(id)
+    }
+  }
+
   let release
   try {
     // The winning daemon holds this lock for its whole lifetime. A second
@@ -100,7 +156,7 @@ export async function startIpcServer({
           const command = typeof request?.command === 'string' ? request.command : null
           let outcome
           try {
-            outcome = await dispatch({ command, params: request?.params, id: request?.id })
+            outcome = await dispatchIdempotent({ command, params: request?.params, id: request?.id }, command)
           } catch (error) {
             outcome = {
               envelope: failure(command, {

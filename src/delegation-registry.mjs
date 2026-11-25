@@ -69,6 +69,34 @@ export class DelegationRegistry {
   }
 
   /**
+   * Find the record owning one Host session id.
+   * @param {string} sessionId - Host session identity.
+   * @returns a copy or undefined.
+   */
+  async findBySessionId(sessionId) {
+    await this.#load()
+    for (const record of this.#records.values()) {
+      if (record.sessionId === sessionId) return clone(record)
+    }
+    return undefined
+  }
+
+  /**
+   * Find the ready delegation bound to one Host session id.
+   * Interaction routing and state observation use this narrower lookup so a
+   * creating, attach-failed, or conflicted record is never treated as bound.
+   * @param {string} sessionId - Host session identity.
+   * @returns a copy or undefined.
+   */
+  async findBoundBySessionId(sessionId) {
+    await this.#load()
+    for (const record of this.#records.values()) {
+      if (record.sessionId === sessionId && record.state === 'ready') return clone(record)
+    }
+    return undefined
+  }
+
+  /**
    * Persist a fresh `creating` record, or validate and resume an existing one.
    * @param {object} input - delegation parameters and the pre-minted session id.
    * @returns the persisted record.

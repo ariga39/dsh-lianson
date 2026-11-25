@@ -6,12 +6,20 @@ import { startIpcServer } from './ipc-server.mjs'
 import { IPC_COMMANDS, failure, success } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
+import { DelegationRegistry } from './delegation-registry.mjs'
+import { DelegationService } from './delegation-service.mjs'
+import { createOperatorAdapter } from './operator-adapter.mjs'
 import { join } from 'node:path'
 
 const stateDir = resolveStateDir()
 const socketPath = join(stateDir, 'daemon.sock')
 const manager = new HostManager({ stateDir })
 const operator = new OperatorConnection({ hostManager: manager })
+const delegationRegistry = new DelegationRegistry({ filePath: join(stateDir, 'delegations.json') })
+const delegations = new DelegationService({
+  registry: delegationRegistry,
+  adapter: createOperatorAdapter(operator),
+})
 let host = null
 let server
 let shuttingDown = false
@@ -77,6 +85,28 @@ async function ensureHost(params) {
   return next
 }
 
+/** Start or attach one Host for a delegation mutation, then wait for the operator. */
+async function ensureDelegationHost(params) {
+  await exclusive(async () => {
+    if (host === null) await ensureHost(params?.host ?? {})
+    await operator.ensureConnected()
+  })
+}
+
+/** Require the already-owned Host; never spawn a Host that would not own the session. */
+async function requireDelegationHost() {
+  if (host === null) {
+    await refreshHost()
+    if (host === null) {
+      throw new LiaisonError(
+        'HOST_UNAVAILABLE',
+        'No managed dsh web Host is available; run "dsh-liaison host start" first',
+      )
+    }
+  }
+  await operator.ensureConnected()
+}
+
 async function dispatch(request) {
   const { command, params = {}, id } = request
   const key = typeof command === 'string' ? command.replace(/ /gu, '.') : command
@@ -136,6 +166,24 @@ async function dispatch(request) {
       return {
         envelope: success(command, { ...statusData(), rpc: 'session/modelCatalog', ...result }, id),
       }
+    }
+    if (key === 'delegation.create') {
+      await ensureDelegationHost(params)
+      return { envelope: success(command, await delegations.create(params), id) }
+    }
+    if (key === 'delegation.get') {
+      return { envelope: success(command, await delegations.get(params), id) }
+    }
+    if (key === 'delegation.list') {
+      return { envelope: success(command, await delegations.list(), id) }
+    }
+    if (key === 'delegation.prompt') {
+      await requireDelegationHost()
+      return { envelope: success(command, await delegations.prompt(params), id) }
+    }
+    if (key === 'delegation.verifyModel') {
+      await requireDelegationHost()
+      return { envelope: success(command, await delegations.verifyModel(params), id) }
     }
     if (key === 'host.stop') {
       if (closing) {

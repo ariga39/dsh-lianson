@@ -1,6 +1,7 @@
 /** Thin CLI: JSON in/out over the user-only daemon socket. */
 
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
@@ -11,29 +12,54 @@ import { errorEnvelope, LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
 
 const DAEMON_PATH = join(import.meta.dirname, 'daemon.mjs')
-const COMMANDS = new Set(['start', 'status', 'ping', 'stop'])
+const HOST_COMMANDS = new Set(['start', 'status', 'ping', 'stop'])
+const DELEGATION_COMMANDS = new Set(['create', 'get', 'list', 'prompt', 'verify-model'])
 // Host spawn permits 120s and stop permits 10s SIGTERM + 2s SIGKILL, on top of
 // the Host lock wait. The IPC deadline must cover the documented operation,
 // not just ordinary replies.
 const START_TIMEOUT_MS = 180_000
 const STOP_TIMEOUT_MS = 180_000
 
-const HELP = `Usage: dsh-liaison host <start|status|ping|stop> [options]
+const HELP = `Usage:
+  dsh-liaison host <start|status|ping|stop> [options]
+  dsh-liaison create --title <title> --provider <id> --model <id> [options]
+  dsh-liaison get (--delegation-id <id> | --session-id <session-id>)
+  dsh-liaison list
+  dsh-liaison prompt --delegation-id <id> --content <text> [options]
+  dsh-liaison verify-model --delegation-id <id> [--request-id <id>]
 
-Commands:
+Host commands:
   host start    attach to or spawn one managed dsh web Host
   host status   print daemon and Host status (use --ensure to start the Host)
   host ping     run one authenticated unary RPC
   host stop     stop the daemon; stop its managed Host unless --keep-host
 
+Delegation commands:
+  create        create or resume one write-ahead delegation session
+  get           read one delegation by delegation id or bound session id
+  list          list delegation records
+  prompt        submit one idempotent prompt
+  verify-model  verify the persisted request-header model for a prompt
+
 Options:
-  --dsh-home <path>   DSH_HOME used when spawning a Host
-  --workspace <path>  working directory used when spawning a Host
-  --patch <path>      extra dsh web profile patch (repeatable)
-  --port <number>     Host listen port, 0 for an OS-assigned loopback port
-  --ensure            with status, attach or spawn the Host first
-  --keep-host         with stop, leave dsh web running
-  -h, --help          show this help
+  --id <id>                 IPC request id; retrying the same id replays the response
+  --delegation-id <id>      stable delegation identity (default: --id)
+  --session-id <id>         Host session identity for get
+  --cwd <path>              delegation working directory (default: current directory)
+  --title <title>           unique session title
+  --provider <id>           advertised model provider
+  --model <id>              advertised model id
+  --reasoning-effort <id>   advertised reasoning effort
+  --agent-preset <name>     optional Host agent preset
+  --content <text>          prompt text
+  --request-id <id>         stable prompt request id (default: derived from --id)
+  --dsh-home <path>         DSH_HOME used when spawning a Host
+  --workspace <path>        working directory used when spawning a Host
+  --patch <path>            extra dsh web profile patch (repeatable)
+  --port <number>           Host listen port, 0 for an OS-assigned loopback port
+  --ensure                  with host status, attach or spawn the Host first
+  --keep-host               with host stop, leave dsh web running
+  -h, --help                show this help
 
 Runtime:
   Managed Host lifecycle currently requires Linux with readable procfs process
@@ -73,6 +99,14 @@ function readPort(value) {
     throw new LiaisonError('HOST_PORT_INVALID', 'Port must be an integer from 0 to 65535')
   }
   return port
+}
+
+function required(values, name, usage) {
+  const value = values[name]
+  if (typeof value !== 'string' || value.trim() === '') {
+    throw new LiaisonError('USAGE', usage)
+  }
+  return value
 }
 
 function hostParams(values) {
@@ -167,6 +201,80 @@ async function stopWithOwnership({ socketPath, stateDir, keepHost }) {
   }
 }
 
+function delegationHostParams(values, cwd) {
+  const params = hostParams(values)
+  if (params.cwd === undefined) params.cwd = cwd
+  return params
+}
+
+function delegationCwd(values) {
+  return resolve(values.cwd ?? values.workspace ?? process.cwd())
+}
+
+function delegationRequest(action, values) {
+  if (action === 'create') {
+    const cwd = delegationCwd(values)
+    const title = required(values, 'title', 'create requires --title <title>')
+    const provider = required(values, 'provider', 'create requires --provider <id>')
+    const model = required(values, 'model', 'create requires --model <id>')
+    return {
+      command: 'delegation.create',
+      params: {
+        delegationId: values['delegation-id'] ?? values.id ?? `delegation-${randomUUID()}`,
+        cwd,
+        title,
+        model: {
+          provider,
+          model,
+          ...(values['reasoning-effort'] === undefined
+            ? {}
+            : { reasoningEffort: values['reasoning-effort'] }),
+        },
+        ...(values['agent-preset'] === undefined ? {} : { agentPreset: values['agent-preset'] }),
+        host: delegationHostParams(values, cwd),
+      },
+    }
+  }
+  if (action === 'get') {
+    if (values['delegation-id'] === undefined && values['session-id'] === undefined) {
+      throw new LiaisonError('USAGE', 'get requires --delegation-id <id> or --session-id <id>')
+    }
+    return {
+      command: 'delegation.get',
+      params: {
+        ...(values['delegation-id'] === undefined ? {} : { delegationId: values['delegation-id'] }),
+        ...(values['session-id'] === undefined ? {} : { sessionId: values['session-id'] }),
+      },
+    }
+  }
+  if (action === 'list') return { command: 'delegation.list', params: {} }
+  if (action === 'prompt') {
+    const delegationId = required(values, 'delegation-id', 'prompt requires --delegation-id <id>')
+    const content = required(values, 'content', 'prompt requires --content <text>')
+    const requestId = values['request-id']
+      ?? (values.id === undefined ? undefined : `request-${values.id}`)
+    return {
+      command: 'delegation.prompt',
+      params: {
+        delegationId,
+        content,
+        ...(requestId === undefined ? {} : { requestId }),
+      },
+    }
+  }
+  if (action === 'verify-model') {
+    const delegationId = required(values, 'delegation-id', 'verify-model requires --delegation-id <id>')
+    return {
+      command: 'delegation.verifyModel',
+      params: {
+        delegationId,
+        ...(values['request-id'] === undefined ? {} : { requestId: values['request-id'] }),
+      },
+    }
+  }
+  throw new LiaisonError('USAGE', `Unknown delegation command: ${String(action)}`)
+}
+
 async function execute(argv, io) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -178,6 +286,17 @@ async function execute(argv, io) {
       port: { type: 'string' },
       ensure: { type: 'boolean', default: false },
       'keep-host': { type: 'boolean', default: false },
+      id: { type: 'string' },
+      'delegation-id': { type: 'string' },
+      'session-id': { type: 'string' },
+      cwd: { type: 'string' },
+      title: { type: 'string' },
+      provider: { type: 'string' },
+      model: { type: 'string' },
+      'reasoning-effort': { type: 'string' },
+      'agent-preset': { type: 'string' },
+      content: { type: 'string' },
+      'request-id': { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false },
     },
   })
@@ -186,18 +305,25 @@ async function execute(argv, io) {
     return 0
   }
   const [group, action, ...extra] = positionals
-  if (group !== 'host' || action === undefined || extra.length > 0 || !COMMANDS.has(action)) {
-    throw new LiaisonError('USAGE', 'Usage: dsh-liaison host <start|status|ping|stop> [options]')
+  if (group === 'host') {
+    if (action === undefined || extra.length > 0 || !HOST_COMMANDS.has(action)) {
+      throw new LiaisonError('USAGE', 'Usage: dsh-liaison host <start|status|ping|stop> [options]')
+    }
+  } else if (!DELEGATION_COMMANDS.has(group) || action !== undefined || extra.length > 0) {
+    throw new LiaisonError('USAGE', 'Usage: dsh-liaison <host|create|get|list|prompt|verify-model> [options]')
   }
 
   const stateDir = resolveStateDir()
   const socketPath = join(stateDir, 'daemon.sock')
-  const command = `host ${action}`
-  const params = hostParams(values)
+  const request = group === 'host'
+    ? { command: `host ${action}`, params: hostParams(values) }
+    : delegationRequest(group, values)
+  const command = request.command
+  const params = request.params
 
   let envelope
   try {
-    if (action === 'stop') {
+    if (group === 'host' && action === 'stop') {
       envelope = await stopWithOwnership({
         socketPath,
         stateDir,
@@ -205,11 +331,14 @@ async function execute(argv, io) {
       })
     } else {
       await ensureDaemon(socketPath)
-      if (action === 'status') params.ensure = values.ensure === true
+      if (group === 'host' && action === 'status') params.ensure = values.ensure === true
       envelope = await call(socketPath, {
         command,
         params,
-        timeoutMs: START_TIMEOUT_MS,
+        id: values.id,
+        timeoutMs: group === 'host'
+          ? START_TIMEOUT_MS
+          : (group === 'create' ? START_TIMEOUT_MS : 60_000),
       })
     }
   } catch (error) {
