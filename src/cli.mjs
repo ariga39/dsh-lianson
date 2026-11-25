@@ -263,11 +263,12 @@ function delegationRequest(action, values) {
   }
   if (action === 'verify-model') {
     const delegationId = required(values, 'delegation-id', 'verify-model requires --delegation-id <id>')
+    const requestId = stablePromptRequestId(values['request-id'], values.id)
     return {
       command: 'delegation.verifyModel',
       params: {
         delegationId,
-        ...(values['request-id'] === undefined ? {} : { requestId: values['request-id'] }),
+        ...(requestId === undefined ? {} : { requestId }),
       },
     }
   }

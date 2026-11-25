@@ -36,6 +36,25 @@ export class DelegationService {
   }
 
   /**
+   * Replay one durable successful create response by IPC request id.
+   * @param {string} requestId - caller IPC request id.
+   * @param {string} fingerprint - canonical request fingerprint.
+   * @returns the original ready record, or undefined.
+   */
+  async createReplay(requestId, fingerprint) {
+    const entry = await this.#registry.getCreateReplay(requestId)
+    if (entry === undefined) return undefined
+    if (entry.fingerprint !== fingerprint) {
+      throw new LiaisonError(
+        'IPC_ID_CONFLICT',
+        `Request id "${requestId}" was already used with different command parameters`,
+        { requestId },
+      )
+    }
+    return entry.response
+  }
+
+  /**
    * Read one record by delegation id or, for bound-session lookup, session id.
    * @param {{ delegationId?: string, sessionId?: string }} query
    */

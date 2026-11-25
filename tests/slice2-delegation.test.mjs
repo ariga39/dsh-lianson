@@ -211,6 +211,41 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     )
   })
 
+  await t.test('same-delegation concurrent creates serialize and ready is terminal', async () => {
+    const { registry, commands } = newCommands('concurrent-create')
+    const params = input('concurrent-create')
+    const before = await sessionsInWorkspace(adapter, canonicalWorkspace)
+    const results = await Promise.allSettled([
+      commands.createDelegation(params),
+      commands.createDelegation(params),
+    ])
+    const fulfilled = results.filter(result => result.status === 'fulfilled')
+    const rejected = results.filter(result => result.status === 'rejected')
+    assert.equal(fulfilled.length, 1, 'exactly one create may bind the delegation')
+    assert.equal(rejected.length, 1)
+    assert.equal(rejected[0].reason?.code, 'delegation/already-exists')
+    assert.equal(fulfilled[0].value.state, 'ready')
+    const sessionId = fulfilled[0].value.sessionId
+
+    const after = await sessionsInWorkspace(adapter, canonicalWorkspace)
+    assert.equal(after.length, before.length + 1, 'the loser must not mint a second session')
+
+    await registry.markConflict(params.delegationId, {
+      upstreamCode: 'late-host-result',
+      message: 'late result must not invalidate ready',
+      substitutedSessionId: `session-${randomUUID()}`,
+    })
+    await registry.markAttachFailed(params.delegationId, {
+      sessionId: `session-${randomUUID()}`,
+      message: 'late attach failure must not invalidate ready',
+    })
+    const record = await registry.get(params.delegationId)
+    assert.equal(record.state, 'ready')
+    assert.equal(record.sessionId, sessionId)
+    assert.equal(record.substitutedSessionId, undefined)
+    assert.equal(record.returnedSessionId, undefined)
+  })
+
   await t.test('silent Host session substitution is rejected without binding', async () => {
     const { registry, commands } = newCommands('substitution')
     const workspace = await adapter.ensureWorkspace(workspaceDir)
@@ -402,6 +437,10 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     assert.deepEqual({ provider: inherited.provider, model: inherited.model }, modelOne,
       'a turn with an unchanged request header inherits the prior effective route')
     assert.ok(Number.isInteger(inherited.turnEndSeq), 'verification reports the pinned turn end')
+
+    const unscoped = await commands.verifyRequestModel({ delegationId: params.delegationId })
+    assert.deepEqual({ provider: unscoped.provider, model: unscoped.model }, modelOne,
+      'an unscoped lookup paginates past pages with no request/header')
 
     // The later turn changes the persisted header. It must never satisfy an
     // earlier request's model proof.

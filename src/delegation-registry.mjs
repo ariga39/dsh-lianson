@@ -26,7 +26,7 @@ function sameModel(left, right) {
 }
 
 function emptyLedger() {
-  return { version: 1, delegations: [] }
+  return { version: 1, delegations: [], createReplays: [] }
 }
 
 /**
@@ -39,6 +39,7 @@ function emptyLedger() {
 export class DelegationRegistry {
   #filePath
   #records = new Map()
+  #createReplays = new Map()
   #loadPromise
   #tail = Promise.resolve()
 
@@ -176,6 +177,7 @@ export class DelegationRegistry {
 
   /**
    * Record a Host identity conflict, preserving the requested session id.
+   * A late result never changes a ready binding.
    * @param {string} delegationId - delegation identity.
    * @param {{ upstreamCode?: string, message?: string, substitutedSessionId?: string }} conflict - conflict details.
    * @returns the persisted record.
@@ -184,6 +186,7 @@ export class DelegationRegistry {
     return this.#enqueue(async () => {
       await this.#load()
       const record = this.#require(delegationId)
+      if (record.state === 'ready') return clone(record)
       record.state = 'conflict'
       record.updatedAt = new Date().toISOString()
       record.lastError = {
@@ -209,6 +212,7 @@ export class DelegationRegistry {
     return this.#enqueue(async () => {
       await this.#load()
       const record = this.#require(delegationId)
+      if (record.state === 'ready') return clone(record)
       if (failure.sessionId !== undefined && failure.sessionId !== record.sessionId) {
         record.state = 'conflict'
         record.updatedAt = new Date().toISOString()
@@ -244,20 +248,61 @@ export class DelegationRegistry {
   }
 
   /**
-   * Mark a fully bound delegation ready.
+   * Mark a fully bound delegation ready and atomically persist the create IPC
+   * replay identity/result in the same ledger write.
    * @param {string} delegationId - delegation identity.
+   * @param {{ ipcRequestId?: string, ipcFingerprint?: string }} [replay] - successful create request identity.
    * @returns the persisted record.
    */
-  async markReady(delegationId) {
+  async markReady(delegationId, replay = {}) {
     return this.#enqueue(async () => {
       await this.#load()
       const record = this.#require(delegationId)
+      if (record.state === 'ready') {
+        if (replay.ipcRequestId !== undefined && replay.ipcFingerprint !== undefined
+          && !this.#createReplays.has(replay.ipcRequestId)) {
+          this.#createReplays.set(replay.ipcRequestId, {
+            requestId: replay.ipcRequestId,
+            fingerprint: replay.ipcFingerprint,
+            response: clone(record),
+          })
+          this.#pruneCreateReplays()
+          await this.#persist()
+        }
+        return clone(record)
+      }
       record.state = 'ready'
       record.updatedAt = new Date().toISOString()
       delete record.lastError
+      const response = clone(record)
+      if (replay.ipcRequestId !== undefined && replay.ipcFingerprint !== undefined) {
+        this.#createReplays.set(replay.ipcRequestId, {
+          requestId: replay.ipcRequestId,
+          fingerprint: replay.ipcFingerprint,
+          response,
+        })
+        this.#pruneCreateReplays()
+      }
       await this.#persist()
       return clone(record)
     })
+  }
+
+  /**
+   * Read one durable create success by caller IPC request id.
+   * @param {string} requestId - the original IPC request id.
+   * @returns `{ requestId, fingerprint, response }` or undefined.
+   */
+  async getCreateReplay(requestId) {
+    await this.#load()
+    const entry = this.#createReplays.get(requestId)
+    return entry === undefined ? undefined : clone(entry)
+  }
+
+  #pruneCreateReplays() {
+    while (this.#createReplays.size > 4_096) {
+      this.#createReplays.delete(this.#createReplays.keys().next().value)
+    }
   }
 
   /**
@@ -360,6 +405,13 @@ export class DelegationRegistry {
       }
       this.#records.set(record.delegationId, record)
     }
+    if (Array.isArray(parsed.createReplays)) {
+      for (const entry of parsed.createReplays) {
+        if (typeof entry?.requestId !== 'string' || typeof entry?.fingerprint !== 'string') continue
+        if (entry.response === null || typeof entry.response !== 'object') continue
+        this.#createReplays.set(entry.requestId, entry)
+      }
+    }
   }
 
   async #persist() {
@@ -369,6 +421,7 @@ export class DelegationRegistry {
     const body = `${JSON.stringify({
       ...emptyLedger(),
       delegations: [...this.#records.values()],
+      createReplays: [...this.#createReplays.values()],
     }, null, 2)}\n`
     let handle
     try {

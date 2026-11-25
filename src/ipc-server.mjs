@@ -6,7 +6,6 @@ import { join } from 'node:path'
 import { createLock, ensurePrivateDir, resolveStateDir } from './host-manager.mjs'
 import { probe } from './ipc-client.mjs'
 import { failure, requestFingerprint } from './ipc-protocol.mjs'
-import { IpcResponseJournal } from './ipc-response-journal.mjs'
 import { redactSecrets } from './redaction.mjs'
 
 const MAX_REQUEST_BYTES = 1_000_000
@@ -38,8 +37,6 @@ export async function startIpcServer({
   const pendingIds = new Map()
   const MAX_COMPLETED_IDS = 4_096
   const REPLAYABLE_COMMANDS = new Set(['delegation.create', 'delegation.prompt'])
-  const responseJournal = new IpcResponseJournal({ filePath: join(stateDir, 'ipc-responses.json') })
-  await responseJournal.load()
 
   // Only successful create/prompt mutations are replayable after a lost socket
   // response. Failed calls stay retryable (the write-ahead ledger and Host
@@ -49,11 +46,7 @@ export async function startIpcServer({
     const id = typeof request?.id === 'string' && request.id !== '' ? request.id : undefined
     if (id === undefined || !REPLAYABLE_COMMANDS.has(command)) return dispatch(request)
     const fingerprint = requestFingerprint(command, request?.params)
-    let completed = completedIds.get(id)
-    if (completed === undefined && command === 'delegation.create') {
-      completed = await responseJournal.get(id)
-      if (completed !== undefined) completedIds.set(id, completed)
-    }
+    const completed = completedIds.get(id)
     if (completed !== undefined) {
       if (completed.fingerprint !== fingerprint) {
         return {
@@ -81,16 +74,9 @@ export async function startIpcServer({
       const outcome = await dispatch(request)
       const envelope = outcome?.envelope ?? outcome
       if (envelope?.ok === true) {
-        const entry = { fingerprint, outcome }
-        completedIds.set(id, entry)
+        completedIds.set(id, { fingerprint, outcome })
         if (completedIds.size > MAX_COMPLETED_IDS) {
           completedIds.delete(completedIds.keys().next().value)
-        }
-        if (command === 'delegation.create') {
-          // Persist before the socket response so a daemon restart can replay
-          // the exact successful create. A journal write failure must not turn
-          // a committed Host session into a client-visible failure.
-          await responseJournal.set(id, entry).catch(() => {})
         }
       }
       return outcome

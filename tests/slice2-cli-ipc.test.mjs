@@ -154,6 +154,22 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     const stored = await cli(['get', '--delegation-id', 'cli-a'])
     assert.deepEqual(stored.data.verifiedModel, { provider: modelOne.provider, model: modelOne.model })
 
+    const derivedPrompt = await cli([
+      'prompt',
+      '--delegation-id', 'cli-a',
+      '--id', 'cli-a-derived',
+      '--content', 'CLI_PROMPT_DERIVED',
+    ])
+    assert.equal(derivedPrompt.data.requestId, 'request-cli-a-derived')
+    await waitForRequest(adapter, created.data.sessionId, 'request-cli-a-derived')
+    const derivedVerify = await cli([
+      'verify-model',
+      '--delegation-id', 'cli-a',
+      '--id', 'cli-a-derived',
+    ])
+    assert.equal(derivedVerify.data.requestId, 'request-cli-a-derived')
+    assert.deepEqual({ provider: derivedVerify.data.provider, model: derivedVerify.data.model }, modelOne)
+
     await cli([
       'prompt',
       '--delegation-id', 'cli-a',
@@ -262,6 +278,9 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     }
     const restartCreateArgs = createArgs(restartInput)
     const created = await cli(restartCreateArgs)
+    const ledger = JSON.parse(await readFile(join(stateDir, 'delegations.json'), 'utf8'))
+    assert.ok(ledger.createReplays.some(entry => entry.requestId === 'restart-create-ipc'),
+      'the create replay identity/result is part of the same durable ledger')
     const status = await cli(['host', 'status'])
     const oldDaemonPid = status.data.daemonPid
     const beforeCount = (await adapter.listSessions()).items.length
@@ -273,6 +292,12 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     assert.equal(replayed.id, 'restart-create-ipc')
     assert.equal((await adapter.listSessions()).items.length, beforeCount,
       'create replay must not execute session.create again')
+    const lookedUp = await cli(['get', '--delegation-id', 'restart-create'])
+    assert.equal(lookedUp.data.sessionId, created.data.sessionId,
+      'the ready binding remains discoverable after the crash boundary')
+    const lookedUpBySession = await cli(['get', '--session-id', created.data.sessionId])
+    assert.equal(lookedUpBySession.data.delegationId, 'restart-create',
+      'bound-session lookup remains available for #4/#5 after restart')
 
     const promptDelegation = await cli(createArgs({
       label: 'restart-prompt',

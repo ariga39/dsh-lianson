@@ -35,6 +35,7 @@ export class SessionCommands {
   #adapter
   #historyPageMessages
   #historyMaxPages
+  #createChains = new Map()
 
   /**
    * @param {{ registry: import('./delegation-registry.mjs').DelegationRegistry, adapter: object, historyPageMessages?: number, historyMaxPages?: number }} options - persistence and Host seam.
@@ -53,10 +54,31 @@ export class SessionCommands {
 
   /**
    * Create or resume one delegation session and bind it to an explicit model.
-   * @param {object} request - delegation identity, directory, title, and model.
+   * Calls for the same delegation are serialized so a late host result can
+   * never overtake a ready transition.
+   * @param {object} request - delegation identity, directory, title, model, and optional IPC replay identity.
    * @returns the ready ledger record.
    */
-  async createDelegation({ delegationId, cwd, title, model, agentPreset }) {
+  async createDelegation(request) {
+    const delegationId = request?.delegationId
+    if (typeof delegationId !== 'string' || delegationId === '') {
+      return this.#createDelegationUnlocked(request)
+    }
+    const previous = this.#createChains.get(delegationId) ?? Promise.resolve()
+    const run = previous.then(
+      () => this.#createDelegationUnlocked(request),
+      () => this.#createDelegationUnlocked(request),
+    )
+    const tail = run.then(() => undefined, () => undefined)
+    this.#createChains.set(delegationId, tail)
+    try {
+      return await run
+    } finally {
+      if (this.#createChains.get(delegationId) === tail) this.#createChains.delete(delegationId)
+    }
+  }
+
+  async #createDelegationUnlocked({ delegationId, cwd, title, model, agentPreset, ipcRequestId, ipcFingerprint }) {
     if (typeof delegationId !== 'string' || delegationId === '') throw new TypeError('delegationId is required')
     if (typeof title !== 'string' || title.trim() === '') throw new TypeError('title is required')
     const normalizedTitle = normalizeSessionTitle(title)
@@ -158,7 +180,10 @@ export class SessionCommands {
       )
     }
 
-    return this.#registry.markReady(record.delegationId)
+    return this.#registry.markReady(record.delegationId, {
+      ...(ipcRequestId === undefined ? {} : { ipcRequestId }),
+      ...(ipcFingerprint === undefined ? {} : { ipcFingerprint }),
+    })
   }
 
   /**
@@ -204,11 +229,7 @@ export class SessionCommands {
     let header
     let turnEndSeq
     if (requestId === undefined) {
-      const page = await this.#adapter.sessionEvents({
-        address: { kind: 'session', sessionId: record.sessionId },
-        maxMessages: this.#historyPageMessages,
-      })
-      header = eventList(page).findLast(event => event.type === 'request/header')
+      header = await this.#latestRequestHeader(record.sessionId)
     } else {
       const window = await this.#requestHeaderWindow(record.sessionId, requestId)
       header = window.header
@@ -260,6 +281,29 @@ export class SessionCommands {
       seq: header.seq,
       ...(turnEndSeq === undefined ? {} : { turnEndSeq }),
     }
+  }
+
+  /**
+   * Read the latest persisted request/header when no exact request id scopes
+   * the lookup, paginating past a page that contains no header event.
+   */
+  async #latestRequestHeader(sessionId) {
+    const address = { kind: 'session', sessionId }
+    let beforeSeq
+    for (let index = 0; index < this.#historyMaxPages; index += 1) {
+      const page = await this.#adapter.sessionEvents({
+        address,
+        maxMessages: this.#historyPageMessages,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      })
+      const events = eventList(page)
+      if (events.length === 0) return undefined
+      const header = events.findLast(event => event.type === 'request/header')
+      if (header !== undefined) return header
+      if (page.hasMore !== true) return undefined
+      beforeSeq = events[0].seq
+    }
+    return undefined
   }
 
   /**

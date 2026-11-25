@@ -1,9 +1,9 @@
 /** User-only local daemon: one managed Host plus one answering operator. */
 
-import { HostManager, hostStopSucceeded, resolveStateDir } from './host-manager.mjs'
+import { HostManager, hostStopSucceeded, resolveDelegationStateDir, resolveStateDir } from './host-manager.mjs'
 import { OperatorConnection } from './operator-connection.mjs'
 import { startIpcServer } from './ipc-server.mjs'
-import { IPC_COMMANDS, failure, stablePromptRequestId, success } from './ipc-protocol.mjs'
+import { IPC_COMMANDS, failure, requestFingerprint, stablePromptRequestId, success } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
 import { DelegationRegistry } from './delegation-registry.mjs'
@@ -12,10 +12,11 @@ import { createOperatorAdapter } from './operator-adapter.mjs'
 import { join } from 'node:path'
 
 const stateDir = resolveStateDir()
+const delegationStateDir = resolveDelegationStateDir()
 const socketPath = join(stateDir, 'daemon.sock')
 const manager = new HostManager({ stateDir })
 const operator = new OperatorConnection({ hostManager: manager })
-const delegationRegistry = new DelegationRegistry({ filePath: join(stateDir, 'delegations.json') })
+const delegationRegistry = new DelegationRegistry({ filePath: join(delegationStateDir, 'delegations.json') })
 const delegations = new DelegationService({
   registry: delegationRegistry,
   adapter: createOperatorAdapter(operator),
@@ -168,8 +169,18 @@ async function dispatch(request) {
       }
     }
     if (key === 'delegation.create') {
+      const ipcRequestId = typeof id === 'string' && id !== '' ? id : undefined
+      const ipcFingerprint = requestFingerprint(command, params)
+      if (ipcRequestId !== undefined) {
+        const replay = await delegations.createReplay(ipcRequestId, ipcFingerprint)
+        if (replay !== undefined) return { envelope: success(command, replay, id) }
+      }
       await ensureDelegationHost(params)
-      return { envelope: success(command, await delegations.create(params), id) }
+      const created = await delegations.create({
+        ...params,
+        ...(ipcRequestId === undefined ? {} : { ipcRequestId, ipcFingerprint }),
+      })
+      return { envelope: success(command, created, id) }
     }
     if (key === 'delegation.get') {
       return { envelope: success(command, await delegations.get(params), id) }
@@ -185,7 +196,9 @@ async function dispatch(request) {
     }
     if (key === 'delegation.verifyModel') {
       await requireDelegationHost()
-      return { envelope: success(command, await delegations.verifyModel(params), id) }
+      const requestId = stablePromptRequestId(params.requestId, id)
+      const verifyParams = requestId === undefined ? params : { ...params, requestId }
+      return { envelope: success(command, await delegations.verifyModel(verifyParams), id) }
     }
     if (key === 'host.stop') {
       if (closing) {
