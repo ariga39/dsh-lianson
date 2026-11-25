@@ -203,6 +203,20 @@ async function dispatch(request) {
       const verifyParams = requestId === undefined ? params : { ...params, requestId }
       return { envelope: success(command, await delegations.verifyModel(verifyParams), id) }
     }
+    if (key === 'delegation.status') {
+      await requireDelegationHost()
+      return { envelope: success(command, await delegations.status(params), id) }
+    }
+    if (key === 'delegation.wait') {
+      // Reads never take the exclusive Host mutation gate: a long wait must not
+      // block status/events for other delegations.
+      await requireDelegationHost()
+      return { envelope: success(command, await delegations.wait(params), id) }
+    }
+    if (key === 'delegation.events') {
+      await requireDelegationHost()
+      return { envelope: success(command, await delegations.events(params), id) }
+    }
     if (key === 'host.stop') {
       if (closing) {
         return { envelope: failure(command, {

@@ -13,7 +13,9 @@ import { redactSecrets } from './redaction.mjs'
 
 const DAEMON_PATH = join(import.meta.dirname, 'daemon.mjs')
 const HOST_COMMANDS = new Set(['start', 'status', 'ping', 'stop'])
-const DELEGATION_COMMANDS = new Set(['create', 'get', 'list', 'prompt', 'verify-model'])
+const DELEGATION_COMMANDS = new Set([
+  'create', 'get', 'list', 'prompt', 'verify-model', 'status', 'wait', 'events',
+])
 // Host spawn permits 120s and stop permits 10s SIGTERM + 2s SIGKILL, on top of
 // the Host lock wait. The IPC deadline must cover the documented operation,
 // not just ordinary replies.
@@ -27,6 +29,9 @@ const HELP = `Usage:
   dsh-liaison list
   dsh-liaison prompt --delegation-id <id> --content <text> [options]
   dsh-liaison verify-model --delegation-id <id> [--request-id <id>]
+  dsh-liaison status --delegation-id <id>
+  dsh-liaison wait --delegation-id <id> [--after-seq N] [--timeout-ms N]
+  dsh-liaison events --delegation-id <id> [--after-seq N] [--through-seq N]
 
 Host commands:
   host start    attach to or spawn one managed dsh web Host
@@ -40,6 +45,9 @@ Delegation commands:
   list          list delegation records
   prompt        submit one idempotent prompt
   verify-model  verify the persisted request-header model for a prompt
+  status        read passive status, pending input and subagent catalog
+  wait          wait across Host wait windows without losing assistant output
+  events        read a contiguous event range with structured views
 
 Options:
   --id <id>                 IPC request id; retrying the same id replays the response
@@ -53,6 +61,13 @@ Options:
   --agent-preset <name>     optional Host agent preset
   --content <text>          prompt text
   --request-id <id>         stable prompt request id (default: derived from --id)
+  --after-seq <n>           exclusive assistant-output/event cursor (default: -1)
+  --through-seq <n>         inclusive event cut (default: current log end)
+  --timeout-ms <n>          overall wait timeout (default: 120000)
+  --slice-timeout-ms <n>    one Host wait window (default: 25000)
+  --max-messages <n>        assistant-record limit per wait window (default: 500)
+  --page-size <n>           event page message budget
+  --wait-for-subagents      keep waiting while local children are working
   --dsh-home <path>         DSH_HOME used when spawning a Host
   --workspace <path>        working directory used when spawning a Host
   --patch <path>            extra dsh web profile patch (repeatable)
@@ -101,12 +116,47 @@ function readPort(value) {
   return port
 }
 
+function callTimeoutMs(group, params) {
+  if (group === 'host') return START_TIMEOUT_MS
+  if (group === 'create') return START_TIMEOUT_MS
+  if (group === 'wait') return Math.max(60_000, (params.timeoutMs ?? 120_000) + 30_000)
+  return 60_000
+}
+
 function required(values, name, usage) {
   const value = values[name]
   if (typeof value !== 'string' || value.trim() === '') {
     throw new LiaisonError('USAGE', usage)
   }
   return value
+}
+
+function optionalInteger(values, name, { min = 0 } = {}) {
+  const raw = values[name]
+  if (raw === undefined) return undefined
+  if (!/^-?\d+$/u.test(raw)) {
+    throw new LiaisonError('USAGE', `--${name} must be an integer`)
+  }
+  const value = Number(raw)
+  if (!Number.isSafeInteger(value) || value < min) {
+    throw new LiaisonError('USAGE', `--${name} must be a safe integer greater than or equal to ${String(min)}`)
+  }
+  return value
+}
+
+function normalizeNumericArgs(argv) {
+  const normalized = []
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]
+    if ((argument === '--after-seq' || argument === '--through-seq')
+      && /^-\d+$/u.test(argv[index + 1] ?? '')) {
+      normalized.push(`${argument}=${argv[index + 1]}`)
+      index += 1
+      continue
+    }
+    normalized.push(argument)
+  }
+  return normalized
 }
 
 function hostParams(values) {
@@ -272,12 +322,49 @@ function delegationRequest(action, values) {
       },
     }
   }
+  if (action === 'status') {
+    const delegationId = required(values, 'delegation-id', 'status requires --delegation-id <id>')
+    return { command: 'delegation.status', params: { delegationId } }
+  }
+  if (action === 'wait') {
+    const delegationId = required(values, 'delegation-id', 'wait requires --delegation-id <id>')
+    const afterSeq = optionalInteger(values, 'after-seq', { min: -1 })
+    const timeoutMs = optionalInteger(values, 'timeout-ms', { min: 1 })
+    const sliceTimeoutMs = optionalInteger(values, 'slice-timeout-ms', { min: 1 })
+    const maxMessages = optionalInteger(values, 'max-messages', { min: 1 })
+    return {
+      command: 'delegation.wait',
+      params: {
+        delegationId,
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        ...(timeoutMs === undefined ? {} : { timeoutMs }),
+        ...(sliceTimeoutMs === undefined ? {} : { sliceTimeoutMs }),
+        ...(maxMessages === undefined ? {} : { maxMessages }),
+        ...(values['wait-for-subagents'] === true ? { waitForSubagents: true } : {}),
+      },
+    }
+  }
+  if (action === 'events') {
+    const delegationId = required(values, 'delegation-id', 'events requires --delegation-id <id>')
+    const afterSeq = optionalInteger(values, 'after-seq', { min: -1 })
+    const throughSeq = optionalInteger(values, 'through-seq', { min: -1 })
+    const pageSize = optionalInteger(values, 'page-size', { min: 1 })
+    return {
+      command: 'delegation.events',
+      params: {
+        delegationId,
+        ...(afterSeq === undefined ? {} : { afterSeq }),
+        ...(throughSeq === undefined ? {} : { throughSeq }),
+        ...(pageSize === undefined ? {} : { pageSize }),
+      },
+    }
+  }
   throw new LiaisonError('USAGE', `Unknown delegation command: ${String(action)}`)
 }
 
 async function execute(argv, io) {
   const { values, positionals } = parseArgs({
-    args: argv,
+    args: normalizeNumericArgs(argv),
     allowPositionals: true,
     options: {
       'dsh-home': { type: 'string' },
@@ -297,6 +384,13 @@ async function execute(argv, io) {
       'agent-preset': { type: 'string' },
       content: { type: 'string' },
       'request-id': { type: 'string' },
+      'after-seq': { type: 'string' },
+      'through-seq': { type: 'string' },
+      'timeout-ms': { type: 'string' },
+      'slice-timeout-ms': { type: 'string' },
+      'max-messages': { type: 'string' },
+      'page-size': { type: 'string' },
+      'wait-for-subagents': { type: 'boolean', default: false },
       help: { type: 'boolean', short: 'h', default: false },
     },
   })
@@ -310,7 +404,7 @@ async function execute(argv, io) {
       throw new LiaisonError('USAGE', 'Usage: dsh-liaison host <start|status|ping|stop> [options]')
     }
   } else if (!DELEGATION_COMMANDS.has(group) || action !== undefined || extra.length > 0) {
-    throw new LiaisonError('USAGE', 'Usage: dsh-liaison <host|create|get|list|prompt|verify-model> [options]')
+    throw new LiaisonError('USAGE', 'Usage: dsh-liaison <host|create|get|list|prompt|verify-model|status|wait|events> [options]')
   }
 
   const stateDir = resolveStateDir()
@@ -336,9 +430,7 @@ async function execute(argv, io) {
         command,
         params,
         id: values.id,
-        timeoutMs: group === 'host'
-          ? START_TIMEOUT_MS
-          : (group === 'create' ? START_TIMEOUT_MS : 60_000),
+        timeoutMs: callTimeoutMs(group, params),
       })
     }
   } catch (error) {

@@ -10,6 +10,9 @@ export const IPC_COMMANDS = new Set([
   'delegation.list',
   'delegation.prompt',
   'delegation.verifyModel',
+  'delegation.status',
+  'delegation.wait',
+  'delegation.events',
 ])
 
 export function success(command, data, id) {
