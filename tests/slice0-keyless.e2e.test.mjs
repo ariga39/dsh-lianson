@@ -192,17 +192,59 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   const userMessages = events.filter(event => event.type === 'user/message' && event.data.source.rpcId === requestId)
   assert.equal(userMessages.length, 1, 'dedup must persist exactly one user message')
 
-  const headers = events.filter(event => event.type === 'request/header')
-  assert.ok(headers.some(event =>
-    event.data.header.config.provider === selected.provider && event.data.header.config.model === selected.model))
+  const turnStart = events.filter(event => event.type === 'turn/start').at(-1)
+  assert.ok(turnStart !== undefined, 'the prompt turn must start')
+  const turn = turnStart.data.turn
+  const turnEnd = events.find(event =>
+    event.type === 'turn/end' && event.data.turn === turn && event.data.reason.kind === 'completed')
+  assert.ok(turnEnd !== undefined, 'the prompt turn must end completed')
+  assert.ok(turnEnd.seq > turnStart.seq)
+  const inTurn = events.filter(event => event.seq >= turnStart.seq && event.seq <= turnEnd.seq)
 
-  const calls = events.filter(event => event.type === 'tool/call')
-  assert.ok(calls.some(event => event.data.name === 'read'), 'real read tool call persisted')
-  assert.ok(calls.some(event => event.data.name === 'ask_user_question'), 'question tool call persisted')
-  assert.ok(events.some(event => event.type === 'tool/result'))
+  const userMessage = inTurn.find(event => event.type === 'user/message' && event.data.source.rpcId === requestId)
+  assert.ok(userMessage !== undefined)
+  assert.equal(userMessage.data.source.kind, 'user')
 
-  const assistant = events.filter(event => event.type === 'assistant/message')
-  assert.ok(assistant.some(event => JSON.stringify(event.data).includes(SENTINEL)), 'final assistant sentinel persisted')
-  const end = events.filter(event => event.type === 'turn/end').at(-1)
-  assert.equal(end?.data.reason.kind, 'completed')
+  const readCall = inTurn.find(event => event.type === 'tool/call' && event.data.name === 'read')
+  assert.ok(readCall !== undefined, 'real read tool call persisted in its turn')
+  const readResult = inTurn.find(event => event.type === 'tool/result'
+    && event.data.turn === readCall.data.turn
+    && event.data.step === readCall.data.step
+    && event.data.message.toolCallId === readCall.data.callId)
+  assert.ok(readResult !== undefined, 'read result must pair with the read call')
+
+  const header = inTurn.find(event => event.type === 'request/header' && event.seq > userMessage.seq && event.seq < readCall.seq)
+  assert.ok(header !== undefined, 'the first step records its header after the user message and before dispatch')
+  assert.equal(header.data.header.config.provider, selected.provider)
+  assert.equal(header.data.header.config.model, selected.model)
+
+  const askCall = inTurn.find(event => event.type === 'tool/call'
+    && event.data.name === 'ask_user_question' && event.seq > readResult.seq)
+  assert.ok(askCall !== undefined, 'question tool call follows the read result')
+  const askResult = inTurn.find(event => event.type === 'tool/result'
+    && event.data.turn === askCall.data.turn
+    && event.data.step === askCall.data.step
+    && event.data.message.toolCallId === askCall.data.callId)
+  assert.ok(askResult !== undefined, 'question result must pair with the question call')
+
+  const finalAssistant = inTurn.find(event => event.type === 'assistant/message'
+    && event.data.turn === turn
+    && JSON.stringify(event.data).includes(SENTINEL))
+  assert.ok(finalAssistant !== undefined, 'final assistant sentinel persists in its turn')
+  assert.ok(finalAssistant.seq > askResult.seq)
+
+  // Documented closure order: turn/start -> user/message -> request/header -> read call/result
+  // -> question call/result -> final assistant/message -> matching turn/end(completed).
+  const order = [
+    turnStart.seq,
+    userMessage.seq,
+    header.seq,
+    readCall.seq,
+    readResult.seq,
+    askCall.seq,
+    askResult.seq,
+    finalAssistant.seq,
+    turnEnd.seq,
+  ]
+  assert.deepEqual([...order].sort((left, right) => left - right), order, 'turn events must follow documented relative order')
 })

@@ -2,8 +2,9 @@
 /** Idempotent clean-checkout bootstrap for the pinned DeepSeek Harness upstream. */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdtempSync, readdirSync, renameSync, rmSync, statSync } from 'node:fs'
+import { existsSync, mkdtempSync, renameSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
+import { ensureUpstreamReady } from './upstream-readiness.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const UPSTREAM = join(ROOT, 'deepseek-harness')
@@ -11,12 +12,6 @@ const REMOTE = 'https://github.com/deepseek-ai/deepseek-harness.git'
 const COMMIT = '4b399c39a6d1479cd84ca591b4d7c88e24d38a96'
 const NODE = '24.22.3'
 const PNPM = '11.28.5'
-const ARTIFACTS = [
-  'apps/cli/lib/bin.js',
-  'apps/web/dist/index.html',
-  'packages/api/gateway/lib/client.node.js',
-  'packages/api/session-controller/lib/typert.remote-client.js',
-]
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, { cwd: ROOT, stdio: 'inherit', ...options })
@@ -33,19 +28,6 @@ function output(command, args, options = {}) {
 
 function pnpm(args, options = {}) {
   run('corepack', ['pnpm', ...args], { cwd: UPSTREAM, ...options })
-}
-
-function hasNamedFile(path, name) {
-  if (!existsSync(path)) return false
-  for (const entry of readdirSync(path)) {
-    const child = join(path, entry)
-    if (statSync(child).isDirectory()) {
-      if (hasNamedFile(child, name)) return true
-    } else if (entry === name) {
-      return true
-    }
-  }
-  return false
 }
 
 function stageUpstream() {
@@ -86,20 +68,10 @@ if (dirty !== '') throw new Error(`upstream checkout is dirty:\n${dirty}`)
 
 pnpm(['install', '--frozen-lockfile'], { env: { ...process.env, CI: 'true' } })
 
-const platformPackage = join(UPSTREAM, 'native/system/packages', `${process.platform}-${process.arch}`)
-const missing = ARTIFACTS.filter(path => !existsSync(join(UPSTREAM, path)))
-if (!hasNamedFile(platformPackage, 'system.node')) {
-  missing.push(`native/system/packages/${process.platform}-${process.arch}/**/system.node`)
-}
-if (missing.length > 0) {
-  console.log(`bootstrap: building missing upstream artifacts (${missing.join(', ')})`)
-  pnpm(['run', 'build:artifacts'])
-}
-const stillMissing = ARTIFACTS.filter(path => !existsSync(join(UPSTREAM, path)))
-if (!hasNamedFile(platformPackage, 'system.node')) {
-  stillMissing.push(`native/system/packages/${process.platform}-${process.arch}/**/system.node`)
-}
-if (stillMissing.length > 0) throw new Error(`upstream artifacts missing after build: ${stillMissing.join(', ')}`)
+await ensureUpstreamReady({
+  root: UPSTREAM,
+  build: async () => { pnpm(['run', 'build:artifacts']) },
+})
 
 const playwright = await import('node:module').then(({ createRequire }) =>
   createRequire(join(UPSTREAM, 'apps/web/package.json'))('playwright'))
