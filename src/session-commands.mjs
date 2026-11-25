@@ -3,6 +3,7 @@
 import { randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { LiaisonError, remoteCodeOf } from './errors.mjs'
+import { normalizeSessionTitle } from './title.mjs'
 
 function normalizeModel(model) {
   if (model === null || typeof model !== 'object') throw new TypeError('model selection is required')
@@ -21,6 +22,9 @@ function sameModel(left, right) {
     && (left.reasoningEffort ?? null) === (right.reasoningEffort ?? null)
 }
 
+const HISTORY_PAGE_MESSAGES = 500
+const HISTORY_MAX_PAGES = 100
+
 function eventList(page) {
   return page.records.map(record => record.event)
 }
@@ -29,13 +33,22 @@ function eventList(page) {
 export class SessionCommands {
   #registry
   #adapter
+  #historyPageMessages
+  #historyMaxPages
 
   /**
-   * @param {{ registry: import('./delegation-registry.mjs').DelegationRegistry, adapter: object }} options - persistence and Host seam.
+   * @param {{ registry: import('./delegation-registry.mjs').DelegationRegistry, adapter: object, historyPageMessages?: number, historyMaxPages?: number }} options - persistence and Host seam.
    */
-  constructor({ registry, adapter }) {
+  constructor({
+    registry,
+    adapter,
+    historyPageMessages = HISTORY_PAGE_MESSAGES,
+    historyMaxPages = HISTORY_MAX_PAGES,
+  }) {
     this.#registry = registry
     this.#adapter = adapter
+    this.#historyPageMessages = historyPageMessages
+    this.#historyMaxPages = historyMaxPages
   }
 
   /**
@@ -46,6 +59,14 @@ export class SessionCommands {
   async createDelegation({ delegationId, cwd, title, model, agentPreset }) {
     if (typeof delegationId !== 'string' || delegationId === '') throw new TypeError('delegationId is required')
     if (typeof title !== 'string' || title.trim() === '') throw new TypeError('title is required')
+    const normalizedTitle = normalizeSessionTitle(title)
+    if (normalizedTitle === '') {
+      throw new LiaisonError(
+        'delegation/title-invalid',
+        'session title must contain visible characters',
+        { title },
+      )
+    }
     const expectedModel = normalizeModel(model)
     const canonicalCwd = await this.#canonicalDirectory(cwd)
 
@@ -66,7 +87,7 @@ export class SessionCommands {
       cwd: canonicalCwd,
       workspaceId: workspace.workspaceId,
       sessionId: `session-${randomUUID()}`,
-      title,
+      title: normalizedTitle,
       agentPreset,
       expectedModel,
     })
@@ -180,26 +201,18 @@ export class SessionCommands {
    */
   async verifyRequestModel({ delegationId, requestId }) {
     const record = await this.#requireReady(delegationId)
-    const page = await this.#adapter.sessionEvents({
-      address: { kind: 'session', sessionId: record.sessionId },
-      maxMessages: 500,
-    })
-    const events = eventList(page)
     let header
+    let turnEndSeq
     if (requestId === undefined) {
-      header = events.findLast(event => event.type === 'request/header')
+      const page = await this.#adapter.sessionEvents({
+        address: { kind: 'session', sessionId: record.sessionId },
+        maxMessages: this.#historyPageMessages,
+      })
+      header = eventList(page).findLast(event => event.type === 'request/header')
     } else {
-      const user = events.find(event =>
-        event.type === 'user/message' && event.data.source?.rpcId === requestId)
-      if (user === undefined) {
-        throw new LiaisonError(
-          'delegation/request-not-found',
-          `request "${requestId}" is not persisted in session "${record.sessionId}"`,
-          { delegationId, sessionId: record.sessionId, requestId },
-        )
-      }
-      header = events.find(event =>
-        event.type === 'request/header' && event.seq > user.seq)
+      const window = await this.#requestHeaderWindow(record.sessionId, requestId)
+      header = window.header
+      turnEndSeq = window.turnEnd.seq
     }
     if (header === undefined) {
       throw new LiaisonError(
@@ -245,7 +258,82 @@ export class SessionCommands {
       ...(requestId === undefined ? {} : { requestId }),
       ...verified,
       seq: header.seq,
+      ...(turnEndSeq === undefined ? {} : { turnEndSeq }),
     }
+  }
+
+  /**
+   * Locate the requested turn, pin history at its turn/end, and walk backwards
+   * to the latest request/header at or before that cut. An unchanged header is
+   * inherited from an earlier turn; a later turn's header is never eligible.
+   */
+  async #requestHeaderWindow(sessionId, requestId) {
+    const address = { kind: 'session', sessionId }
+    const pages = []
+    let beforeSeq
+    let user
+    let turnEnd
+    for (let index = 0; index < this.#historyMaxPages; index += 1) {
+      const page = await this.#adapter.sessionEvents({
+        address,
+        maxMessages: this.#historyPageMessages,
+        ...(beforeSeq === undefined ? {} : { beforeSeq }),
+      })
+      const events = eventList(page)
+      if (events.length === 0) break
+      pages.unshift(events)
+      const all = pages.flat()
+      user = all.find(event =>
+        event.type === 'user/message' && event.data.source?.rpcId === requestId)
+      if (user !== undefined) {
+        turnEnd = all.find(event => event.type === 'turn/end' && event.seq > user.seq)
+        if (turnEnd !== undefined) break
+      }
+      if (page.hasMore !== true) break
+      beforeSeq = events[0].seq
+    }
+    if (user === undefined) {
+      throw new LiaisonError(
+        'delegation/request-not-found',
+        `request "${requestId}" is not persisted in session "${sessionId}"`,
+        { sessionId, requestId },
+      )
+    }
+    if (turnEnd === undefined) {
+      throw new LiaisonError(
+        'delegation/request-window-incomplete',
+        `request "${requestId}" has no completed turn to pin in session "${sessionId}"`,
+        { sessionId, requestId, requestSeq: user.seq },
+      )
+    }
+
+    const pinned = []
+    let pinnedBefore
+    let header
+    for (let index = 0; index < this.#historyMaxPages; index += 1) {
+      const page = await this.#adapter.sessionEvents({
+        address,
+        throughSeq: turnEnd.seq,
+        maxMessages: this.#historyPageMessages,
+        ...(pinnedBefore === undefined ? {} : { beforeSeq: pinnedBefore }),
+      })
+      const events = eventList(page)
+      if (events.length === 0) break
+      pinned.unshift(events)
+      header = pinned.flat().findLast(event =>
+        event.type === 'request/header' && event.seq <= turnEnd.seq)
+      if (header !== undefined) break
+      if (page.hasMore !== true) break
+      pinnedBefore = events[0].seq
+    }
+    if (header === undefined) {
+      throw new LiaisonError(
+        'delegation/request-header-missing',
+        `session "${sessionId}" has no request/header at or before the requested turn end`,
+        { sessionId, requestId, turnEndSeq: turnEnd.seq },
+      )
+    }
+    return { header, user, turnEnd }
   }
 
   async #canonicalDirectory(cwd) {

@@ -13,7 +13,7 @@ import { call } from '../src/ipc-client.mjs'
 import { startScriptedAgentServer } from './support/scripted-agent-server.mjs'
 import { createKeylessEnvironment } from './support/keyless-environment.mjs'
 import { dropIpcResponse } from './support/ipc-loss.mjs'
-import { runCli, sleep } from './support/cli-harness.mjs'
+import { runCli, sleep, waitForExit } from './support/cli-harness.mjs'
 
 function eventsOf(page) {
   return page.records.map(record => record.event)
@@ -220,6 +220,93 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     const events = await waitForRequest(adapter, created.data.sessionId, requestId)
     assert.equal(events.filter(event =>
       event.type === 'user/message' && event.data.source?.rpcId === requestId).length, 1)
+  })
+
+  await t.test('titles are stored in Host-normalized form and deduplicated after normalization', async () => {
+    const title = '  Review\u200B   title  '
+    const created = await cli([
+      'create',
+      '--delegation-id', 'normalized-title',
+      '--id', 'normalized-title-create',
+      '--cwd', fixture.cwd,
+      '--title', title,
+      '--provider', modelOne.provider,
+      '--model', modelOne.model,
+    ])
+    assert.equal(created.data.title, 'Review title')
+
+    const stored = await cli(['get', '--delegation-id', 'normalized-title'])
+    assert.equal(stored.data.title, 'Review title')
+
+    const before = (await adapter.listSessions()).items.length
+    const duplicate = await runCli([
+      'create',
+      '--delegation-id', 'normalized-title-duplicate',
+      '--id', 'normalized-title-duplicate-create',
+      '--cwd', fixture.cwd,
+      '--title', 'Review   title',
+      '--provider', modelOne.provider,
+      '--model', modelOne.model,
+    ], { cwd: fixture.cwd, env })
+    assert.notEqual(duplicate.code, 0)
+    assert.equal(duplicate.envelope?.ok, false)
+    assert.equal(duplicate.envelope?.error?.code, 'delegation/title-conflict')
+    assert.equal((await adapter.listSessions()).items.length, before,
+      'a normalized title conflict must fail before creating another session')
+  })
+
+  await t.test('create replay and stable prompt ids survive a daemon restart', async () => {
+    const restartInput = {
+      label: 'restart-create',
+      id: 'restart-create-ipc',
+    }
+    const restartCreateArgs = createArgs(restartInput)
+    const created = await cli(restartCreateArgs)
+    const status = await cli(['host', 'status'])
+    const oldDaemonPid = status.data.daemonPid
+    const beforeCount = (await adapter.listSessions()).items.length
+    process.kill(oldDaemonPid, 'SIGKILL')
+    await waitForExit(oldDaemonPid)
+
+    const replayed = await cli(restartCreateArgs)
+    assert.deepEqual(replayed.data, created.data, 'daemon restart replays the original create success')
+    assert.equal(replayed.id, 'restart-create-ipc')
+    assert.equal((await adapter.listSessions()).items.length, beforeCount,
+      'create replay must not execute session.create again')
+
+    const promptDelegation = await cli(createArgs({
+      label: 'restart-prompt',
+      id: 'restart-prompt-create',
+    }))
+    const promptRequest = {
+      command: 'delegation.prompt',
+      params: { delegationId: 'restart-prompt', content: 'RESTART_PROMPT' },
+      id: 'restart-prompt-ipc',
+      timeoutMs: 60_000,
+    }
+    const firstPrompt = await call(join(stateDir, 'daemon.sock'), promptRequest)
+    assert.equal(firstPrompt.ok, true, JSON.stringify(firstPrompt))
+    const derivedRequestId = 'request-restart-prompt-ipc'
+    assert.equal(firstPrompt.data.requestId, derivedRequestId)
+    await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
+
+    const restartedStatus = await cli(['host', 'status'])
+    process.kill(restartedStatus.data.daemonPid, 'SIGKILL')
+    await waitForExit(restartedStatus.data.daemonPid)
+    await cli(['host', 'status'])
+
+    const secondPrompt = await call(join(stateDir, 'daemon.sock'), promptRequest)
+    assert.equal(secondPrompt.ok, true, JSON.stringify(secondPrompt))
+    assert.equal(secondPrompt.data.requestId, derivedRequestId,
+      'a missing prompt requestId derives stably from the IPC id')
+    await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
+    const events = eventsOf(await adapter.sessionEvents({
+      address: { kind: 'session', sessionId: promptDelegation.data.sessionId },
+      maxMessages: 500,
+    }))
+    assert.equal(events.filter(event =>
+      event.type === 'user/message' && event.data.source?.rpcId === derivedRequestId).length, 1,
+    'a prompt retried after daemon restart must not persist twice')
   })
 
   await t.test('CLI delegations keep linked worktrees isolated and prove each selected model', async () => {

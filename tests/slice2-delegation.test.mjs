@@ -134,13 +134,13 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
   assert.ok(models.length >= 2, 'the scripted Host must advertise at least two models')
   const [modelOne, modelTwo] = models
 
-  function newCommands(label, subject = adapter) {
+  function newCommands(label, subject = adapter, sessionOptions = {}) {
     const filePath = join(root, `state-${label}`, 'delegations.json')
     const registry = new DelegationRegistry({ filePath })
     return {
       filePath,
       registry,
-      commands: new SessionCommands({ registry, adapter: subject }),
+      commands: new SessionCommands({ registry, adapter: subject, ...sessionOptions }),
     }
   }
 
@@ -287,6 +287,41 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     assert.ok(afterRetry.some(item => item.sessionId === record.sessionId), 'the preserved session still exists')
   })
 
+  await t.test('attach failure with a remote substituted session records conflict without rebinding', async () => {
+    const { filePath, commands } = newCommands('attach-substituted')
+    const params = input('attach-substituted')
+    const substitutedSessionId = `session-${randomUUID()}`
+
+    const faultedAdapter = createRemoteAdapter(operator.ctx.remote)
+    const realCreate = faultedAdapter.createSession
+    faultedAdapter.createSession = async request => {
+      await realCreate(request)
+      const error = new Error('simulated attach failure with a substituted session')
+      error.isDSHRemoteError = true
+      error.code = 'session/workspace-attach-failed'
+      error.details = { sessionId: substitutedSessionId, workspaceId: request.workspaceId }
+      throw error
+    }
+    const faulted = new SessionCommands({
+      registry: new DelegationRegistry({ filePath }),
+      adapter: faultedAdapter,
+    })
+
+    await assert.rejects(faulted.createDelegation(params), error => {
+      assert.equal(error?.code, 'delegation/session-substituted')
+      assert.notEqual(error.details.requestedSessionId, substitutedSessionId)
+      assert.equal(error.details.returnedSessionId, substitutedSessionId)
+      return true
+    })
+    const [record] = await ledgerEntries(filePath)
+    assert.equal(record.state, 'conflict')
+    assert.notEqual(record.sessionId, substitutedSessionId, 'the binding must not be overwritten')
+    assert.equal(record.substitutedSessionId, substitutedSessionId)
+    assert.equal(record.returnedSessionId, substitutedSessionId)
+
+    await assert.rejects(commands.createDelegation(params), errorCode('delegation/conflict'))
+  })
+
   await t.test('advertised model checks and request-window header proof isolate each session', async () => {
     const { registry, commands } = newCommands('models')
     const a = input('model-a', { model: modelOne })
@@ -345,6 +380,49 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     const afterAttempt = await sessionsInWorkspace(adapter, canonicalWorkspace)
     assert.equal(afterAttempt.length, before.length, 'model pre-check must fail before session creation')
     assert.equal(await registry.get(unavailable.delegationId), undefined)
+  })
+
+  await t.test('request-window verification inherits an unchanged header and ignores later turns', async () => {
+    const { commands } = newCommands('header-window', adapter, { historyPageMessages: 5 })
+    const params = input('header-window', { model: modelOne })
+    const created = await commands.createDelegation(params)
+
+    const first = `request-${randomUUID()}`
+    await commands.submitPrompt({ delegationId: params.delegationId, content: 'HEADER_WINDOW_ONE', requestId: first })
+    await waitForRequest(adapter, created.sessionId, first)
+
+    const second = `request-${randomUUID()}`
+    await commands.submitPrompt({ delegationId: params.delegationId, content: 'HEADER_WINDOW_TWO', requestId: second })
+    await waitForRequest(adapter, created.sessionId, second)
+
+    const inherited = await commands.verifyRequestModel({
+      delegationId: params.delegationId,
+      requestId: second,
+    })
+    assert.deepEqual({ provider: inherited.provider, model: inherited.model }, modelOne,
+      'a turn with an unchanged request header inherits the prior effective route')
+    assert.ok(Number.isInteger(inherited.turnEndSeq), 'verification reports the pinned turn end')
+
+    // The later turn changes the persisted header. It must never satisfy an
+    // earlier request's model proof.
+    await adapter.selectModel({ sessionId: created.sessionId, ...modelTwo })
+    const third = `request-${randomUUID()}`
+    await commands.submitPrompt({ delegationId: params.delegationId, content: 'HEADER_WINDOW_THREE', requestId: third })
+    const events = await waitForRequest(adapter, created.sessionId, third)
+    const latestHeader = events.findLast(event => event.type === 'request/header')
+    assert.equal(latestHeader?.data.header.config.model, modelTwo.model,
+      'the later turn must persist the changed header')
+
+    const firstAgain = await commands.verifyRequestModel({
+      delegationId: params.delegationId,
+      requestId: first,
+    })
+    const secondAgain = await commands.verifyRequestModel({
+      delegationId: params.delegationId,
+      requestId: second,
+    })
+    assert.deepEqual({ provider: firstAgain.provider, model: firstAgain.model }, modelOne)
+    assert.deepEqual({ provider: secondAgain.provider, model: secondAgain.model }, modelOne)
   })
 
   await t.test('repeated prompt requestId is accepted once and persists one user message', async () => {

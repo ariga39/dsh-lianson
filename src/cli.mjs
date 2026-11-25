@@ -7,7 +7,7 @@ import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { HostManager, createLock, hostStopSucceeded, resolveStateDir } from './host-manager.mjs'
 import { call, probe } from './ipc-client.mjs'
-import { failure } from './ipc-protocol.mjs'
+import { failure, stablePromptRequestId } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
 
@@ -251,8 +251,7 @@ function delegationRequest(action, values) {
   if (action === 'prompt') {
     const delegationId = required(values, 'delegation-id', 'prompt requires --delegation-id <id>')
     const content = required(values, 'content', 'prompt requires --content <text>')
-    const requestId = values['request-id']
-      ?? (values.id === undefined ? undefined : `request-${values.id}`)
+    const requestId = stablePromptRequestId(values['request-id'], values.id)
     return {
       command: 'delegation.prompt',
       params: {

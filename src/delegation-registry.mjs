@@ -209,9 +209,30 @@ export class DelegationRegistry {
     return this.#enqueue(async () => {
       await this.#load()
       const record = this.#require(delegationId)
+      if (failure.sessionId !== undefined && failure.sessionId !== record.sessionId) {
+        record.state = 'conflict'
+        record.updatedAt = new Date().toISOString()
+        record.substitutedSessionId = failure.sessionId
+        record.returnedSessionId = failure.sessionId
+        record.lastError = {
+          code: 'session/workspace-attach-failed',
+          message: failure.message ?? 'session was created but could not attach to its workspace',
+        }
+        await this.#persist()
+        throw new LiaisonError(
+          'delegation/session-substituted',
+          `Host attached session "${failure.sessionId}" after requesting "${record.sessionId}"; `
+            + 'refusing to overwrite the delegation binding',
+          {
+            delegationId,
+            requestedSessionId: record.sessionId,
+            returnedSessionId: failure.sessionId,
+            workspaceId: record.workspaceId,
+            upstreamCode: 'session/workspace-attach-failed',
+          },
+        )
+      }
       record.state = 'attach-failed'
-      if (failure.sessionId !== undefined) record.sessionId = failure.sessionId
-      if (failure.workspaceId !== undefined) record.workspaceId = failure.workspaceId
       record.updatedAt = new Date().toISOString()
       record.lastError = {
         code: 'session/workspace-attach-failed',

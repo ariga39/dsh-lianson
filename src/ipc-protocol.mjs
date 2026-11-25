@@ -20,6 +20,18 @@ export function failure(command, error, id) {
   return { ok: false, command, ...id === undefined ? {} : { id }, error }
 }
 
+/**
+ * Derive one stable Host request id from the caller's IPC request id.
+ * @param {string | undefined} requestId - caller-supplied prompt request id.
+ * @param {string | null | undefined} ipcId - IPC envelope id.
+ * @returns the explicit id, a derived id, or undefined.
+ */
+export function stablePromptRequestId(requestId, ipcId) {
+  if (requestId !== undefined) return requestId
+  if (typeof ipcId === 'string' && ipcId !== '') return `request-${ipcId}`
+  return undefined
+}
+
 function canonical(value) {
   if (Array.isArray(value)) return `[${value.map(canonical).join(',')}]`
   if (value !== null && typeof value === 'object') {

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto'
 import { chmod, mkdir, open, readdir, readFile, rename, stat, unlink } from 'node:fs/promises'
 import { createRequire } from 'node:module'
 import { homedir } from 'node:os'
-import { basename, dirname, join, resolve } from 'node:path'
+import { basename, dirname, isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 import { LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
@@ -49,13 +49,16 @@ export function parseLaunchAnnouncement(line) {
   return /^dsh web: (http:\/\/\S+)$/u.exec(line)?.[1]
 }
 
-/** State directory: explicit test override, XDG runtime, then the user's state home. */
+/** State directory: explicit test override, XDG state home, then the user's state home. */
 export function resolveStateDir(env = process.env) {
   if (typeof env.DSH_LIAISON_STATE_DIR === 'string' && env.DSH_LIAISON_STATE_DIR !== '') {
     return resolve(env.DSH_LIAISON_STATE_DIR)
   }
-  if (typeof env.XDG_RUNTIME_DIR === 'string' && env.XDG_RUNTIME_DIR !== '') {
-    return join(env.XDG_RUNTIME_DIR, 'dsh-liaison')
+  // Durable state (including the delegation ledger) must survive an
+  // XDG_RUNTIME_DIR clearing at logout or reboot, so runtime directories are
+  // deliberately not consulted here.
+  if (typeof env.XDG_STATE_HOME === 'string' && isAbsolute(env.XDG_STATE_HOME)) {
+    return join(env.XDG_STATE_HOME, 'dsh-liaison')
   }
   return join(env.HOME ?? homedir(), '.local', 'state', 'dsh-liaison')
 }

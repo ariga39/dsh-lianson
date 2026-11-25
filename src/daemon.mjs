@@ -3,7 +3,7 @@
 import { HostManager, hostStopSucceeded, resolveStateDir } from './host-manager.mjs'
 import { OperatorConnection } from './operator-connection.mjs'
 import { startIpcServer } from './ipc-server.mjs'
-import { IPC_COMMANDS, failure, success } from './ipc-protocol.mjs'
+import { IPC_COMMANDS, failure, stablePromptRequestId, success } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
 import { redactSecrets } from './redaction.mjs'
 import { DelegationRegistry } from './delegation-registry.mjs'
@@ -179,7 +179,9 @@ async function dispatch(request) {
     }
     if (key === 'delegation.prompt') {
       await requireDelegationHost()
-      return { envelope: success(command, await delegations.prompt(params), id) }
+      const requestId = stablePromptRequestId(params.requestId, id)
+      const promptParams = requestId === undefined ? params : { ...params, requestId }
+      return { envelope: success(command, await delegations.prompt(promptParams), id) }
     }
     if (key === 'delegation.verifyModel') {
       await requireDelegationHost()
