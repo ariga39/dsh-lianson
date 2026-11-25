@@ -386,7 +386,10 @@ export async function readSubagentStatus(adapter, sessionId) {
   }
   const values = projectionValues(projections)
   if (values === undefined) return emptySubagentStatus('projections-unavailable')
-  const raw = Array.isArray(values.subagentCatalog) ? values.subagentCatalog : []
+  if (!Array.isArray(values.subagentCatalog)) {
+    return emptySubagentStatus('subagent-catalog-unavailable')
+  }
+  const raw = values.subagentCatalog
   const catalog = []
 
   for (const entry of raw) {

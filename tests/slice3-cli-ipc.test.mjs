@@ -123,6 +123,7 @@ test('slice3 CLI/IPC: status, wait and events over the real daemon keep delegati
     '--slice-timeout-ms', '1000',
   ])
   assert.equal(waitB.data.reason, 'idle')
+  assert.equal(waitB.data.indeterminate, false)
   assert.ok(waitB.data.assistantMessages.some(message => /SLICE2_FINAL_DONE/u.test(message.text)))
   assert.equal(aSettled, false, 'B completed while the unrelated A wait was still running')
   assert.equal(await readFile(join(fixture.cwd, 'slice3-cli-b.txt'), 'utf8'), `written by ${model.model}\n`)
@@ -133,6 +134,7 @@ test('slice3 CLI/IPC: status, wait and events over the real daemon keep delegati
   assert.equal(aWait.result.envelope?.ok, true, aWait.result.stdout)
   const waitedA = aWait.result.envelope.data
   assert.equal(waitedA.reason, 'idle')
+  assert.equal(waitedA.indeterminate, false)
   assert.ok(waitedA.slices >= 2, `wait A crossed multiple Host windows (${waitedA.slices})`)
   assert.ok(waitedA.assistantMessages.some(message => /SLICE3_HOLD_FINAL/u.test(message.text)))
   assert.equal(waitedA.subagentCatalog.length, 0)

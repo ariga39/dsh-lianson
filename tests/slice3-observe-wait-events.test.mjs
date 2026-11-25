@@ -173,8 +173,10 @@ test('slice3: EventReader pins the tail cursor and reconstructs [afterSeq + 1 ..
 })
 
 test('slice3: deriveStatus and input-required waits resolve without probing subagents', async () => {
-  assert.equal(deriveStatus({ pendingInput: ['question'], running: true }), 'input-required')
-  assert.equal(deriveStatus({ pendingInput: [], running: true }), 'running')
+  assert.equal(deriveStatus({ pendingInput: ['question'], running: true, queue: [{ id: 'q' }] }), 'input-required')
+  assert.equal(deriveStatus({ pendingInput: [], running: true, queue: [{ id: 'q' }] }), 'running')
+  assert.equal(deriveStatus({ pendingInput: [], running: false, queue: [{ id: 'q' }] }), 'queued')
+  assert.equal(deriveStatus({ pendingInput: [], running: false, queue: [] }), 'idle')
   assert.equal(deriveStatus({ pendingInput: [], running: false }), 'idle')
 
   const registry = {
@@ -202,6 +204,192 @@ test('slice3: deriveStatus and input-required waits resolve without probing suba
   assert.equal(result.slices, 1)
   assert.equal(result.subagents, null)
   assert.equal(probes, 0)
+})
+
+test('slice3: waitForSubagents retries unavailable child status and returns explicit indeterminate', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-indeterminate', state: 'ready' }
+    },
+  }
+  let now = 0
+  let probes = 0
+  const idleState = { cursor: 4, active: true, running: false, queue: [], pendingInput: [] }
+  const adapter = {
+    async sessionWait() {
+      return { reason: 'idle', state: idleState, output: { records: [], truncated: false } }
+    },
+    async sessionProjections() {
+      probes += 1
+      const error = new Error('projection read failed')
+      error.code = 'gateway/internal'
+      throw error
+    },
+    async sessionEvents() { throw new Error('events are not read without truncation') },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 100,
+  })
+  const result = await waiter.wait({
+    delegationId: 'indeterminate',
+    timeoutMs: 500,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'timeout', 'unavailable child status must not be reported as idle')
+  assert.equal(result.indeterminate, true)
+  assert.equal(result.indeterminateReason, 'subagent-status-unavailable')
+  assert.equal(result.subagents.available, false)
+  assert.ok(probes >= 2, 'the waiter retries the projection within the deadline')
+})
+
+test('slice3: waitForSubagents recovers from transient child-status failure', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-recovering', state: 'ready' }
+    },
+  }
+  let now = 0
+  let probes = 0
+  const idleState = { cursor: 4, active: true, running: false, queue: [], pendingInput: [] }
+  const adapter = {
+    async sessionWait() {
+      return { reason: 'idle', state: idleState, output: { records: [], truncated: false } }
+    },
+    async sessionProjections() {
+      probes += 1
+      if (probes === 1) throw new Error('transient projection failure')
+      return { kind: 'sequenced', asOfSeq: 4, values: { subagentCatalog: [] } }
+    },
+    async sessionEvents() { throw new Error('events are not read without truncation') },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 100,
+  })
+  const result = await waiter.wait({
+    delegationId: 'recovering',
+    timeoutMs: 2_000,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'idle')
+  assert.equal(result.indeterminate, false)
+  assert.equal(result.indeterminateReason, null)
+  assert.ok(result.slices >= 2, 'the waiter retried before declaring idle')
+  assert.equal(probes, 2)
+})
+
+test('slice3: waitForSubagents reports indeterminate when a local child is unreadable', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-child-unreadable', state: 'ready' }
+    },
+  }
+  let now = 0
+  const idleState = { cursor: 6, active: true, running: false, queue: [], pendingInput: [] }
+  const adapter = {
+    async sessionWait() {
+      return { reason: 'idle', state: idleState, output: { records: [], truncated: false } }
+    },
+    async sessionProjections({ sessionId }) {
+      if (sessionId === 'child-unreadable') {
+        return { kind: 'sequenced', asOfSeq: 2, values: {} }
+      }
+      return {
+        kind: 'sequenced',
+        asOfSeq: 6,
+        values: {
+          subagentCatalog: [{ id: 'child-unreadable', mode: 'one-shot', label: 'child', createdAt: 1 }],
+        },
+      }
+    },
+    async sessionState() {
+      const error = new Error('child state unavailable')
+      error.code = 'session/not-found'
+      throw error
+    },
+    async sessionEvents() { throw new Error('events are not read without truncation') },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 100,
+  })
+  const result = await waiter.wait({
+    delegationId: 'child-unreadable',
+    timeoutMs: 500,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'timeout')
+  assert.equal(result.indeterminate, true)
+  assert.equal(result.indeterminateReason, 'subagent-status-unavailable')
+  assert.deepEqual(result.activeSubagents, [])
+  assert.deepEqual(result.subagents.unavailableSubagents.map(entry => entry.id), ['child-unreadable'])
+})
+
+test('slice3: nonempty root queue with running=false is queued and never idle in wait', async () => {
+  const queuedState = {
+    cursor: 9,
+    active: true,
+    running: false,
+    queue: [{ id: 'queued-message', placement: 'queued' }],
+    pendingInput: [],
+  }
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-queued', state: 'ready' }
+    },
+  }
+  const statusWaiter = new StateWaiter({
+    registry,
+    adapter: {
+      async sessionState() { return queuedState },
+      async sessionWait() { throw new Error('status does not wait') },
+      async sessionEvents() { throw new Error('status does not read events') },
+      async sessionProjections() {
+        return { kind: 'sequenced', asOfSeq: 9, values: { subagentCatalog: [] } }
+      },
+    },
+  })
+  const status = await statusWaiter.getStatus({ delegationId: 'queued-status' })
+  assert.equal(status.status, 'queued')
+  assert.deepEqual(status.subagentCatalog, [])
+
+  let now = 0
+  const waiter = new StateWaiter({
+    registry,
+    adapter: {
+      async sessionWait() {
+        return { reason: 'idle', state: queuedState, output: { records: [], truncated: false } }
+      },
+      async sessionProjections() {
+        throw new Error('subagent status is not needed without waitForSubagents')
+      },
+      async sessionEvents() { throw new Error('events are not read without truncation') },
+    },
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 100,
+  })
+  const result = await waiter.wait({
+    delegationId: 'queued-wait',
+    timeoutMs: 500,
+    sliceTimeoutMs: 200,
+  })
+  assert.equal(result.reason, 'timeout', 'queued work must not be reported as idle')
+  assert.equal(result.state.queue.length, 1)
+  assert.equal(result.indeterminate, false)
 })
 
 test('slice3: subagent status reports unknown, external and unreadable children honestly', async () => {
@@ -262,6 +450,15 @@ test('slice3: subagent status reports unknown, external and unreadable children 
   assert.equal(unavailable.available, false)
   assert.equal(unavailable.reason, 'projections-unavailable')
   assert.deepEqual(unavailable.catalog, [])
+
+  const noCatalog = await readSubagentStatus({
+    async sessionProjections() {
+      return { kind: 'sequenced', asOfSeq: 3, values: {} }
+    },
+  }, 'session-no-catalog')
+  assert.equal(noCatalog.available, false)
+  assert.equal(noCatalog.reason, 'subagent-catalog-unavailable')
+  assert.deepEqual(noCatalog.catalog, [])
 })
 
 // ─── Real Host ───────────────────────────────────────────────────────────────
@@ -614,6 +811,7 @@ test('slice3: real Host state, segmented waits, paginated contiguity and subagen
       waitForSubagents: true,
     })
     assert.equal(result.reason, 'idle')
+    assert.equal(result.indeterminate, false)
     assert.ok(observedActiveChild, 'the child was observed running while the parent was idle')
     assert.deepEqual(result.activeSubagents, [], 'waitForSubagents returns only after background work settles')
     const observed = result.subagentCatalog.find(child => child.id === entry.id)

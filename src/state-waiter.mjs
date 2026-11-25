@@ -17,11 +17,12 @@ function defaultSleep(milliseconds) {
 /**
  * Derive the caller-visible status from one passive state sample.
  * @param {object} state - `SessionState`.
- * @returns {'input-required'|'running'|'idle'} status.
+ * @returns {'input-required'|'running'|'queued'|'idle'} status.
  */
 export function deriveStatus(state) {
   if ((state?.pendingInput?.length ?? 0) > 0) return 'input-required'
   if (state?.running === true) return 'running'
+  if ((state?.queue?.length ?? 0) > 0) return 'queued'
   return 'idle'
 }
 
@@ -29,6 +30,19 @@ function assertPositiveInteger(value, name) {
   if (!Number.isSafeInteger(value) || value <= 0) {
     throw new TypeError(`${name} must be a positive safe integer`)
   }
+}
+
+/**
+ * Whether background child work cannot be ruled out from one observation.
+ * Unknown/external catalog rows are historical and have no local status; they
+ * are reported but never make an otherwise healthy idle result indeterminate.
+ * @param {object} subagents - `readSubagentStatus` result.
+ * @returns {string|null} stable indeterminate reason, or null when status is trustworthy.
+ */
+function subagentIndeterminate(subagents) {
+  if (subagents?.available !== true) return 'subagent-status-unavailable'
+  if ((subagents.unavailableSubagents?.length ?? 0) > 0) return 'subagent-status-unavailable'
+  return null
 }
 
 /** Passive status and multi-window wait over a bound delegation. */
@@ -180,7 +194,72 @@ export class StateWaiter {
       }
 
       if (value.reason === 'idle') {
+        if ((value.state?.queue?.length ?? 0) > 0) {
+          // A nonempty root queue means work is pending even while no turn is
+          // running. Never report idle; wait for the queued turn within the
+          // caller's deadline.
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'timeout',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents: await this.#readSubagents(sessionId),
+              collected,
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          continue
+        }
+
         const subagents = await this.#readSubagents(sessionId)
+        const indeterminateReason = waitForSubagents ? subagentIndeterminate(subagents) : null
+        if (indeterminateReason !== null) {
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'timeout',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents,
+              collected,
+              indeterminate: true,
+              indeterminateReason,
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          if (this.#clock() >= deadline) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'timeout',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents,
+              collected,
+              indeterminate: true,
+              indeterminateReason,
+            })
+          }
+          continue
+        }
+
         if (waitForSubagents && subagents.activeSubagents.length > 0) {
           const left = deadline - this.#clock()
           if (left <= 0) {
@@ -244,6 +323,7 @@ export class StateWaiter {
   #snapshot({
     delegationId, sessionId, reason, state, pendingInput, startedAt,
     cursor, slices, backfilled, outputTruncated, subagents, collected,
+    indeterminate = false, indeterminateReason = null,
   }) {
     const assistantMessages = [...collected.values()]
       .sort((left, right) => left.seq - right.seq)
@@ -257,6 +337,8 @@ export class StateWaiter {
       elapsedMs: this.#clock() - startedAt,
       backfilled,
       outputTruncated,
+      indeterminate,
+      indeterminateReason,
       state: state ?? null,
       pendingInput: pendingInput ?? state?.pendingInput ?? [],
       assistantMessages,
