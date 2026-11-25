@@ -5,8 +5,22 @@ import { redactSecrets } from './redaction.mjs'
 import { assertLoopbackOrigin } from './host-manager.mjs'
 import { loadUpstream } from './upstream.mjs'
 
-function sleep(ms) {
-  return new Promise(resolve => setTimeout(resolve, ms))
+function sleep(ms, signal) {
+  return new Promise(resolve => {
+    if (signal?.aborted === true) {
+      resolve()
+      return
+    }
+    let timer
+    const done = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      signal?.removeEventListener('abort', abort)
+      resolve()
+    }
+    const abort = () => done()
+    timer = setTimeout(done, ms)
+    signal?.addEventListener('abort', abort, { once: true })
+  })
 }
 
 function unauthorized(error) {
@@ -64,6 +78,7 @@ export class OperatorConnection {
     this.opening = undefined
     this.reconnectPromise = undefined
     this.stopping = false
+    this.lifecycle = new AbortController()
     this.connectedGeneration = 0
     this.connectCount = 0
     this.reconnectCount = 0
@@ -182,34 +197,50 @@ export class OperatorConnection {
       await previous.ctx.fiber.dispose().catch(() => {})
     }
 
-    let delay = previous === undefined ? 0 : Math.max(0, this.reconnectDelayMs)
+    const persistent = previous !== undefined
+    let attempt = 0
+    let delay = persistent ? Math.max(0, this.reconnectDelayMs) : 0
     let lastError = reason
-    for (let attempt = 1; attempt <= this.reconnectAttempts; attempt += 1) {
-      if (this.stopping) throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
-      if (delay > 0) await sleep(delay + Math.floor(Math.random() * Math.min(50, delay / 2)))
+    while (true) {
+      if (this.stopping || this.lifecycle.signal.aborted) {
+        throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
+      }
+      attempt += 1
+      if (delay > 0) {
+        await sleep(delay + Math.floor(Math.random() * Math.min(50, delay / 2)), this.lifecycle.signal)
+      }
+      if (this.stopping || this.lifecycle.signal.aborted) {
+        throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
+      }
       try {
         const host = await this.#currentHost()
         const generation = await this.#openGeneration(host)
         this.generation = generation
         this.connectedGeneration += 1
         this.connectCount += 1
-        if (previous !== undefined || this.connectCount > 1) this.reconnectCount += 1
+        if (persistent || this.connectCount > 1) this.reconnectCount += 1
         this.lastError = undefined
         return
       } catch (error) {
         lastError = error
         this.lastError = error
         const code = typeof error?.code === 'string' ? error.code : ''
-        if (code === 'HOST_ORIGIN_CHANGED' || code === 'HOST_ORIGIN_UNSAFE') throw error
-        if (attempt === this.reconnectAttempts) break
-        delay = Math.min(this.reconnectMaxDelayMs,
-          Math.max(50, this.reconnectDelayMs > 0 ? this.reconnectDelayMs : 50) * 2 ** (attempt - 1))
+        if (code === 'HOST_ORIGIN_CHANGED' || code === 'HOST_ORIGIN_UNSAFE'
+          || code === 'OPERATOR_STOPPED') throw error
+        // Once a generation has been established, recovery stays active with a
+        // capped backoff until it succeeds or close() cancels it.
+        if (!persistent && attempt >= this.reconnectAttempts) break
+        const base = Math.max(50, this.reconnectDelayMs)
+        delay = Math.min(this.reconnectMaxDelayMs, base * 2 ** Math.min(attempt - 1, 10))
       }
     }
     throw lastError
   }
 
   async #openGeneration(host) {
+    if (this.stopping || this.lifecycle.signal.aborted) {
+      throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
+    }
     const upstream = await this.#getUpstream()
     const generation = {
       ctx: undefined,
@@ -250,10 +281,13 @@ export class OperatorConnection {
   async #waitReady(generation) {
     const deadline = Date.now() + this.readyTimeoutMs
     while (Date.now() < deadline) {
+      if (this.stopping || this.lifecycle.signal.aborted) {
+        throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
+      }
       if (generation.disposed) throw new LiaisonError('CONNECTION_DISPOSED', 'Connection generation was disposed')
       if (generation.failed !== undefined) throw generation.failed
       if (generation.ctx?.get('connection')?.generation.getSnapshot() !== undefined) return
-      await sleep(50)
+      await sleep(50, this.lifecycle.signal)
     }
     throw new LiaisonError('CONNECTION_TIMEOUT', 'Operator connection did not become ready')
   }
@@ -272,9 +306,12 @@ export class OperatorConnection {
         method: 'GET',
         redirect: 'manual',
         headers: { accept: 'application/json' },
-        signal: AbortSignal.timeout(15_000),
+        signal: AbortSignal.any([AbortSignal.timeout(15_000), this.lifecycle.signal]),
       })
     } catch (error) {
+      if (this.stopping || this.lifecycle.signal.aborted) {
+        throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
+      }
       throw new LiaisonError('CONNECT_FAILED', 'Could not reach the Host /connect endpoint', { cause: String(error?.code ?? '') })
     }
     const rawCookies = typeof response.headers.getSetCookie === 'function'
@@ -358,6 +395,7 @@ export class OperatorConnection {
 
   async close() {
     this.stopping = true
+    this.lifecycle.abort(new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed'))
     if (this.reconnectPromise !== undefined) await this.reconnectPromise.catch(() => {})
     await this.#disposeCurrent()
     await this.#disposeGeneration(this.opening)

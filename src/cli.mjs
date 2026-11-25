@@ -3,7 +3,7 @@
 import { spawn } from 'node:child_process'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { resolveStateDir } from './host-manager.mjs'
+import { HostManager, resolveStateDir } from './host-manager.mjs'
 import { call, probe } from './ipc-client.mjs'
 import { failure } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
@@ -11,6 +11,11 @@ import { redactSecrets } from './redaction.mjs'
 
 const DAEMON_PATH = join(import.meta.dirname, 'daemon.mjs')
 const COMMANDS = new Set(['start', 'status', 'ping', 'stop'])
+// Host spawn permits 120s and stop permits 10s SIGTERM + 2s SIGKILL, on top of
+// the Host lock wait. The IPC deadline must cover the documented operation,
+// not just ordinary replies.
+const START_TIMEOUT_MS = 180_000
+const STOP_TIMEOUT_MS = 180_000
 
 const HELP = `Usage: dsh-liaison host <start|status|ping|stop> [options]
 
@@ -76,6 +81,26 @@ function hostParams(values) {
   return params
 }
 
+async function stopWithoutDaemon({ stateDir, keepHost }) {
+  const manager = new HostManager({ stateDir })
+  if (keepHost) {
+    const host = await manager.inspectHost({ probe: false }).catch(() => null)
+    return {
+      daemonPid: null,
+      hostPid: host?.pid ?? null,
+      stoppedHost: false,
+      stopReason: 'kept',
+    }
+  }
+  const stopped = await manager.stopHost()
+  return {
+    daemonPid: null,
+    hostPid: stopped.pid ?? null,
+    stoppedHost: stopped.stopped,
+    stopReason: stopped.reason,
+  }
+}
+
 async function execute(argv, io) {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -106,11 +131,14 @@ async function execute(argv, io) {
 
   let envelope
   try {
-    if (action === 'stop' && !(await probe(socketPath, 500))) {
+    if (action === 'stop' && !(await probe(socketPath, 1_000))) {
       envelope = {
         ok: true,
         command,
-        data: { daemonPid: null, hostPid: null, stoppedHost: false, stopReason: 'daemon-not-running' },
+        data: await stopWithoutDaemon({
+          stateDir,
+          keepHost: values['keep-host'] === true,
+        }),
       }
     } else {
       await ensureDaemon(socketPath)
@@ -119,7 +147,7 @@ async function execute(argv, io) {
       envelope = await call(socketPath, {
         command,
         params,
-        timeoutMs: action === 'stop' ? 30_000 : 60_000,
+        timeoutMs: action === 'stop' ? STOP_TIMEOUT_MS : START_TIMEOUT_MS,
       })
     }
   } catch (error) {

@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { loadUpstream } from '../src/upstream.mjs'
-import { HostManager } from '../src/host-manager.mjs'
+import { HostManager, inspectProcess } from '../src/host-manager.mjs'
 import { OperatorConnection } from '../src/operator-connection.mjs'
 import { startScriptedMessagesServer } from './support/scripted-messages-server.mjs'
 import { createKeylessEnvironment } from './support/keyless-environment.mjs'
@@ -173,6 +173,23 @@ test('slice1: daemon keeps state private, exposes no TCP listener, and redacts c
   assert.equal(/token=/u.test(combined), false, 'CLI output must not contain token query strings')
   assert.equal(/dsh-auth-/u.test(combined), false, 'CLI output must not contain v2 cookies')
   assert.equal(/\bv2\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/u.test(combined), false)
+
+  const lockPath = join(stateDir, 'daemon.lock')
+  const daemonLock = JSON.parse(await readFile(lockPath, 'utf8'))
+  assert.equal(daemonLock.pid, startedData.daemonPid,
+    'the daemon must still own its startup lock while serving')
+
+  const stopped = await runCli(['host', 'stop'], { cwd: fixtureEnvironment.cwd, env })
+  assert.equal(stopped.code, 0, stopped.stderr)
+  assert.equal(stopped.envelope?.ok, true, stopped.stdout)
+  assert.equal(stopped.envelope.data.stoppedHost, true)
+  await waitForExit(startedData.daemonPid)
+  await waitForExit(startedData.hostPid)
+  await waitFor(async () => {
+    try { await stat(lockPath); return false } catch (error) { if (error?.code === 'ENOENT') return true; throw error }
+  }, { label: 'daemon lock release' })
+  await assert.rejects(() => stat(startedData.socketPath), error => error?.code === 'ENOENT')
+  started = undefined
 })
 
 test('slice1: concurrent CLI starts share one Host and a stale socket is reclaimed after daemon loss', { timeout: 240_000 }, async (t) => {
@@ -228,6 +245,134 @@ test('slice1: concurrent CLI starts share one Host and a stale socket is reclaim
   assert.equal((await stat(join(stateDir, 'daemon.sock'))).mode & 0o777, 0o600)
 })
 
+test('slice1: host stop after daemon loss stops a verified surviving Host unless keep-host', { timeout: 240_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-stop-'))
+  const mock = await startScriptedMessagesServer()
+  const fixtureEnvironment = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
+  const stateDir = join(root, 'state')
+  const env = { ...fixtureEnvironment.env, DSH_LIAISON_STATE_DIR: stateDir }
+  const args = [
+    'host', 'start',
+    '--workspace', fixtureEnvironment.cwd,
+    '--dsh-home', fixtureEnvironment.dshHome,
+    '--patch', fixtureEnvironment.overlayPath,
+  ]
+  t.after(async () => {
+    await new HostManager({ stateDir, env: process.env }).stopHost().catch(() => {})
+    await mock.close().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const first = await runCli(args, { cwd: fixtureEnvironment.cwd, env })
+  assert.equal(first.code, 0, first.stderr)
+  assert.equal(first.envelope?.ok, true, first.stdout)
+  const firstHostPid = first.envelope.data.hostPid
+  process.kill(first.envelope.data.daemonPid, 'SIGKILL')
+  await waitForExit(first.envelope.data.daemonPid)
+
+  const stopped = await runCli(['host', 'stop'], { cwd: fixtureEnvironment.cwd, env })
+  assert.equal(stopped.code, 0, stopped.stderr)
+  assert.equal(stopped.envelope?.ok, true, stopped.stdout)
+  assert.equal(stopped.envelope.command, 'host stop')
+  assert.equal(stopped.envelope.data.daemonPid, null)
+  assert.equal(stopped.envelope.data.hostPid, firstHostPid)
+  assert.equal(stopped.envelope.data.stoppedHost, true,
+    'a daemon-less stop must still stop the verified surviving Host')
+  await waitForExit(firstHostPid)
+  await assert.rejects(() => stat(join(stateDir, 'host.json')), error => error?.code === 'ENOENT')
+
+  const second = await runCli(args, { cwd: fixtureEnvironment.cwd, env })
+  assert.equal(second.code, 0, second.stderr)
+  assert.equal(second.envelope?.ok, true, second.stdout)
+  const secondHostPid = second.envelope.data.hostPid
+  process.kill(second.envelope.data.daemonPid, 'SIGKILL')
+  await waitForExit(second.envelope.data.daemonPid)
+
+  const kept = await runCli(['host', 'stop', '--keep-host'], { cwd: fixtureEnvironment.cwd, env })
+  assert.equal(kept.code, 0, kept.stderr)
+  assert.equal(kept.envelope?.ok, true, kept.stdout)
+  assert.equal(kept.envelope.data.stoppedHost, false)
+  assert.equal(kept.envelope.data.stopReason, 'kept')
+  assert.equal(kept.envelope.data.hostPid, secondHostPid)
+  process.kill(secondHostPid, 0)
+  await sleep(100)
+  assert.equal(process.kill(secondHostPid, 0), true, '--keep-host must leave dsh web running')
+})
+
+test('slice1: reconnect keeps retrying past five failures and close cancels the retry loop', { timeout: 180_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-retry-'))
+  const mock = await startScriptedMessagesServer()
+  const fixtureEnvironment = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
+  const stateDir = join(root, 'state')
+  const manager = new HostManager({
+    stateDir,
+    dshHome: fixtureEnvironment.dshHome,
+    cwd: fixtureEnvironment.cwd,
+    patches: [fixtureEnvironment.overlayPath],
+    port: 0,
+    env: fixtureEnvironment.env,
+  })
+  let operator
+  t.after(async () => {
+    await operator?.close().catch(() => {})
+    await manager.stopHost().catch(() => {})
+    await mock.close().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const host = await manager.ensureHost()
+  const upstream = await loadUpstream()
+  const transport = createTransportFixture(upstream.WebSocket)
+  operator = new OperatorConnection({
+    hostManager: manager,
+    host,
+    upstream,
+    createWebSocket: transport.createWebSocket,
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 50,
+  })
+  await operator.ensureConnected()
+  await readModelCatalog(await operator.withClient(remote => remote))
+
+  const realFetch = operator.fetchImpl
+  let connectFailures = 0
+  let failureLimit = 7
+  operator.fetchImpl = (input, init) => {
+    if (String(input).includes('/connect') && connectFailures < failureLimit) {
+      connectFailures += 1
+      return Promise.reject(new Error('simulated /connect outage'))
+    }
+    return realFetch(input, init)
+  }
+
+  assert.equal(transport.forceDropMux(), 1)
+  await waitFor(() => operator.snapshot().connected === true && connectFailures >= 7, {
+    timeoutMs: 30_000,
+    label: 'recovery after more than five failed /connect exchanges',
+  })
+  assert.equal(connectFailures, 7, 'the retry loop must survive the old five-attempt bound')
+  assert.equal(operator.snapshot().reconnectCount, 1)
+  await readModelCatalog(await operator.withClient(remote => remote))
+
+  connectFailures = 0
+  failureLimit = Number.POSITIVE_INFINITY
+  operator.reconnectDelayMs = 5_000
+  operator.reconnectMaxDelayMs = 5_000
+  assert.equal(transport.forceDropMux(), 1)
+  await waitFor(() => operator.snapshot().connected === false && connectFailures >= 1, {
+    timeoutMs: 15_000,
+    label: 'the persistent retry loop to make another attempt',
+  })
+  const attemptsBeforeClose = connectFailures
+  const closeStarted = Date.now()
+  await operator.close()
+  const closeElapsed = Date.now() - closeStarted
+  assert.ok(closeElapsed < 2_000, `close must cancel the backoff wait (took ${String(closeElapsed)}ms)`)
+  await sleep(300)
+  assert.equal(connectFailures, attemptsBeforeClose, 'no retry may run after close')
+  assert.equal(operator.snapshot().connected, false)
+})
+
 test('slice1: stale unverified Host records are never signalled and foreign origins are rejected', { timeout: 60_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-ownership-'))
   const stateDir = join(root, 'state')
@@ -239,6 +384,27 @@ test('slice1: stale unverified Host records are never signalled and foreign orig
     await rm(root, { recursive: true, force: true })
   })
   await waitFor(() => sleeper.pid !== undefined && sleeper.exitCode === null, { label: 'sleeper start' })
+  const exitedChild = spawn(process.execPath, ['-e', ''], { stdio: 'ignore' })
+  await new Promise(resolve => exitedChild.once('exit', resolve))
+  const deadPid = exitedChild.pid
+
+  const deadInspection = await inspectProcess({ pid: deadPid, marker: randomUUID() })
+  assert.equal(deadInspection.ok, false)
+  assert.equal(deadInspection.alive, false)
+  assert.equal(deadInspection.reason, 'dead')
+  const hiddenProcfs = await inspectProcess(
+    { pid: sleeper.pid, marker: randomUUID() },
+    { procRoot: join(root, 'no-procfs') },
+  )
+  assert.equal(hiddenProcfs.ok, false)
+  assert.equal(hiddenProcfs.alive, true, 'a live pid is not dead merely because procfs is unavailable')
+  assert.equal(hiddenProcfs.reason, 'unverified')
+  assert.equal(hiddenProcfs.unsupported, true)
+  const hiddenDead = await inspectProcess(
+    { pid: deadPid, marker: randomUUID() },
+    { procRoot: join(root, 'no-procfs') },
+  )
+  assert.equal(hiddenDead.reason, 'dead', 'an OS-confirmed gone pid is still dead without procfs')
 
   const manager = new HostManager({ stateDir, env: process.env })
   const recordPath = join(stateDir, 'host.json')

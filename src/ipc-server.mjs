@@ -49,6 +49,7 @@ export async function startIpcServer({
     released = true
     await release()
   }
+  let retainLock = false
   try {
     if (await probe(socketPath, 1_000)) {
       await releaseLock()
@@ -135,6 +136,7 @@ export async function startIpcServer({
     await chmod(socketPath, 0o600)
     const identity = await lstat(socketPath)
     let closed = false
+    retainLock = true
 
     return {
       reused: false,
@@ -143,18 +145,21 @@ export async function startIpcServer({
       close: async () => {
         if (closed) return
         closed = true
-        server.closeAllConnections?.()
-        await new Promise(resolve => server.close(() => resolve()))
         try {
-          const current = await lstat(socketPath)
-          if (current.ino === identity.ino) await unlink(socketPath)
-        } catch (error) {
-          if (error?.code !== 'ENOENT') throw error
+          server.closeAllConnections?.()
+          await new Promise(resolve => server.close(() => resolve()))
+          try {
+            const current = await lstat(socketPath)
+            if (current.ino === identity.ino) await unlink(socketPath)
+          } catch (error) {
+            if (error?.code !== 'ENOENT') throw error
+          }
+        } finally {
+          await releaseLock()
         }
-        await releaseLock()
       },
     }
   } finally {
-    await releaseLock()
+    if (!retainLock) await releaseLock()
   }
 }

@@ -121,9 +121,38 @@ async function bootId() {
   return cachedBootId
 }
 
-async function readProcStat(pid) {
+const procfsAvailability = new Map()
+
+async function procfsAvailable(procRoot = '/proc') {
+  if (procfsAvailability.has(procRoot)) return procfsAvailability.get(procRoot)
+  if (procRoot === '/proc' && process.platform !== 'linux') {
+    procfsAvailability.set(procRoot, false)
+    return false
+  }
   try {
-    const content = await readFile(`/proc/${String(pid)}/stat`, 'utf8')
+    await readFile(join(procRoot, 'self', 'stat'), 'utf8')
+    procfsAvailability.set(procRoot, true)
+    return true
+  } catch {
+    procfsAvailability.set(procRoot, false)
+    return false
+  }
+}
+
+/** Liveness without procfs; unknown means the pid may exist but identity is unprovable. */
+export async function pidLiveness(pid) {
+  try {
+    process.kill(pid, 0)
+    return 'alive'
+  } catch (error) {
+    if (error?.code === 'ESRCH') return 'dead'
+    return 'unknown'
+  }
+}
+
+async function readProcStat(pid, procRoot = '/proc') {
+  try {
+    const content = await readFile(join(procRoot, String(pid), 'stat'), 'utf8')
     const end = content.lastIndexOf(')')
     if (end === -1) return undefined
     const fields = content.slice(end + 2).trim().split(/\s+/u)
@@ -141,31 +170,50 @@ export async function processStartToken(pid) {
   return `${await bootId()}:${info.startTime}`
 }
 
-async function readProcessEnvironment(pid) {
-  try { return await readFile(`/proc/${String(pid)}/environ`, 'utf8') } catch { return undefined }
+async function readProcessEnvironment(pid, procRoot = '/proc') {
+  try { return await readFile(join(procRoot, String(pid), 'environ'), 'utf8') } catch { return undefined }
 }
 
 /**
  * Verify that a record's pid is still the exact process we spawned.
+ *
+ * A missing or unreadable procfs proves nothing about the pid: liveness comes
+ * from the OS probe, and identity remains unverified. Only a confirmed dead or
+ * reused pid is treated as safe to reclaim.
  * @param {{pid: number, marker?: string, procStart?: string}} record
+ * @param {{procRoot?: string}} [options]
  */
-export async function inspectProcess(record) {
+export async function inspectProcess(record, { procRoot = '/proc' } = {}) {
   if (!Number.isInteger(record?.pid) || record.pid <= 0) {
     return { ok: false, alive: false, reason: 'dead' }
   }
-  let info
-  try { info = await readProcStat(record.pid) } catch {
-    return { ok: false, alive: false, reason: 'unverified' }
+  const procfs = await procfsAvailable(procRoot)
+  if (!procfs) {
+    const liveness = await pidLiveness(record.pid)
+    if (liveness === 'dead') return { ok: false, alive: false, reason: 'dead' }
+    return { ok: false, alive: true, reason: 'unverified', unsupported: true }
   }
-  if (info === undefined || info.state === 'Z') return { ok: false, alive: false, reason: 'dead' }
-  const current = await processStartToken(record.pid)
+
+  let info
+  try { info = await readProcStat(record.pid, procRoot) } catch {
+    const liveness = await pidLiveness(record.pid)
+    if (liveness === 'dead') return { ok: false, alive: false, reason: 'dead' }
+    return { ok: false, alive: true, reason: 'unverified', hidden: true }
+  }
+  if (info === undefined) {
+    const liveness = await pidLiveness(record.pid)
+    if (liveness === 'dead') return { ok: false, alive: false, reason: 'dead' }
+    return { ok: false, alive: true, reason: 'unverified', hidden: true }
+  }
+  if (info.state === 'Z') return { ok: false, alive: false, reason: 'dead' }
+  const current = `${await bootId()}:${info.startTime}`
   if (record.procStart !== undefined && current !== undefined && record.procStart !== current) {
     return { ok: false, alive: true, reason: 'reused' }
   }
   if (typeof record.marker !== 'string' || record.marker === '') {
     return { ok: false, alive: true, reason: 'unverified' }
   }
-  const environment = await readProcessEnvironment(record.pid)
+  const environment = await readProcessEnvironment(record.pid, procRoot)
   if (environment === undefined) return { ok: false, alive: true, reason: 'unverified' }
   const expected = `${HOST_MARKER_ENV}=${record.marker}`
   if (!environment.split('\0').includes(expected)) {
@@ -297,13 +345,23 @@ export class FileLock {
   }
 
   async #ownerGone(owner) {
-    const info = await readProcStat(owner.pid)
-    if (info === undefined || info.state === 'Z') return true
-    if (typeof owner.procStart === 'string') {
-      const current = await processStartToken(owner.pid)
-      if (current !== undefined && current !== owner.procStart) return true
+    try {
+      if (!await procfsAvailable()) {
+        return await pidLiveness(owner.pid) === 'dead'
+      }
+      const info = await readProcStat(owner.pid)
+      if (info === undefined || info.state === 'Z') {
+        return await pidLiveness(owner.pid) === 'dead'
+      }
+      if (typeof owner.procStart === 'string') {
+        const current = `${await bootId()}:${info.startTime}`
+        if (current !== undefined && current !== owner.procStart) return true
+      }
+      return false
+    } catch {
+      // An unreadable process entry never proves the holder exited.
+      return await pidLiveness(owner.pid) === 'dead'
     }
-    return false
   }
 }
 
