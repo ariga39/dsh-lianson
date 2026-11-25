@@ -11,6 +11,7 @@
     "smoke:slice0": "node scripts/bootstrap.mjs && node --test tests/bootstrap-readiness.test.mjs tests/git-checkout.test.mjs tests/harness-diagnostics.test.mjs tests/slice0-keyless.e2e.test.mjs",
     "test:slice1": "node scripts/bootstrap.mjs && node --test tests/slice1-host-ipc.test.mjs",
     "test:all": "node scripts/bootstrap.mjs && node --test tests/*.test.mjs",
-    "test:slice2": "node scripts/bootstrap.mjs && node --test tests/slice2-*.test.mjs"
+    "test:slice2": "node scripts/bootstrap.mjs && node --test tests/slice2-*.test.mjs",
+    "test:slice3": "node --test tests/slice3-*.test.mjs"
   }
 }

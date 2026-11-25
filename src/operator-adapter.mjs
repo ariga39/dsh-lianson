@@ -53,6 +53,7 @@ function operations(call) {
     sessionState: request => call('session', 'state', request),
     sessionWait: request => call('session', 'wait', request),
     sessionEvents: request => call('session', 'events', request),
+    sessionProjections: request => call('session', 'projections', request),
     prompt: request => call('session', 'prompt', request),
   }
 }
