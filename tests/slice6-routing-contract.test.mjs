@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { execFile } from 'node:child_process';
-import { readFile, writeFile } from 'node:fs/promises';
+import { access, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 
@@ -30,6 +31,28 @@ function childTestEnvironment() {
     if (key.startsWith('NODE_TEST')) delete environment[key];
   }
   return environment;
+}
+
+async function pathExists(target) {
+  try {
+    await access(target);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function gitCommand(cwd, args, environment = {}) {
+  return execFileAsync('git', args, {
+    cwd,
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+      ...environment,
+    },
+  });
 }
 
 async function withFixture(t) {
@@ -103,6 +126,115 @@ test('baseline legacy router tests pass', { timeout: 30_000 }, async (t) => {
   assert.match(output, /pass 5\b/);
   assert.match(output, /fail 0\b/);
 });
+
+test(
+  'fixture git operations ignore global and template hooks',
+  { timeout: 30_000 },
+  async (t) => {
+    const controlRoot = await mkdtemp(path.join(os.tmpdir(), 'routing-hooks-'));
+    t.after(() => rm(controlRoot, { recursive: true, force: true }));
+
+    const globalHooks = path.join(controlRoot, 'global-hooks');
+    const templateDirectory = path.join(controlRoot, 'template');
+    const templateHooks = path.join(templateDirectory, 'hooks');
+    await mkdir(globalHooks, { recursive: true });
+    await mkdir(templateHooks, { recursive: true });
+
+    const sentinel = path.join(controlRoot, 'hook-sentinel');
+    const hook = `#!/bin/sh
+printf '%s\\n' "$0" >> '${sentinel}'
+exit 1
+`;
+    for (const directory of [globalHooks, templateHooks]) {
+      for (const name of ['pre-commit', 'post-checkout']) {
+        await writeFile(path.join(directory, name), hook, { mode: 0o755 });
+      }
+    }
+
+    const globalConfig = path.join(controlRoot, 'gitconfig');
+    const globalConfigContents = `[core]
+	hooksPath = ${globalHooks}
+[init]
+	templateDir = ${templateDirectory}
+`;
+    await writeFile(globalConfig, globalConfigContents);
+    const gitEnvironment = {
+      GIT_CONFIG_GLOBAL: globalConfig,
+      GIT_CONFIG_SYSTEM: '/dev/null',
+    };
+
+    // Control: prove the configured pre-commit and post-checkout hooks really
+    // fire and write the sentinel when hooks are not disabled.
+    const controlRepo = path.join(controlRoot, 'control-repo');
+    await mkdir(controlRepo, { recursive: true });
+    await gitCommand(controlRepo, ['init', '-q'], gitEnvironment);
+    await gitCommand(controlRepo, ['config', '--local', 'user.name', 'Control'], gitEnvironment);
+    await gitCommand(
+      controlRepo,
+      ['config', '--local', 'user.email', 'control@example.invalid'],
+      gitEnvironment,
+    );
+    await writeFile(path.join(controlRepo, 'tracked.txt'), 'control\n');
+    await gitCommand(controlRepo, ['add', '-A'], gitEnvironment);
+    await assert.rejects(
+      gitCommand(controlRepo, ['commit', '-q', '-m', 'must be rejected'], gitEnvironment),
+      (error) => error.code !== 0,
+    );
+    assert.equal(await pathExists(sentinel), true, 'control pre-commit hook must run');
+
+    await rm(sentinel, { force: true });
+    await gitCommand(
+      controlRepo,
+      ['commit', '-q', '--no-verify', '-m', 'control baseline'],
+      gitEnvironment,
+    );
+    await assert.rejects(
+      gitCommand(
+        controlRepo,
+        ['worktree', 'add', '--detach', path.join(controlRoot, 'control-wt'), 'HEAD'],
+        gitEnvironment,
+      ),
+      (error) => error.code !== 0,
+    );
+    assert.equal(await pathExists(sentinel), true, 'control post-checkout hook must run');
+    await rm(sentinel, { force: true });
+
+    const fixture = await createRoutingFixture({ gitEnvironment });
+    t.after(() => fixture.cleanup());
+
+    assert.match(fixture.baselineRev, /^[0-9a-f]{40}$/);
+    assert.equal(
+      await pathExists(path.join(fixture.directory, '.git', 'hooks', 'pre-commit')),
+      true,
+      'init template hooks should be copied into the fixture',
+    );
+    assert.equal(await pathExists(sentinel), false, 'fixture init/commit must bypass hooks');
+
+    const localHooks = (
+      await gitCommand(
+        fixture.directory,
+        ['config', '--local', '--get', 'core.hooksPath'],
+        gitEnvironment,
+      )
+    ).stdout.trim();
+    assert.equal(localHooks, path.join(fixture.root, 'disabled-hooks'));
+    assert.notEqual(localHooks, globalHooks);
+
+    const worktree = await fixture.addWorktree('hook-safe', { branch: 'hook-safe' });
+    assert.equal(await pathExists(sentinel), false, 'worktree checkout must bypass hooks');
+
+    await writeFile(path.join(worktree, 'worktree.txt'), 'worktree\n');
+    const worktreeRev = await fixture.commitAll(worktree, 'worktree commit must bypass hooks');
+    assert.match(worktreeRev, /^[0-9a-f]{40}$/);
+    assert.equal(await pathExists(sentinel), false, 'worktree commit must bypass hooks');
+
+    assert.equal(
+      await readFile(globalConfig, 'utf8'),
+      globalConfigContents,
+      'the global config must not be rewritten',
+    );
+  },
+);
 
 for (const field of ['status', 'body', 'cacheControl', 'contentType']) {
   test(

@@ -65,11 +65,16 @@ export function applyServerMutation(source, mutation) {
   return source.replace(mutation.find, mutation.replace);
 }
 
-async function git(cwd, args) {
+async function git(cwd, args, environment = {}) {
   const { stdout } = await execFileAsync('git', args, {
     cwd,
     encoding: 'utf8',
-    env: { ...process.env, GIT_TERMINAL_PROMPT: '0', GIT_CONFIG_NOSYSTEM: '1' },
+    env: {
+      ...process.env,
+      GIT_TERMINAL_PROMPT: '0',
+      GIT_CONFIG_NOSYSTEM: '1',
+      ...environment,
+    },
   });
   return stdout;
 }
@@ -80,6 +85,8 @@ async function git(cwd, args) {
  */
 export async function createRoutingFixture(options = {}) {
   const baseDirectory = options.baseDirectory ?? os.tmpdir();
+  const gitEnvironment = options.gitEnvironment ?? {};
+  const runGit = (cwd, args) => git(cwd, args, gitEnvironment);
   await mkdir(baseDirectory, { recursive: true });
   const root = await mkdtemp(path.join(baseDirectory, 'routing-fixture-'));
   const directory = path.join(root, 'repo');
@@ -106,13 +113,19 @@ export async function createRoutingFixture(options = {}) {
   );
   await writeFile(path.join(directory, '.gitignore'), 'observations.json\n');
 
-  await git(directory, ['init', '-q']);
-  await git(directory, ['config', 'user.name', 'Routing Fixture']);
-  await git(directory, ['config', 'user.email', 'routing-fixture@example.invalid']);
-  await git(directory, ['config', 'commit.gpgsign', 'false']);
-  await git(directory, ['add', '-A']);
-  await git(directory, ['commit', '-q', '-m', 'baseline routing fixture']);
-  const baselineRev = (await git(directory, ['rev-parse', 'HEAD'])).trim();
+  // Ignore any global core.hooksPath or template hooks for every fixture git
+  // operation. The empty directory is local to this fixture run and is set
+  // before the first add/commit; the user's global config is never modified.
+  const disabledHooks = path.join(root, 'disabled-hooks');
+  await mkdir(disabledHooks, { recursive: true });
+  await runGit(directory, ['-c', `core.hooksPath=${disabledHooks}`, 'init', '-q']);
+  await runGit(directory, ['config', '--local', 'core.hooksPath', disabledHooks]);
+  await runGit(directory, ['config', '--local', 'user.name', 'Routing Fixture']);
+  await runGit(directory, ['config', '--local', 'user.email', 'routing-fixture@example.invalid']);
+  await runGit(directory, ['config', '--local', 'commit.gpgsign', 'false']);
+  await runGit(directory, ['add', '-A']);
+  await runGit(directory, ['commit', '-q', '-m', 'baseline routing fixture']);
+  const baselineRev = (await runGit(directory, ['rev-parse', 'HEAD'])).trim();
 
   return {
     root,
@@ -129,9 +142,9 @@ export async function createRoutingFixture(options = {}) {
       }
       const worktree = path.join(root, `wt-${label}`);
       if (branch) {
-        await git(directory, ['worktree', 'add', '-b', branch, worktree, from]);
+        await runGit(directory, ['worktree', 'add', '-b', branch, worktree, from]);
       } else {
-        await git(directory, ['worktree', 'add', '--detach', worktree, from]);
+        await runGit(directory, ['worktree', 'add', '--detach', worktree, from]);
       }
       return worktree;
     },
@@ -143,9 +156,9 @@ export async function createRoutingFixture(options = {}) {
     },
 
     async commitAll(worktree, message) {
-      await git(worktree, ['add', '-A']);
-      await git(worktree, ['commit', '-q', '-m', message]);
-      return (await git(worktree, ['rev-parse', 'HEAD'])).trim();
+      await runGit(worktree, ['add', '-A']);
+      await runGit(worktree, ['commit', '-q', '-m', message]);
+      return (await runGit(worktree, ['rev-parse', 'HEAD'])).trim();
     },
 
     async cleanup() {
