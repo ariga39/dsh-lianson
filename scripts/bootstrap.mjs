@@ -6,6 +6,7 @@ import { existsSync, mkdtempSync, renameSync, rmSync } from 'node:fs'
 import { join, resolve } from 'node:path'
 import { ensureUpstreamReady } from './upstream-readiness.mjs'
 import { pnpmInvocation } from './pnpm-invocation.mjs'
+import { checkoutDetachedWithoutHooks } from './git-checkout.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const UPSTREAM = join(ROOT, 'deepseek-harness')
@@ -37,13 +38,18 @@ function pnpmOutput(args, options = {}) {
   return output(invocation.command, invocation.args, { cwd: ROOT, ...options })
 }
 
+function pnpmCapture(args) {
+  const invocation = pnpmInvocation(args)
+  return spawnSync(invocation.command, invocation.args, { cwd: UPSTREAM, encoding: 'utf8' })
+}
+
 function stageUpstream() {
   const staging = mkdtempSync(join(ROOT, '.upstream-staging-'))
   try {
     run('git', ['init', staging])
     run('git', ['-C', staging, 'remote', 'add', 'origin', REMOTE])
     run('git', ['-C', staging, 'fetch', '--depth', '1', 'origin', COMMIT])
-    run('git', ['-C', staging, 'checkout', '--detach', 'FETCH_HEAD'])
+    checkoutDetachedWithoutHooks(staging, 'FETCH_HEAD', run)
     renameSync(staging, UPSTREAM)
   } catch (error) {
     rmSync(staging, { recursive: true, force: true })
@@ -83,5 +89,19 @@ await ensureUpstreamReady({
 const shellInstall = ['--filter', '@deepseek-ai/dsh-web-frontend', 'exec', 'playwright', 'install', 'chromium', '--only-shell']
 console.log('bootstrap: ensuring Playwright headless shell (default chromium.launch target)')
 pnpm(shellInstall)
+
+if (process.platform === 'linux') {
+  const deps = pnpmCapture([
+    '--filter', '@deepseek-ai/dsh-web-frontend',
+    'exec', 'playwright', 'install-deps', '--dry-run', 'chromium-headless-shell',
+  ])
+  if (deps.status !== 0) {
+    throw new Error([
+      'bootstrap: Playwright headless shell is missing required Linux system libraries.',
+      'Install them with your distribution package manager; bootstrap never runs sudo or mutates packages.',
+      (deps.stdout ?? '') + (deps.stderr ?? ''),
+    ].join('\n'))
+  }
+}
 
 console.log(`bootstrap: ready at ${COMMIT}`)

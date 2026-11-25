@@ -177,7 +177,7 @@ test('keyless slice0: external operator, duplicate prompts, two browser visits, 
   assert.equal(idle.reason, 'idle')
   assert.deepEqual(pageErrors, [], 'both browser visits must produce no page errors')
   assertNoWriterHeld({ consoleMessages, uiTexts: [], label: 'both browser visits' })
-  assert.doesNotMatch(web.output(), /session\/writer-held|writer[- ]held/iu, 'Host logs must not report writer contention')
+  assert.doesNotMatch(web.diagnostics(), /session\/writer-held|writer[- ]held/iu, 'Host logs must not report writer contention')
 
   assert.equal(mock.requests.length, 3, 'exactly three scripted model requests')
   assert.match(mock.requests[0].url, /^\/v1\/messages$/u)

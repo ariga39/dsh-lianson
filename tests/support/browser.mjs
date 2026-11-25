@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict'
+import { scrubTokenDiagnostics, tokenOfUrl } from './scrub.mjs'
 
 const WRITER_HELD = /session\/writer-held|writer[- ]held|already in use|已被占用/iu
 
@@ -29,9 +30,13 @@ export async function assertNoWriterHeldInPage(page, consoleMessages, label) {
 }
 
 export async function openSessionInBrowser({ browser, launchUrl, sessionId, title, workspaceTitle, pageErrors, consoleMessages }) {
+  const token = tokenOfUrl(launchUrl)
   const page = await browser.newPage({ locale: 'en-US', viewport: { width: 1680, height: 1000 } })
-  page.on('pageerror', error => pageErrors.push(error))
-  page.on('console', message => consoleMessages.push({ type: message.type(), text: message.text() }))
+  page.on('pageerror', error => pageErrors.push(new Error(scrubTokenDiagnostics(error.message, token))))
+  page.on('console', message => consoleMessages.push({
+    type: message.type(),
+    text: scrubTokenDiagnostics(message.text(), token),
+  }))
   await page.addInitScript(() => {
     window.__dshObservedNotices = []
     const record = () => {
@@ -45,7 +50,11 @@ export async function openSessionInBrowser({ browser, launchUrl, sessionId, titl
     document.addEventListener('DOMContentLoaded', record, { once: true })
     record()
   })
-  await page.goto(launchUrl, { waitUntil: 'load', timeout: 60_000 })
+  try {
+    await page.goto(launchUrl, { waitUntil: 'load', timeout: 60_000 })
+  } catch (error) {
+    throw new Error(scrubTokenDiagnostics(error instanceof Error ? error.message : String(error), token))
+  }
   await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
 
   const welcome = page.getByRole('button', { name: 'Continue', exact: true })
