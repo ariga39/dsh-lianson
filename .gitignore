@@ -1,1 +1,6 @@
 /deepseek-harness/
+/.upstream-staging-*/
+/.cache/
+/node_modules/
+/test-results/
+*.log

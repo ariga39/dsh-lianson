@@ -1,0 +1,13 @@
+{
+  "name": "dsh-lianson",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.28.5",
+  "engines": {
+    "node": "24.22.3"
+  },
+  "scripts": {
+    "smoke:slice0": "node scripts/bootstrap.mjs && node --test tests/slice0-keyless.e2e.test.mjs"
+  }
+}
