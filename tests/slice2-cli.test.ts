@@ -453,6 +453,12 @@ await test('normal delegation CLI: two models, worktree isolation, replay, verif
     const started = await startHost(env, worktreeA, patchPath)
     daemonPid = started.daemonPid
 
+    const help = await runCli(env, worktreeA, ['delegation', '--help'])
+    const helpText = stringField(okResult(help), 'result')
+    assert.match(helpText, /separate new operation/u)
+    assert.match(helpText, /--id <key>/u)
+    assertNoSecrets(help)
+
     const delegationA = `delegation-a-${nonce}`
     const delegationB = `delegation-b-${nonce}`
     const createdA = await delegationCreate(env, worktreeA, [

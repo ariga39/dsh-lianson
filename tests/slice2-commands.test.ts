@@ -731,3 +731,133 @@ await test('verify-model does not certify early evidence from a later header whe
     await cleanup(item)
   }
 })
+
+await test('unkeyed create and prompt invocations remain separate new operations', async () => {
+  const item = await fixture('one-shot-unkeyed')
+  try {
+    const first = await item.commands.create({
+      title: 'Unkeyed Alpha',
+      provider: 'provider-a',
+      model: 'model-a',
+      cwd: item.work,
+    })
+    const second = await item.commands.create({
+      title: 'Unkeyed Beta',
+      provider: 'provider-a',
+      model: 'model-a',
+      cwd: item.work,
+    })
+    assert.equal(first.replayed, false)
+    assert.equal(second.replayed, false)
+    assert.notEqual(first.delegation.delegationId, second.delegation.delegationId)
+    assert.notEqual(first.delegation.sessionId, second.delegation.sessionId)
+
+    const firstPrompt = await item.commands.prompt({
+      delegationId: first.delegation.delegationId,
+      content: 'same unkeyed content',
+    })
+    const secondPrompt = await item.commands.prompt({
+      delegationId: first.delegation.delegationId,
+      content: 'same unkeyed content',
+    })
+    assert.equal(firstPrompt.replayed, false)
+    assert.equal(secondPrompt.replayed, false)
+    assert.notEqual(firstPrompt.requestId, secondPrompt.requestId)
+    assert.equal(item.host.promptCalls, 2)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('prompt key bindings persist across restart and reject changed identity or content', async () => {
+  const item = await fixture('prompt-key-binding')
+  let restarted: DelegationRegistry | undefined
+  try {
+    await item.commands.create(createCommand(item, { delegationId: 'del-1', title: 'Alpha' }))
+    await item.commands.create(createCommand(item, { delegationId: 'del-2', title: 'Beta' }))
+    const first = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-1',
+      content: 'stable content',
+    })
+    assert.equal(first.replayed, false)
+    assert.equal(item.host.promptCalls, 1)
+
+    const boundReplay = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-1',
+      content: 'stable content',
+      ipcRequestId: 'caller-key',
+    })
+    assert.equal(boundReplay.replayed, true)
+    assert.equal(boundReplay.beforeCursor, first.beforeCursor)
+    assert.equal(item.host.promptCalls, 1)
+    assert.deepEqual((await item.registry.get('del-1')).promptKeys?.['caller-key'], {
+      delegationId: 'del-1',
+      requestId: 'request-1',
+      contentHash: contentHash('stable content'),
+    })
+
+    await item.registry.close()
+    restarted = new DelegationRegistry({ ledgerFile: item.ledgerFile, lockWaitMs: 0 })
+    const commands = new SessionCommands({
+      registry: restarted,
+      access: accessFor(item.host, item.context),
+      ledgerDir: join(item.root, 'ledger'),
+    })
+
+    const replay = await commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-1',
+      content: 'stable content',
+      ipcRequestId: 'caller-key',
+    })
+    assert.equal(replay.replayed, true)
+    assert.equal(replay.beforeCursor, first.beforeCursor)
+    assert.equal(item.host.promptCalls, 1)
+
+    await expectCode(
+      commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'request-1',
+        content: 'changed content',
+        ipcRequestId: 'caller-key',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
+    await expectCode(
+      commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'different-request',
+        content: 'stable content',
+        ipcRequestId: 'caller-key',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
+    await expectCode(
+      commands.prompt({
+        delegationId: 'del-2',
+        content: 'stable content',
+        ipcRequestId: 'caller-key',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
+    assert.equal(item.host.promptCalls, 1)
+
+    const fresh = await commands.prompt({
+      delegationId: 'del-2',
+      content: 'fresh keyed content',
+      ipcRequestId: 'caller-key-2',
+    })
+    assert.equal(fresh.replayed, false)
+    assert.equal(item.host.promptCalls, 2)
+    assert.deepEqual((await restarted.get('del-2')).promptKeys?.['caller-key-2'], {
+      delegationId: 'del-2',
+      requestId: fresh.requestId,
+      contentHash: contentHash('fresh keyed content'),
+    })
+  } finally {
+    await restarted?.close()
+    await cleanup(item)
+  }
+})

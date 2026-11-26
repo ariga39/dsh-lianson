@@ -15,6 +15,28 @@ import { redactSecrets, redactValue } from './redaction.ts'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const binPath = fileURLToPath(new URL('../bin/dsh-liaison.ts', import.meta.url))
+const MAIN_HELP = [
+  'usage: dsh-liaison <host|delegation> <command>',
+  '',
+  'host: <start|status|ping|stop>',
+  'delegation: <create|get|list|prompt|verify-model>',
+  '',
+  'Run "dsh-liaison delegation --help" for delegation identity and retry rules.',
+].join('\n')
+const DELEGATION_HELP = [
+  'usage: dsh-liaison delegation <create|get|list|prompt|verify-model>',
+  '',
+  'create --title <text> --provider <id> --model <id> [--reasoning-effort <id>]',
+  '        [--agent-preset <name>] [--cwd <dir>] [--delegation-id <id>] [--id <key>]',
+  'prompt --delegation-id <id> --content <text> [--request-id <id>] [--id <key>]',
+  'get (--delegation-id <id> | --session-id <id>)',
+  'list',
+  'verify-model --delegation-id <id> [--request-id <id>] [--id <key>]',
+  '',
+  '--id <key> supplies the original caller identity for a retry after a lost reply.',
+  'Without --id, each create or prompt invocation is a separate new operation.',
+  'The CLI never retries a Host mutation internally.',
+].join('\n')
 const DAEMON_BOOT_TIMEOUT_MS = 20_000
 /** Bound on one active `host.start`, including its Host readiness deadline. */
 export const START_CALL_TIMEOUT_MS = 150_000
@@ -67,8 +89,12 @@ export async function main(argv: readonly string[]): Promise<number> {
 
 async function dispatch(argv: readonly string[]): Promise<unknown> {
   const [group, command, ...rest] = argv
+  if (group === undefined || group === '--help' || group === 'help') return MAIN_HELP
   if (group === '__daemon') return await runDaemonFromArgs(argv.slice(1))
-  if (group === 'delegation') return await delegationCommand(command, rest)
+  if (group === 'delegation') {
+    if (command === undefined || command === '--help' || command === 'help') return DELEGATION_HELP
+    return await delegationCommand(command, rest)
+  }
   if (group !== 'host') {
     throw new LiaisonError(
       'INVALID_ARGUMENT',
@@ -79,6 +105,7 @@ async function dispatch(argv: readonly string[]): Promise<unknown> {
   if (command === 'status') return await statusCommand(rest)
   if (command === 'ping') return await pingCommand(rest)
   if (command === 'stop') return await stopCommand(rest)
+  if (command === undefined || command === '--help' || command === 'help') return MAIN_HELP
   throw new LiaisonError('INVALID_ARGUMENT', 'usage: dsh-liaison host <start|status|ping|stop>')
 }
 
@@ -168,7 +195,7 @@ async function delegationCommand(command: string | undefined, args: readonly str
   if (command === 'verify-model') return await delegationVerifyModelCommand(args)
   throw new LiaisonError(
     'INVALID_ARGUMENT',
-    'usage: dsh-liaison delegation <create|get|list|prompt|verify-model>',
+    'usage: dsh-liaison delegation <create|get|list|prompt|verify-model>; run "dsh-liaison delegation --help"',
   )
 }
 

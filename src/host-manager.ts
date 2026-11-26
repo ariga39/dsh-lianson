@@ -2,9 +2,10 @@ import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
+import { DSH_HOME_DIR_NAME } from '@deepseek-ai/dsh-home-paths'
 import { createDeadline, type Deadline } from './deadline.ts'
 import { LiaisonError } from './errors.ts'
 import { acquireLock } from './flock.ts'
@@ -282,7 +283,7 @@ export class HostManager {
     const record = await this.resolveReadyHost(deadline)
     return {
       stateDir: this.paths.stateDir,
-      dshHome: record.dshHome,
+      dshHome: resolveRecordedDshHome(record.dshHome, record.cwd),
       cwd: record.cwd,
       hostPid: record.hostPid,
       origin: record.origin,
@@ -496,9 +497,10 @@ export class HostManager {
       // Commit point adjacency: every prelaunch write above has completed.
       // There is deliberately no await between this check and spawnProcess.
       assertDeadlineLive(deadline)
+      const childDshHome = resolveHostDshHome(this.options.env ?? process.env, launch.cwd)
       child = this.spawnProcess(process.execPath, args, {
         cwd: launch.cwd,
-        env: this.hostEnvironment(launchId),
+        env: this.hostEnvironment(launchId, childDshHome),
         detached: true,
         stdio: 'ignore',
       })
@@ -547,7 +549,7 @@ export class HostManager {
         origin: origin.origin,
         port: origin.port,
         launchToken: ready.launchToken,
-        dshHome: this.dshHome(),
+        dshHome: childDshHome,
         cwd: launch.cwd,
         startedAt: launching.startedAt,
       }
@@ -859,22 +861,16 @@ export class HostManager {
     }
   }
 
-  private hostEnvironment(launchId: string): NodeJS.ProcessEnv {
+  private hostEnvironment(launchId: string, dshHome: string): NodeJS.ProcessEnv {
     return {
       ...this.options.env ?? process.env,
+      DSH_HOME: dshHome,
       DSH_LIAISON_HOST_ID: launchId,
       DSH_TELEMETRY_DISABLED: '1',
       NODE_NO_WARNINGS: '1',
       SSH_CONNECTION: '',
       SSH_TTY: '',
     }
-  }
-
-  private dshHome(): string {
-    const env = this.options.env ?? process.env
-    const configured = env.DSH_HOME
-    if (configured !== undefined && configured.trim() !== '') return configured
-    return join(env.HOME !== undefined && env.HOME.trim() !== '' ? env.HOME : homedir(), '.dsh')
   }
 
   private async resolveReadyHost(
@@ -960,6 +956,53 @@ export class HostManager {
   private killGraceMs(): number {
     return this.options.killGraceMs ?? DEFAULT_KILL_GRACE_MS
   }
+}
+
+/**
+ * Resolve the absolute DSH_HOME the child Host will actually use.
+ * Applies the pinned upstream tilde rules against the child HOME and resolves
+ * relative paths against the child launch cwd.
+ * @param env - environment passed to the child.
+ * @param launchCwd - cwd passed to the child.
+ * @returns an absolute DSH_HOME.
+ */
+export function resolveHostDshHome(env: NodeJS.ProcessEnv, launchCwd: string): string {
+  const cwd = resolve(launchCwd)
+  const homeValue = env.HOME
+  const home = homeValue !== undefined && homeValue.trim() !== ''
+    ? resolve(cwd, homeValue)
+    : homedir()
+  const configured = env.DSH_HOME
+  const selected = configured !== undefined && configured.trim() !== ''
+    ? configured
+    : join(home, DSH_HOME_DIR_NAME)
+  return resolve(cwd, expandChildHomePath(selected, home))
+}
+
+/**
+ * Resolve one persisted legacy DSH_HOME without inventing an unknown child HOME.
+ * @param dshHome - persisted DSH_HOME text.
+ * @param launchCwd - persisted launch cwd.
+ * @returns an absolute DSH_HOME for workspace policy.
+ */
+export function resolveRecordedDshHome(dshHome: string, launchCwd: string): string {
+  const configured = dshHome.trim()
+  if (configured.startsWith('~')) {
+    throw new LiaisonError('HOST_RECORD_INVALID', 'the recorded DSH_HOME uses unverifiable home expansion', {
+      details: { dshHome },
+    })
+  }
+  if (isAbsolute(configured)) return resolve(configured)
+  if (configured !== '' && isAbsolute(launchCwd)) return resolve(launchCwd, configured)
+  throw new LiaisonError('HOST_RECORD_INVALID', 'the recorded DSH_HOME cannot be resolved from its launch cwd', {
+    details: { dshHome, cwd: launchCwd },
+  })
+}
+
+function expandChildHomePath(path: string, home: string): string {
+  if (path === '~') return home
+  if (path.startsWith('~/') || path.startsWith('~\\')) return join(home, path.slice(2))
+  return path
 }
 
 /**

@@ -78,6 +78,13 @@ export interface PromptReceipt {
   readonly accepted: boolean
 }
 
+/** One explicit prompt replay key bound to its durable request identity. */
+export interface PromptKeyBinding {
+  readonly delegationId: string
+  readonly requestId: string
+  readonly contentHash: string
+}
+
 /** One durable delegation identity and its replay evidence. */
 export interface DelegationRecord {
   readonly delegationId: string
@@ -91,6 +98,7 @@ export interface DelegationRecord {
   readonly createFingerprint: string
   readonly createIpcId?: string
   readonly prompts?: Readonly<Record<string, PromptReceipt>>
+  readonly promptKeys?: Readonly<Record<string, PromptKeyBinding>>
   readonly verifiedModel?: ModelTarget
   readonly verifiedTurnSeq?: number
 }
@@ -127,6 +135,7 @@ export interface BeginPromptInput {
   readonly requestId: string
   readonly contentHash: string
   readonly beforeCursor: number
+  readonly ipcRequestId?: string
 }
 
 /** Result of an idempotent prompt admission. */
@@ -384,10 +393,17 @@ export class DelegationRegistry {
   async beginPrompt(delegationId: string, input: BeginPromptInput): Promise<PromptAdmission> {
     const requestId = requireText(input.requestId, 'requestId')
     const contentHash = requireText(input.contentHash, 'contentHash')
+    const ipcRequestId = input.ipcRequestId === undefined
+      ? undefined
+      : requireText(input.ipcRequestId, 'ipcRequestId')
     requireCursor(input.beforeCursor, 'beforeCursor')
 
     return await this.mutate((draft) => {
       const record = requireRecord(draft, delegationId)
+      const bound = ipcRequestId === undefined ? undefined : findPromptKeyBinding(draft, ipcRequestId)
+      if (bound !== undefined) {
+        assertPromptKeyBinding(bound, ipcRequestId ?? '', delegationId, requestId, contentHash)
+      }
       const existing = record.prompts?.[requestId]
       if (existing !== undefined) {
         if (existing.contentHash !== contentHash) {
@@ -397,10 +413,29 @@ export class DelegationRegistry {
             { delegationId, requestId },
           )
         }
+        if (ipcRequestId === undefined || bound !== undefined) {
+          return {
+            value: { receipt: structuredClone(existing), replayed: existing.accepted },
+            changed: false,
+          }
+        }
+        const keys = {
+          ...record.promptKeys,
+          [ipcRequestId]: { delegationId, requestId, contentHash },
+        }
+        const next: DelegationRecord = { ...record, promptKeys: keys }
+        draft.set(delegationId, next)
         return {
           value: { receipt: structuredClone(existing), replayed: existing.accepted },
-          changed: false,
+          changed: true,
         }
+      }
+      if (bound !== undefined) {
+        throw new DelegationRegistryError(
+          'DELEGATION_PROMPT_CONFLICT',
+          `prompt key ${ipcRequestId ?? ''} is bound without a matching receipt`,
+          { delegationId, requestId, ipcRequestId: ipcRequestId ?? '' },
+        )
       }
       if (record.state !== 'ready') throw alreadyExists(delegationId, record.state)
 
@@ -413,6 +448,14 @@ export class DelegationRegistry {
       const next: DelegationRecord = {
         ...record,
         prompts: { ...record.prompts, [requestId]: receipt },
+        ...(ipcRequestId === undefined
+          ? {}
+          : {
+              promptKeys: {
+                ...record.promptKeys,
+                [ipcRequestId]: { delegationId, requestId, contentHash },
+              },
+            }),
       }
       draft.set(delegationId, next)
       return { value: { receipt: structuredClone(receipt), replayed: false }, changed: true }
@@ -600,6 +643,7 @@ function parseRecord(delegationId: string, value: unknown, ledgerFile: string): 
     throw invalidLedger(ledgerFile, `record ${delegationId} has an invalid state`)
   }
   const prompts = parsePrompts(delegationId, value['prompts'], ledgerFile)
+  const promptKeys = parsePromptKeys(delegationId, value['promptKeys'], ledgerFile)
   const verifiedModel = value['verifiedModel']
   const verifiedTurnSeq = value['verifiedTurnSeq']
   if (verifiedTurnSeq !== undefined && !isCursor(verifiedTurnSeq)) {
@@ -624,6 +668,7 @@ function parseRecord(delegationId: string, value: unknown, ledgerFile: string): 
     ...(agentPreset === undefined ? {} : { agentPreset }),
     ...(createIpcId === undefined ? {} : { createIpcId }),
     ...(prompts === undefined ? {} : { prompts }),
+    ...(promptKeys === undefined ? {} : { promptKeys }),
     ...(verifiedModel === undefined
       ? {}
       : { verifiedModel: parseModel(verifiedModel, ledgerFile, `record ${delegationId} verifiedModel`) }),
@@ -668,6 +713,38 @@ function parsePrompts(
   return prompts
 }
 
+function parsePromptKeys(
+  delegationId: string,
+  value: unknown,
+  ledgerFile: string,
+): Record<string, PromptKeyBinding> | undefined {
+  if (value === undefined) return undefined
+  if (!isObject(value)) throw invalidLedger(ledgerFile, `record ${delegationId} promptKeys must be an object`)
+  const keys = Object.create(null) as Record<string, PromptKeyBinding>
+  for (const [ipcRequestId, binding] of Object.entries(value)) {
+    if (!isObject(binding)) {
+      throw invalidLedger(ledgerFile, `record ${delegationId} prompt key ${ipcRequestId} must be an object`)
+    }
+    if (binding['delegationId'] !== delegationId) {
+      throw invalidLedger(ledgerFile, `record ${delegationId} prompt key ${ipcRequestId} has a mismatched delegation`)
+    }
+    keys[requireText(ipcRequestId, 'ipcRequestId')] = {
+      delegationId,
+      requestId: requiredStoredText(
+        binding['requestId'],
+        ledgerFile,
+        `record ${delegationId} prompt key ${ipcRequestId} requestId`,
+      ),
+      contentHash: requiredStoredText(
+        binding['contentHash'],
+        ledgerFile,
+        `record ${delegationId} prompt key ${ipcRequestId} contentHash`,
+      ),
+    }
+  }
+  return keys
+}
+
 function parseModel(value: unknown, ledgerFile: string, field: string): ModelTarget {
   if (!isObject(value)) throw invalidLedger(ledgerFile, `${field} must be an object`)
   const provider = requiredStoredText(value['provider'], ledgerFile, `${field} provider`)
@@ -699,6 +776,41 @@ function invalidLedger(ledgerFile: string, reason: string): DelegationRegistryEr
     ledgerFile,
     reason,
   })
+}
+
+function findPromptKeyBinding(
+  records: Map<string, DelegationRecord>,
+  ipcRequestId: string,
+): PromptKeyBinding | undefined {
+  for (const record of records.values()) {
+    const binding = record.promptKeys?.[ipcRequestId]
+    if (binding !== undefined) return binding
+  }
+  return undefined
+}
+
+function assertPromptKeyBinding(
+  binding: PromptKeyBinding,
+  ipcRequestId: string,
+  delegationId: string,
+  requestId: string,
+  contentHash: string,
+): void {
+  if (binding.delegationId === delegationId
+    && binding.requestId === requestId
+    && binding.contentHash === contentHash) return
+  throw new DelegationRegistryError(
+    'DELEGATION_PROMPT_CONFLICT',
+    `prompt key ${ipcRequestId} is already bound to a different delegation or request`,
+    {
+      ipcRequestId,
+      requestedDelegationId: delegationId,
+      boundDelegationId: binding.delegationId,
+      requestedRequestId: requestId,
+      boundRequestId: binding.requestId,
+      contentMatches: binding.contentHash === contentHash,
+    },
+  )
 }
 
 function requireRecord(draft: Map<string, DelegationRecord>, delegationId: string): DelegationRecord {

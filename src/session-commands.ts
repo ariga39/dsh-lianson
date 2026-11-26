@@ -19,6 +19,7 @@ import {
   DelegationRegistryError,
   type DelegationRecord,
   type ModelTarget,
+  type PromptKeyBinding,
   type PromptReceipt,
 } from './delegation-registry.ts'
 import { DelegationError, guardWorkspace, type DelegationErrorCode } from './workspace-guard.ts'
@@ -336,6 +337,10 @@ export class SessionCommands {
           { delegationId: record.delegationId, state: record.state },
         )
       }
+      const binding = await this.findPromptBinding(command.ipcRequestId)
+      if (binding !== undefined) {
+        this.assertPromptBinding(binding, command.ipcRequestId ?? '', record.delegationId, requestId, contentHash)
+      }
       const existing = await this.registry.promptReceipt(record.delegationId, requestId)
       if (existing !== undefined) {
         if (existing.contentHash !== contentHash) {
@@ -345,9 +350,24 @@ export class SessionCommands {
             { delegationId: record.delegationId, requestId },
           )
         }
+        if (command.ipcRequestId !== undefined && binding === undefined) {
+          await this.registry.beginPrompt(record.delegationId, {
+            requestId,
+            contentHash,
+            beforeCursor: existing.beforeCursor,
+            ipcRequestId: command.ipcRequestId,
+          })
+        }
         if (existing.accepted) return promptResult(record, existing, true)
         await this.assertRecordedWorkspace(record, command.deadline)
         return await this.resolvePendingPrompt(record, requestId, command.content, existing, command.deadline)
+      }
+      if (binding !== undefined) {
+        throw new DelegationRegistryError(
+          'DELEGATION_PROMPT_CONFLICT',
+          `prompt key ${command.ipcRequestId ?? ''} is bound without a matching receipt`,
+          { delegationId: record.delegationId, requestId, ipcRequestId: command.ipcRequestId ?? '' },
+        )
       }
 
       await this.assertRecordedWorkspace(record, command.deadline)
@@ -361,6 +381,7 @@ export class SessionCommands {
         requestId,
         contentHash,
         beforeCursor: state.cursor,
+        ...(command.ipcRequestId === undefined ? {} : { ipcRequestId: command.ipcRequestId }),
       })
       if (admission.receipt.accepted) return promptResult(record, admission.receipt, true)
       await this.dispatchPrompt(record, requestId, command.content, command.deadline)
@@ -519,6 +540,39 @@ export class SessionCommands {
       dshHome: context.dshHome,
       ledgerDir: this.ledgerDir,
     })
+  }
+
+  private async findPromptBinding(ipcRequestId: string | undefined): Promise<PromptKeyBinding | undefined> {
+    if (ipcRequestId === undefined) return undefined
+    for (const record of await this.registry.list()) {
+      const binding = record.promptKeys?.[ipcRequestId]
+      if (binding !== undefined) return binding
+    }
+    return undefined
+  }
+
+  private assertPromptBinding(
+    binding: PromptKeyBinding,
+    ipcRequestId: string,
+    delegationId: string,
+    requestId: string,
+    contentHash: string,
+  ): void {
+    if (binding.delegationId === delegationId
+      && binding.requestId === requestId
+      && binding.contentHash === contentHash) return
+    throw new DelegationRegistryError(
+      'DELEGATION_PROMPT_CONFLICT',
+      `prompt key ${ipcRequestId} is already bound to a different delegation or request`,
+      {
+        ipcRequestId,
+        requestedDelegationId: delegationId,
+        boundDelegationId: binding.delegationId,
+        requestedRequestId: requestId,
+        boundRequestId: binding.requestId,
+        contentMatches: binding.contentHash === contentHash,
+      },
+    )
   }
 
   private async ownWriter(deadline?: Deadline): Promise<void> {
