@@ -134,10 +134,12 @@ export class StateWaiter {
     let backfilled = 0
     let outputTruncated = false
     const collected = new Map()
-    const noticeSeqs = new Map()
-    const noticeFloor = new Map()
+    const epochs = new Map()
+    const noticeRecords = []
+    const turnEnds = new Map()
     const noticeScanned = new Map()
     let pendingNoticeReason = null
+    let boundedRecheckUsed = false
 
     const absorb = records => {
       for (const record of records ?? []) {
@@ -147,26 +149,32 @@ export class StateWaiter {
       }
     }
 
-    const noteActive = (tree, rootCursor) => {
+    const observeTree = (tree, rootCursor) => {
       const byId = new Map((tree.descendants ?? tree.catalog ?? [])
         .map(node => [node.id, node]))
       for (const node of tree.localSubagents ?? []) {
-        if (node.active !== true) continue
         const parentNode = node.parentSessionId === sessionId
           ? null
           : byId.get(node.parentSessionId)
-        const parentCursor = parentNode === null
-          ? rootCursor
-          : parentNode?.cursor
-        const floor = Number.isSafeInteger(parentCursor)
-          ? Math.max(noticeSeqs.get(node.id) ?? -1, parentCursor)
-          : (noticeSeqs.get(node.id) ?? -1)
-        noticeFloor.set(node.id, floor)
+        const parentCursor = parentNode === null ? rootCursor : parentNode?.cursor
+        const epoch = epochs.get(node.id)
+        if (epoch === undefined) {
+          epochs.set(node.id, {
+            mode: node.mode,
+            firstSeenNonsettled: node.settled !== true,
+            initialParentCursor: Number.isSafeInteger(parentCursor) ? parentCursor : -1,
+            settledSeen: node.settled === true,
+            reactivated: false,
+          })
+          continue
+        }
+        if (epoch.settledSeen
+          && (node.active === true || node.live === true || node.settled !== true)) {
+          epoch.reactivated = true
+        }
+        if (node.settled === true) epoch.settledSeen = true
       }
     }
-
-    const noticeSatisfied = childId =>
-      (noticeSeqs.get(childId) ?? -1) > (noticeFloor.get(childId) ?? -1)
 
     const backfill = async throughSeq => {
       if (!Number.isSafeInteger(throughSeq) || throughSeq <= cursor) return
@@ -181,72 +189,108 @@ export class StateWaiter {
       backfilled += 1
     }
 
-    const verifyNotices = async (tree, rootState) => {
-      // Upstream finishDisposal deletes the child before notifySettlement
-      // (packages/subagent/subagent/src/manager.ts:1119-1122), so "child
-      // settled + parent idle" does not prove the notice turn was scheduled.
-      // The public evidence is the durable parent user/message carrying
-      // source.kind === 'subagent-settled' and senderSessionId === child id
-      // (continuation-messages.ts:168-174).
+    const scanParent = async (parentId, parentNode) => {
+      const address = parentNode === null
+        ? undefined
+        : {
+            kind: 'subagent',
+            parentSessionId: parentNode.parentSessionId,
+            childSessionId: parentNode.id,
+            mode: parentNode.mode,
+          }
+      let page
+      try {
+        page = await this.#reader.readRange({
+          sessionId: parentId,
+          ...(address === undefined ? {} : { address }),
+          afterSeq: noticeScanned.get(parentId) ?? 0,
+          pageSize: 500,
+        })
+      } catch {
+        return false
+      }
+      noticeScanned.set(parentId, page.cursor)
+      for (const event of page.events) {
+        if (event.type === 'turn/end') {
+          const ends = turnEnds.get(parentId) ?? []
+          ends.push(event.seq)
+          turnEnds.set(parentId, ends)
+        }
+        if (event.type === 'user/message'
+          && event.data?.source?.kind === 'subagent-settled'
+          && typeof event.data.source.senderSessionId === 'string') {
+          noticeRecords.push({
+            childId: event.data.source.senderSessionId,
+            parentId,
+            seq: event.seq,
+          })
+        }
+      }
+      return true
+    }
+
+    const noticeConsumed = record =>
+      (turnEnds.get(record.parentId) ?? []).some(seq => seq > record.seq)
+
+    const verifySettlement = async tree => {
+      // Upstream settlement notices identify the child but carry no durable
+      // per-resume epoch. A one-shot child is proven by a notice consumed by a
+      // later parent turn/end. A continuable child is proven only for the first
+      // nonsettled epoch first observed by this wait: no prior notice, exactly
+      // one current notice, consumed, and no reactivation. Anything else is an
+      // unprovable boundary, never an invented generation.
       const byId = new Map((tree.descendants ?? tree.catalog ?? [])
         .map(node => [node.id, node]))
       const byParent = new Map()
-      for (const node of tree.localSubagents ?? []) {
-        if (node.settled !== true || noticeSatisfied(node.id)) continue
-        const parentId = node.parentSessionId
-        const parentNode = parentId === sessionId ? null : byId.get(parentId)
+      const candidates = (tree.localSubagents ?? []).filter(node => node.settled === true)
+      for (const node of candidates) {
+        const parentNode = node.parentSessionId === sessionId ? null : byId.get(node.parentSessionId)
         if (parentNode === undefined) {
-          return { pending: [], unavailableReason: 'subagent-settlement-notice-unavailable' }
+          return { pending: [], unprovable: [], unavailableReason: 'subagent-settlement-notice-unavailable' }
         }
-        // Upstream skips delivery when no live parent Agent exists; no parent
-        // turn can start in that case.
-        const parentLive = parentNode === null ? rootState?.active === true : parentNode.live === true
-        if (!parentLive) continue
-        const group = byParent.get(parentId) ?? { parentNode, ids: [] }
+        const group = byParent.get(node.parentSessionId) ?? { parentNode, ids: [] }
         group.ids.push(node.id)
-        byParent.set(parentId, group)
+        byParent.set(node.parentSessionId, group)
+      }
+      for (const [parentId, group] of byParent) {
+        if (!await scanParent(parentId, group.parentNode)) {
+          return { pending: [], unprovable: [], unavailableReason: 'subagent-settlement-notice-unavailable' }
+        }
       }
 
       const pending = []
-      for (const [parentId, group] of byParent) {
-        const parentNode = group.parentNode
-        const address = parentNode === null
-          ? undefined
-          : {
-              kind: 'subagent',
-              parentSessionId: parentNode.parentSessionId,
-              childSessionId: parentNode.id,
-              mode: parentNode.mode,
-            }
-        let page
-        try {
-          page = await this.#reader.readRange({
-            sessionId: parentId,
-            ...(address === undefined ? {} : { address }),
-            afterSeq: noticeScanned.get(parentId) ?? 0,
-            pageSize: 500,
-          })
-        } catch {
-          return { pending, unavailableReason: 'subagent-settlement-notice-unavailable' }
+      const unprovable = []
+      for (const node of candidates) {
+        const epoch = epochs.get(node.id)
+        const records = noticeRecords.filter(record => record.childId === node.id)
+        if (node.mode === 'one-shot') {
+          if (records.some(noticeConsumed)) continue
+          if (epoch?.firstSeenNonsettled === true) pending.push(node.id)
+          else unprovable.push(node.id)
+          continue
         }
-        noticeScanned.set(parentId, page.cursor)
-        // Index every notice in the page before checking any sibling; one
-        // parent cursor must never discard another child's notice.
-        for (const event of page.events) {
-          if (event.type === 'user/message'
-            && event.data?.source?.kind === 'subagent-settled'
-            && typeof event.data.source.senderSessionId === 'string') {
-            const previous = noticeSeqs.get(event.data.source.senderSessionId) ?? -1
-            if (event.seq > previous) {
-              noticeSeqs.set(event.data.source.senderSessionId, event.seq)
-            }
-          }
+        if (epoch === undefined || epoch.firstSeenNonsettled !== true || epoch.reactivated) {
+          unprovable.push(node.id)
+          continue
         }
-        for (const childId of group.ids) {
-          if (!noticeSatisfied(childId)) pending.push(childId)
+        const prior = records.filter(record => record.seq <= epoch.initialParentCursor)
+        if (prior.length > 0) {
+          unprovable.push(node.id)
+          continue
         }
+        const current = records.filter(record => record.seq > epoch.initialParentCursor)
+        if (current.length === 0) {
+          pending.push(node.id)
+          continue
+        }
+        if (current.length > 1) {
+          unprovable.push(node.id)
+          continue
+        }
+        if (noticeConsumed(current[0])) continue
+        pending.push(node.id)
       }
-      return { pending, unavailableReason: null }
+      return { pending, unprovable, unavailableReason: null }
     }
 
     for (;;) {
@@ -339,6 +383,10 @@ export class StateWaiter {
               collected,
             })
           }
+          if (waitForSubagents) {
+            const queuedTree = await this.#readSubagents(sessionId, { recursive: true })
+            observeTree(queuedTree, lastState?.cursor)
+          }
           await this.#sleep(Math.min(this.#subagentPollMs, left))
           continue
         }
@@ -360,7 +408,7 @@ export class StateWaiter {
           })
         }
 
-        noteActive(subagents, lastState?.cursor)
+        observeTree(subagents, lastState?.cursor)
 
         // A durable external/unknown row names a child with no local session to
         // observe. Its mere presence proves neither running nor finished, so
@@ -543,7 +591,7 @@ export class StateWaiter {
         // Every observable local descendant is settled. Success requires the
         // child's durable settlement notice in its direct parent's history, not
         // a quiet timer. Then recheck the parent/root state and queue.
-        const verification = await verifyNotices(subagents, lastState)
+        const verification = await verifySettlement(subagents)
         if (verification.unavailableReason !== null) {
           return this.#snapshot({
             delegationId,
@@ -560,6 +608,47 @@ export class StateWaiter {
             indeterminate: true,
             indeterminateReason: verification.unavailableReason,
           })
+        }
+        if (verification.unprovable.length > 0) {
+          if (boundedRecheckUsed) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'indeterminate',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-epoch-unverifiable',
+            })
+          }
+          boundedRecheckUsed = true
+          pendingNoticeReason = 'subagent-settlement-epoch-unverifiable'
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'indeterminate',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-epoch-unverifiable',
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          continue
         }
         if (verification.pending.length > 0) {
           pendingNoticeReason = 'subagent-settlement-notice-unobserved'
@@ -606,8 +695,8 @@ export class StateWaiter {
             indeterminateReason: 'subagent-settlement-recheck-unavailable',
           })
         }
-        noteActive(freshTree, lastState?.cursor)
-        const freshVerification = await verifyNotices(freshTree, lastState)
+        observeTree(freshTree, lastState?.cursor)
+        const freshVerification = await verifySettlement(freshTree)
         if (freshVerification.unavailableReason !== null) {
           return this.#snapshot({
             delegationId,
@@ -624,6 +713,47 @@ export class StateWaiter {
             indeterminate: true,
             indeterminateReason: freshVerification.unavailableReason,
           })
+        }
+        if (freshVerification.unprovable.length > 0) {
+          if (boundedRecheckUsed) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'indeterminate',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents: freshTree,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-epoch-unverifiable',
+            })
+          }
+          boundedRecheckUsed = true
+          pendingNoticeReason = 'subagent-settlement-epoch-unverifiable'
+          const left = deadline - this.#clock()
+          if (left <= 0) {
+            return this.#snapshot({
+              delegationId,
+              sessionId,
+              reason: 'indeterminate',
+              state: lastState,
+              startedAt,
+              cursor,
+              slices,
+              backfilled,
+              outputTruncated,
+              subagents: freshTree,
+              collected,
+              indeterminate: true,
+              indeterminateReason: 'subagent-settlement-epoch-unverifiable',
+            })
+          }
+          await this.#sleep(Math.min(this.#subagentPollMs, left))
+          continue
         }
         if (freshVerification.pending.length > 0) {
           pendingNoticeReason = 'subagent-settlement-notice-unobserved'
