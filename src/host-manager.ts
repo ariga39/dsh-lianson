@@ -304,9 +304,6 @@ export class HostManager {
       const record = await this.readRecord()
       if (record === undefined) return { hostPid: null, stoppedHost: false, stopReason: 'absent' }
       if (record.state === 'launching') {
-        if (options.keepHost === true) {
-          throw new LiaisonError('HOST_LAUNCH_INCOMPLETE', 'an interrupted launch cannot be kept')
-        }
         const identity = await this.resolveLaunchingIdentity(record)
         if (identity.kind === 'unverified') {
           throw new LiaisonError('HOST_IDENTITY_UNVERIFIED', 'the launching Host cannot be verified', {
@@ -322,14 +319,13 @@ export class HostManager {
           await this.cleanupFiles()
           return { hostPid: null, stoppedHost: false, stopReason: 'already-exited' }
         }
+        if (options.keepHost === true) {
+          throw new LiaisonError('HOST_LAUNCH_INCOMPLETE', 'an interrupted launch cannot be kept')
+        }
         await this.closeOperator()
         await this.terminate(identity.pid, identity.startTime, record)
         await this.cleanupFiles()
         return { hostPid: identity.pid, stoppedHost: true, stopReason: 'stopped' }
-      }
-      if (options.keepHost === true) {
-        await this.closeOperator()
-        return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'kept' }
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
       if (identity.kind === 'unverified') {
@@ -340,6 +336,12 @@ export class HostManager {
       if (identity.kind === 'dead-or-reused') {
         await this.cleanupFiles()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'already-exited' }
+      }
+      if (options.keepHost === true) {
+        // Keeping never signals. Verify first so a dead/reused or unverifiable
+        // record reports the truth instead of a false kept claim.
+        await this.closeOperator()
+        return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'kept' }
       }
       await this.closeOperator()
       await this.terminateVerified(record)
@@ -604,6 +606,10 @@ export class HostManager {
             return
           }
           finish({ value: { origin: record.origin, port: record.port, launchToken: record.launchToken } })
+        } catch (error) {
+          finish({
+            error: new LiaisonError('HOST_START_FAILED', 'the observer ready record could not be read', { cause: error }),
+          })
         } finally {
           reading = false
         }

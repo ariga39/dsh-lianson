@@ -30,6 +30,8 @@ export interface OperatorConnectionOptions {
   readonly reconnectBaseMs?: number
   readonly reconnectMaxMs?: number
   readonly generationTimeoutMs?: number
+  /** Per-attempt `/connect` deadline; defaults to 10s. */
+  readonly connectTimeoutMs?: number
   readonly onCookie?: (cookie: string) => void
   readonly onWebSocket?: (socket: ConnectionWebSocket, url: string) => void
 }
@@ -52,6 +54,7 @@ interface ReadyWaiter {
 const DEFAULT_RECONNECT_BASE_MS = 100
 const DEFAULT_RECONNECT_MAX_MS = 2_000
 const DEFAULT_GENERATION_TIMEOUT_MS = 15_000
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000
 const DISPOSE_TIMEOUT_MS = 5_000
 
 /**
@@ -68,6 +71,7 @@ export class OperatorConnection {
   private loopDone: Promise<void> | undefined
   private closing = false
   private lastError: Error | undefined
+  private changes: Promise<void> = Promise.resolve()
 
   /**
    * @param options - transport overrides and bound reconnect timing.
@@ -93,11 +97,13 @@ export class OperatorConnection {
    * @param timeoutMs - optional foreground readiness deadline.
    */
   async setHost(target: OperatorTarget, timeoutMs?: number): Promise<void> {
-    if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
-    await this.detach()
-    this.target = target
-    this.startLoop()
-    if (timeoutMs !== undefined) await this.waitReady(timeoutMs)
+    await this.serializeChange(async () => {
+      if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
+      await this.detach()
+      this.target = target
+      this.startLoop()
+      if (timeoutMs !== undefined) await this.waitReady(timeoutMs)
+    })
   }
 
   /**
@@ -142,20 +148,30 @@ export class OperatorConnection {
 
   /** Stop reconnecting, close the current socket, and reject pending waits. */
   async close(): Promise<void> {
-    if (this.closing) return
-    this.closing = true
-    this.target = undefined
-    await this.detach()
-    const failure = new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection closed')
-    for (const waiter of this.readyWaiters.splice(0)) {
-      clearTimeout(waiter.timer)
-      waiter.reject(failure)
-    }
+    await this.serializeChange(async () => {
+      if (this.closing) return
+      this.closing = true
+      this.target = undefined
+      await this.detach()
+      const failure = new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection closed')
+      for (const waiter of this.readyWaiters.splice(0)) {
+        clearTimeout(waiter.timer)
+        waiter.reject(failure)
+      }
+    })
+  }
+
+  private serializeChange<T>(operation: () => Promise<T>): Promise<T> {
+    const start = this.changes
+    let release: () => void = () => {}
+    this.changes = new Promise<void>((resolve) => { release = resolve })
+    return start.then(operation).finally(release)
   }
 
   private startLoop(): void {
     const target = this.target
     if (target === undefined || this.closing) return
+    if (this.loopAbort !== undefined) throw new Error('operator connection already has an active loop')
     const abort = new AbortController()
     this.loopAbort = abort
     this.loopDone = this.runLoop(target, abort.signal).catch((error: unknown) => {
@@ -189,7 +205,12 @@ export class OperatorConnection {
   }
 
   private async open(target: OperatorTarget, signal: AbortSignal): Promise<OpenedConnection> {
-    const { cookie, baseUrl } = await exchangeOperatorCredential(target, this.options.fetch, signal)
+    const { cookie, baseUrl } = await exchangeOperatorCredential(
+      target,
+      this.options.fetch,
+      signal,
+      this.connectTimeoutMs(),
+    )
     this.options.onCookie?.(cookie)
     const ctx = new Context()
     const lost = new AbortController()
@@ -285,12 +306,9 @@ export class OperatorConnection {
     this.loopAbort = undefined
     this.loopDone = undefined
     abort?.abort()
-    if (done !== undefined) {
-      await new Promise<void>((resolve) => {
-        const timer = setTimeout(resolve, DISPOSE_TIMEOUT_MS + 2_000)
-        void done.finally(() => { clearTimeout(timer); resolve() })
-      })
-    }
+    // Every started loop is awaited: changes are serialized, so this loop is
+    // the only one and cannot be abandoned by a shorter timeout.
+    if (done !== undefined) await done
   }
 
   private backoff(attempt: number): number {
@@ -302,6 +320,10 @@ export class OperatorConnection {
 
   private generationTimeoutMs(): number {
     return this.options.generationTimeoutMs ?? DEFAULT_GENERATION_TIMEOUT_MS
+  }
+
+  private connectTimeoutMs(): number {
+    return this.options.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
   }
 }
 
@@ -316,23 +338,53 @@ export async function exchangeOperatorCredential(
   target: OperatorTarget,
   fetchImpl: typeof fetch = globalThis.fetch,
   signal?: AbortSignal,
+  timeoutMs = DEFAULT_CONNECT_TIMEOUT_MS,
 ): Promise<{ readonly cookie: string; readonly baseUrl: string }> {
   const connect = new URL('/connect', target.origin)
   connect.searchParams.set('token', target.launchToken)
   connect.searchParams.set('interactions', 'answer')
-  const response = await fetchImpl(connect, {
-    redirect: 'manual',
-    ...signal === undefined ? {} : { signal },
+  const attempt = new AbortController()
+  const forwardAbort = (): void => {
+    attempt.abort(signal?.reason instanceof Error
+      ? signal.reason
+      : new LiaisonError('OPERATOR_UNAVAILABLE', 'operator /connect was aborted'))
+  }
+  if (signal?.aborted === true) forwardAbort()
+  else signal?.addEventListener('abort', forwardAbort, { once: true })
+  let timer: NodeJS.Timeout | undefined
+  const timedOut = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new LiaisonError('OPERATOR_UNAVAILABLE', `operator /connect did not answer within ${String(timeoutMs)}ms`)
+      attempt.abort(error)
+      reject(error)
+    }, timeoutMs)
   })
-  if (response.status !== 302) {
-    throw new LiaisonError('OPERATOR_UNAVAILABLE', `operator /connect returned HTTP ${String(response.status)}`)
+  const aborted = new Promise<never>((_resolve, reject) => {
+    attempt.signal.addEventListener('abort', () => {
+      reject(attempt.signal.reason instanceof Error
+        ? attempt.signal.reason
+        : new LiaisonError('OPERATOR_UNAVAILABLE', 'operator /connect was aborted'))
+    }, { once: true })
+  })
+  try {
+    const response = await Promise.race([
+      fetchImpl(connect, { redirect: 'manual', signal: attempt.signal }),
+      timedOut,
+      aborted,
+    ])
+    if (response.status !== 302) {
+      throw new LiaisonError('OPERATOR_UNAVAILABLE', `operator /connect returned HTTP ${String(response.status)}`)
+    }
+    const setCookie = response.headers.get('set-cookie')
+    const cookie = setCookie?.split(';', 1)[0]
+    if (cookie === undefined || cookie === '') {
+      throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator /connect returned no credential')
+    }
+    return { cookie, baseUrl: new URL('/', target.origin).href }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    signal?.removeEventListener('abort', forwardAbort)
   }
-  const setCookie = response.headers.get('set-cookie')
-  const cookie = setCookie?.split(';', 1)[0]
-  if (cookie === undefined || cookie === '') {
-    throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator /connect returned no credential')
-  }
-  return { cookie, baseUrl: new URL('/', target.origin).href }
 }
 
 async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number, signal: AbortSignal): Promise<void> {

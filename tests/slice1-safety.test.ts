@@ -1,6 +1,7 @@
 import { strict as assert } from 'node:assert'
-import { spawn } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { spawn, type ChildProcess } from 'node:child_process'
+import { EventEmitter } from 'node:events'
+import { chmodSync, existsSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import { START_CALL_TIMEOUT_MS, STOP_CALL_TIMEOUT_MS } from '../src/cli.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { HostManager, normalizeLoopbackOrigin } from '../src/host-manager.ts'
+import { statePaths } from '../src/paths.ts'
 import { scanHostProcesses } from '../src/proc-identity.ts'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
@@ -126,6 +128,120 @@ await test('unreadable process evidence is unverified, not dead', async (t) => {
     })
     assert.equal(signals.length, 0)
     assert.equal(existsSync(join(stateDir, 'host.json')), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('keep-host reports dead or unverified ownership truthfully and never signals', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-keep-truth-'))
+  try {
+    const record = readyRecord({ hostPid: process.pid, hostStartTime: '1' })
+
+    const aliveState = join(root, 'alive-state')
+    await writeState(aliveState, record)
+    const aliveProc = join(root, 'alive-proc')
+    const aliveDir = join(aliveProc, String(process.pid))
+    await mkdir(join(aliveProc, 'self'), { recursive: true })
+    await writeFile(join(aliveProc, 'self', 'stat'), '1 (node) S 0')
+    await mkdir(aliveDir, { recursive: true })
+    await writeProc(aliveDir, 'S', '1', record)
+    const aliveSignals: string[] = []
+    const alive = new HostManager({
+      stateDir: aliveState,
+      projectRoot,
+      cwd: root,
+      procRoot: aliveProc,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      signalProcess: (_pid, signal) => { aliveSignals.push(signal) },
+    })
+    const kept = await alive.stop({ keepHost: true })
+    assert.equal(kept.stopReason, 'kept')
+    assert.equal(kept.stoppedHost, false)
+    assert.equal(aliveSignals.length, 0)
+    assert.equal(existsSync(join(aliveState, 'host.json')), true)
+
+    const deadState = join(root, 'dead-state')
+    await writeState(deadState, record)
+    const deadProc = join(root, 'dead-proc')
+    await mkdir(join(deadProc, 'self'), { recursive: true })
+    await writeFile(join(deadProc, 'self', 'stat'), '1 (node) S 0')
+    const deadSignals: string[] = []
+    const dead = new HostManager({
+      stateDir: deadState,
+      projectRoot,
+      cwd: root,
+      procRoot: deadProc,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      signalProcess: (_pid, signal) => { deadSignals.push(signal) },
+    })
+    const alreadyExited = await dead.stop({ keepHost: true })
+    assert.equal(alreadyExited.stopReason, 'already-exited')
+    assert.equal(alreadyExited.stoppedHost, false)
+    assert.equal(deadSignals.length, 0)
+    assert.equal(existsSync(join(deadState, 'host.json')), false)
+
+    const unknownState = join(root, 'unknown-state')
+    await writeState(unknownState, record)
+    const unknownSignals: string[] = []
+    const unknown = new HostManager({
+      stateDir: unknownState,
+      projectRoot,
+      cwd: root,
+      procRoot: join(root, 'no-such-proc'),
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      signalProcess: (_pid, signal) => { unknownSignals.push(signal) },
+    })
+    await assert.rejects(unknown.stop({ keepHost: true }), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'HOST_IDENTITY_UNVERIFIED')
+      return true
+    })
+    assert.equal(unknownSignals.length, 0)
+    assert.equal(existsSync(join(unknownState, 'host.json')), true)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('ready record read failures finish as HOST_START_FAILED without an unhandled rejection', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-ready-read-'))
+  try {
+    for (const mode of ['malformed', 'unreadable'] as const) {
+      const stateDir = join(root, mode)
+      const paths = statePaths(stateDir)
+      const child = new EventEmitter() as EventEmitter & { pid: number; unref: () => void }
+      child.pid = process.pid
+      child.unref = () => undefined
+      const spawnProcess = (() => {
+        if (mode === 'malformed') {
+          writeFileSync(paths.readyFile, '{')
+        } else {
+          writeFileSync(paths.readyFile, JSON.stringify({ ok: true, launchId: 'unreadable' }))
+          chmodSync(paths.readyFile, 0)
+        }
+        return child as unknown as ChildProcess
+      }) as unknown as typeof spawn
+      const manager = new HostManager({
+        stateDir,
+        projectRoot,
+        cwd: root,
+        startTimeoutMs: 5_000,
+        stopGraceMs: 10,
+        killGraceMs: 10,
+        spawnProcess,
+      })
+      await assert.rejects(manager.start(), (error: unknown) => {
+        assert.ok(error instanceof LiaisonError)
+        assert.equal(error.code, 'HOST_START_FAILED')
+        return true
+      })
+      assert.equal(existsSync(join(stateDir, 'host.json')), false)
+      assert.equal(existsSync(join(stateDir, 'host-observer.patch.json')), false)
+    }
   } finally {
     await rm(root, { recursive: true, force: true })
   }
