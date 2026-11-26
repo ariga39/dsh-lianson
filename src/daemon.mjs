@@ -15,7 +15,12 @@ const operator = new OperatorConnection({ hostManager: manager })
 let host = null
 let server
 let shuttingDown = false
+let closing = false
 let gate = Promise.resolve()
+
+function assertOpen() {
+  if (closing) throw new LiaisonError('DAEMON_CLOSING', 'Daemon is closing')
+}
 
 function redact(value) {
   return redactSecrets(value, [host?.launchToken].filter(secret => typeof secret === 'string'))
@@ -62,7 +67,11 @@ async function refreshHost() {
 }
 
 async function ensureHost(params) {
+  assertOpen()
   const next = await manager.ensureHost(params)
+  // A stop may have started while the Host lock was held. The stop path will
+  // reclaim this launch under the same lock, but this request must not adopt it.
+  assertOpen()
   host = next
   await operator.setHost(next)
   return next
@@ -77,11 +86,19 @@ async function dispatch(request) {
       message: `Unknown command: ${String(command)}`,
     }, id) }
   }
+  if (closing && key !== 'host.stop') {
+    return { envelope: failure(command, {
+      code: 'DAEMON_CLOSING',
+      message: 'Daemon is closing',
+    }, id) }
+  }
 
   try {
     if (key === 'host.start') {
       return await exclusive(async () => {
+        assertOpen()
         await ensureHost(params)
+        assertOpen()
         await operator.ensureConnected()
         return { envelope: success(command, statusData(), id) }
       })
@@ -89,7 +106,9 @@ async function dispatch(request) {
     if (key === 'host.status') {
       if (params.ensure === true) {
         return await exclusive(async () => {
+          assertOpen()
           await ensureHost(params)
+          assertOpen()
           await operator.ensureConnected()
           return { envelope: success(command, statusData(), id) }
         })
@@ -98,7 +117,13 @@ async function dispatch(request) {
       return { envelope: success(command, statusData(), id) }
     }
     if (key === 'host.ping') {
-      if (host === null) await exclusive(async () => { await ensureHost(params) })
+      if (host === null) {
+        await exclusive(async () => {
+          assertOpen()
+          await ensureHost(params)
+        })
+      }
+      assertOpen()
       await operator.ensureConnected()
       const result = await operator.withClient(async remote => {
         const response = await remote.session.modelCatalog()
@@ -113,29 +138,46 @@ async function dispatch(request) {
       }
     }
     if (key === 'host.stop') {
+      if (closing) {
+        return { envelope: failure(command, {
+          code: 'DAEMON_CLOSING',
+          message: 'Daemon is already closing',
+        }, id) }
+      }
+      closing = true
       const keep = params.stopHost === false
       const previous = host
-      // Close first: this aborts any persistent background reconnect before the
-      // stop path waits on process or filesystem state.
-      await operator.close()
-      const stopped = keep
-        ? await manager.inspectHost({ probe: false }).catch(() => null).then(hostInfo => ({
-          stopped: false,
-          reason: 'kept',
-          pid: hostInfo?.pid ?? previous?.pid ?? null,
-          retained: false,
-        }))
-        : await manager.stopHost()
-      host = null
-      return {
-        envelope: success(command, {
-          daemonPid: process.pid,
-          hostPid: stopped.pid ?? previous?.pid ?? null,
-          stoppedHost: stopped.stopped,
-          stopReason: stopped.reason,
-          stopRetained: stopped.retained === true,
-        }, id),
-        shutdown: true,
+      try {
+        // Close first: this aborts any persistent background reconnect before
+        // the stop path waits on process or filesystem state.
+        await operator.close()
+        const stopped = keep
+          ? await manager.inspectHost({ probe: false }).catch(() => null).then(hostInfo => ({
+            stopped: false,
+            reason: 'kept',
+            pid: hostInfo?.pid ?? previous?.pid ?? null,
+            retained: false,
+          }))
+          : await manager.stopHost()
+        host = null
+        return {
+          envelope: success(command, {
+            daemonPid: process.pid,
+            hostPid: stopped.pid ?? previous?.pid ?? null,
+            stoppedHost: stopped.stopped,
+            stopReason: stopped.reason,
+            stopRetained: stopped.retained === true,
+          }, id),
+          shutdown: true,
+        }
+      } catch (error) {
+        // The operator is already closed. Exit rather than leaving an unusable
+        // daemon; the Host record and its ownership lock remain for a successor.
+        return {
+          envelope: failure(command, errorEnvelope(error, redact), id),
+          shutdown: true,
+          preserveOwnership: true,
+        }
       }
     }
     return { envelope: failure(command, {

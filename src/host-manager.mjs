@@ -12,6 +12,7 @@ import { redactSecrets } from './redaction.mjs'
 
 export const REPO_ROOT = fileURLToPath(new URL('..', import.meta.url))
 export const DSH_BIN = join(REPO_ROOT, 'deepseek-harness/apps/cli/lib/bin.js')
+const DRAIN_BIN = fileURLToPath(new URL('./host-drain.mjs', import.meta.url))
 const FLOCK_ANCHOR = join(REPO_ROOT, 'deepseek-harness/native/system/packages/entry/package.json')
 export const HOST_MARKER_ENV = 'DSH_LIAISON_HOST_MARKER'
 const RECORD_VERSION = 1
@@ -398,20 +399,6 @@ async function probeOrigin(origin, timeoutMs) {
   }
 }
 
-async function openUnlinkedCapture(stateDir, name) {
-  const path = join(stateDir, `.${name}-${randomUUID()}.log`)
-  const handle = await open(path, 'a+', 0o600)
-  await chmod(path, 0o600)
-  return { path, handle }
-}
-
-async function readCaptureTail(handle, position) {
-  const buffer = Buffer.allocUnsafe(65_536)
-  const { bytesRead } = await handle.read(buffer, 0, buffer.length, position)
-  if (bytesRead === 0) return { text: '', position }
-  return { text: buffer.subarray(0, bytesRead).toString('utf8'), position: position + bytesRead }
-}
-
 /** A managed Host handle. `launchToken` is a credential and must never be serialized to IPC. */
 function hostHandle(record) {
   return {
@@ -715,67 +702,69 @@ export class HostManager {
     for (const patch of patches) args.push('--patch', patch)
     args.push('--no-open', '--host', '127.0.0.1', '--port', String(port))
 
-    const stdout = await openUnlinkedCapture(this.stateDir, 'host-stdout')
-    const stderr = await openUnlinkedCapture(this.stateDir, 'host-stderr')
-    const child = spawn(process.execPath, args, {
+    const drainEnv = {
+      ...env,
+      DSH_LIAISON_DRAIN_ARGS: JSON.stringify(args),
+      DSH_LIAISON_DRAIN_CWD: cwd,
+    }
+    const drainer = spawn(process.execPath, [DRAIN_BIN], {
       cwd,
-      env,
+      env: drainEnv,
       detached: true,
-      stdio: ['ignore', stdout.handle.fd, stderr.handle.fd],
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
-    child.unref()
-    await unlink(stdout.path).catch(() => {})
-    await unlink(stderr.path).catch(() => {})
+    let spawnError
+    drainer.once('error', error => { spawnError = error })
+    drainer.unref()
 
     let output = ''
     let errorOutput = ''
-    let stdoutPosition = 0
-    let stderrPosition = 0
+    let hostPid
     let launchUrl
-    let spawnError
-    child.once('error', error => { spawnError = error })
+    drainer.stdout.setEncoding('utf8')
+    drainer.stderr.setEncoding('utf8')
+    drainer.stdout.on('data', chunk => { output = `${output}${chunk}`.slice(-100_000) })
+    drainer.stderr.on('data', chunk => { errorOutput = `${errorOutput}${chunk}`.slice(-100_000) })
     const started = Date.now()
     try {
-      if (child.pid === undefined) {
-        throw new LiaisonError('HOST_SPAWN_FAILED', 'dsh web did not provide a pid')
-      }
-      const procStart = await processStartToken(child.pid, this.procRoot)
-      if (procStart !== undefined) {
-        ownershipRecord = {
-          ...launchRecord,
-          state: 'starting',
-          pid: child.pid,
-          procStart,
-        }
-        await writePrivateAtomic(this.recordPath, ownershipRecord)
-      }
       while (Date.now() - started < this.spawnTimeoutMs) {
         if (spawnError !== undefined) {
           throw new LiaisonError('HOST_SPAWN_FAILED',
             `Could not start dsh web: ${redactSecrets(spawnError.message)}`)
         }
-        if (stdoutPosition >= 0) {
-          const read = await readCaptureTail(stdout.handle, stdoutPosition)
-          stdoutPosition = read.position
-          output = `${output}${read.text}`.slice(-100_000)
+        if (hostPid === undefined) {
+          const pidMatch = /DSH_DRAIN_PID (\d+)/u.exec(output)
+          if (pidMatch?.[1] !== undefined) hostPid = Number(pidMatch[1])
         }
-        const read = await readCaptureTail(stderr.handle, stderrPosition)
-        stderrPosition = read.position
-        errorOutput = `${errorOutput}${read.text}`.slice(-100_000)
+        if (hostPid !== undefined && ownershipRecord === undefined) {
+          const procStart = await processStartToken(hostPid, this.procRoot)
+          if (procStart !== undefined) {
+            ownershipRecord = {
+              ...launchRecord,
+              state: 'starting',
+              pid: hostPid,
+              procStart,
+            }
+            await writePrivateAtomic(this.recordPath, ownershipRecord)
+          }
+        }
         const match = /dsh web: (http:\/\/[^\s]+)/u.exec(`${output}${errorOutput}`)
         if (match?.[1] !== undefined) {
           launchUrl = match[1]
           break
         }
-        if (child.exitCode !== null) {
+        if (drainer.exitCode !== null) {
           throw new LiaisonError('HOST_SPAWN_FAILED',
-            `dsh web exited before readiness (${String(child.exitCode)}): ${redactSecrets(`${output}${errorOutput}`)}`)
+            `dsh web exited before readiness (${String(drainer.exitCode)}): ${redactSecrets(`${output}${errorOutput}`)}`)
         }
         await sleep(25)
       }
       if (launchUrl === undefined) {
         throw new LiaisonError('HOST_SPAWN_TIMEOUT',
           `dsh web did not become ready: ${redactSecrets(`${output}${errorOutput}`)}`)
+      }
+      if (hostPid === undefined) {
+        throw new LiaisonError('HOST_SPAWN_FAILED', 'dsh web did not report a pid')
       }
 
       let url
@@ -787,19 +776,12 @@ export class HostManager {
       if (launchToken === null || launchToken.length < 16) {
         throw new LiaisonError('HOST_LAUNCH_URL_INVALID', 'dsh web launch URL has no token')
       }
-      if (child.pid === undefined) {
-        throw new LiaisonError('HOST_SPAWN_FAILED', 'dsh web did not provide a pid')
-      }
-      if (child.exitCode !== null) {
-        throw new LiaisonError('HOST_SPAWN_FAILED', 'dsh web exited immediately after readiness')
-      }
-
       const record = {
         ...(ownershipRecord ?? {
           ...launchRecord,
           state: 'starting',
-          pid: child.pid,
-          procStart: await processStartToken(child.pid, this.procRoot),
+          pid: hostPid,
+          procStart: await processStartToken(hostPid, this.procRoot),
         }),
         state: 'ready',
         origin,
@@ -807,17 +789,27 @@ export class HostManager {
         launchToken,
       }
       await writePrivateAtomic(this.recordPath, record)
+      // Switch the detached drainer to discard-only. It keeps reading Host
+      // output for its whole lifetime, so no unlinked file grows on disk.
+      drainer.stdout.destroy()
+      drainer.stderr.destroy()
       return hostHandle(record)
     } catch (error) {
-      if (ownershipRecord !== undefined && child.exitCode === null) {
-        await this.#terminateRecord(ownershipRecord, { timeoutMs: 2_000, killTimeoutMs: 1_000 }).catch(() => {})
-      } else if (child.pid === undefined || child.exitCode !== null) {
+      const cleanupRecord = ownershipRecord ?? (hostPid === undefined ? undefined : {
+        ...launchRecord,
+        state: 'starting',
+        pid: hostPid,
+        procStart: await processStartToken(hostPid, this.procRoot),
+      })
+      if (cleanupRecord !== undefined) {
+        await this.#terminateRecord(cleanupRecord, { timeoutMs: 2_000, killTimeoutMs: 1_000 }).catch(() => {})
+      } else if (drainer.pid === undefined || drainer.exitCode !== null) {
         await this.#removeRecordByMarker(marker)
       }
       throw error
     } finally {
-      await stdout.handle.close().catch(() => {})
-      await stderr.handle.close().catch(() => {})
+      drainer.stdout.destroy()
+      drainer.stderr.destroy()
     }
   }
 

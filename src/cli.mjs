@@ -1,6 +1,7 @@
 /** Thin CLI: JSON in/out over the user-only daemon socket. */
 
 import { spawn } from 'node:child_process'
+import { stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
 import { HostManager, createLock, resolveStateDir } from './host-manager.mjs'
@@ -103,6 +104,23 @@ async function stopWithoutDaemon({ stateDir, keepHost }) {
 }
 
 async function stopWithOwnership({ socketPath, stateDir, keepHost }) {
+  const stateExists = await stat(stateDir).then(info => info.isDirectory()).catch(error => {
+    if (error?.code === 'ENOENT') return false
+    throw error
+  })
+  if (!stateExists) {
+    return {
+      ok: true,
+      command: 'host stop',
+      data: {
+        daemonPid: null,
+        hostPid: null,
+        stoppedHost: false,
+        stopReason: 'missing',
+        stopRetained: false,
+      },
+    }
+  }
   const lock = await createLock(join(stateDir, 'daemon.lock'))
   const deadline = Date.now() + 15_000
   while (true) {

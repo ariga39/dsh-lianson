@@ -9,5 +9,6 @@ const { tryLockExclusive } = await import(pathToFileURL(resolved).href)
 
 const handle = await open(process.argv[2], 'a+', 0o600)
 await tryLockExclusive(handle.fd)
+globalThis.__dshFlockHandle = handle
 process.stdout.write('locked\n')
-setInterval(() => {}, 1_000)
+setInterval(() => { void handle.fd }, 1_000)
