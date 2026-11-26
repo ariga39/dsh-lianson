@@ -109,6 +109,13 @@ export class EventReader {
     if (throughSeq !== undefined && (!Number.isSafeInteger(throughSeq) || throughSeq < -1)) {
       throw new TypeError('throughSeq must be an integer greater than or equal to -1')
     }
+    if (throughSeq !== undefined && afterSeq > throughSeq) {
+      throw new LiaisonError(
+        'events/bad-range',
+        `afterSeq ${String(afterSeq)} is beyond throughSeq ${String(throughSeq)}`,
+        { sessionId, afterSeq, throughSeq },
+      )
+    }
     if (pageSize !== undefined && (!Number.isSafeInteger(pageSize) || pageSize <= 0)) {
       throw new TypeError('pageSize must be a positive safe integer')
     }
@@ -122,6 +129,16 @@ export class EventReader {
     })
     assertPage(first, sessionId)
     const pinnedCursor = first.cursor
+    if (pinnedCursor <= afterSeq) {
+      return {
+        sessionId,
+        cursor: pinnedCursor,
+        pinnedCursor,
+        afterSeq,
+        events: [],
+        pagesRead: 1,
+      }
+    }
     let loaded = pageEvents(first)
     assertChronological(loaded, { sessionId, expectedFrom: afterSeq, throughSeq: pinnedCursor })
     let page = first
