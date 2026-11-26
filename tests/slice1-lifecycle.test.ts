@@ -1,8 +1,9 @@
 import { strict as assert } from 'node:assert'
 import { spawn, spawnSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readdir, readFile, readlink, rm, stat, writeFile } from 'node:fs/promises'
-import { createServer } from 'node:net'
+import { createConnection, createServer, type Socket } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -170,8 +171,9 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
       cleanupPids.delete(pid)
     }
 
-    // Starts scheduled together and stopped immediately must not orphan a
-    // Host or leave a reconnect loop keeping a replaced manager's daemon alive.
+    // Establish one live daemon, start a normal CLI launch, wait until its
+    // launching record exists, then queue a second start and the stop on that
+    // same original socket. No independent CLI arrival order is guessed.
     const raceDir = join(root, 'race-state')
     const raceEnv = cliEnv(root, join(root, 'race-dsh'), raceDir)
     const primePing = runCli(raceEnv, workspace, ['host', 'ping'])
@@ -181,26 +183,45 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
     const primeDaemon = objectOf(primeStatus.json).daemonPid
     assert.equal(typeof primeDaemon, 'number')
     cleanupPids.add(primeDaemon as number)
-    const [raceStartA, raceStartB, raceStop] = await Promise.all([
-      spawnCli(raceEnv, workspace, ['host', 'start']),
-      spawnCli(raceEnv, workspace, ['host', 'start']),
-      spawnCli(raceEnv, workspace, ['host', 'stop']),
-    ])
-    assert.equal(raceStop.status, 0, `simultaneous stop failed: ${raceStop.stderr}`)
-    const racePids = new Set<number>([])
-    for (const result of [raceStartA, raceStartB]) {
-      if (result.status !== 0) continue
-      const host = startedHost(result.json)
-      racePids.add(host.hostPid)
-      racePids.add(host.daemonPid)
-      cleanupPids.add(host.hostPid)
-      cleanupPids.add(host.daemonPid)
+
+    const firstStart = spawnCli(raceEnv, workspace, ['host', 'start'])
+    await waitForHostRecord(raceDir, record => record.state === 'launching')
+    const session = openIpcSession(join(raceDir, 'daemon.sock'))
+    try {
+      const queuedStart = session.call('host.start', {})
+      const stop = session.call('host.stop', { keepHost: false })
+      const outcomes = await Promise.allSettled([queuedStart.promise, stop.promise, firstStart])
+      const [queuedOutcome, stopOutcome, firstOutcome] = outcomes
+      assert.equal(firstOutcome.status, 'fulfilled')
+      assert.equal(stopOutcome.status, 'fulfilled')
+      assert.equal(queuedOutcome.status, 'fulfilled')
+      const first = firstOutcome.value
+      assert.equal(first.status, 0, first.stderr)
+      const firstHost = startedHost(first.json)
+      assert.equal(firstHost.daemonPid, primeDaemon, 'the ordered start must use the original daemon')
+      cleanupPids.add(firstHost.hostPid)
+      cleanupPids.add(firstHost.daemonPid)
+
+      const queued = queuedOutcome.value
+      if (queued.ok) {
+        const queuedHost = objectOf(queued.result)
+        assert.equal(queuedHost.hostPid, firstHost.hostPid, 'an admitted queued start must bind the same Host')
+      } else {
+        assert.equal(queued.error?.code, 'DAEMON_STOPPING', 'a queued start must observe the stop fence')
+      }
+      const stopReply = stopOutcome.value
+      assert.equal(stopReply.ok, true, `stop on the original daemon failed: ${stopReply.error?.message ?? ''}`)
+      assert.equal(objectOf(stopReply.result).stoppedHost, true)
+
+      await assertGone(firstHost.hostPid)
+      await assertGone(firstHost.daemonPid)
+      cleanupPids.delete(firstHost.hostPid)
+      cleanupPids.delete(firstHost.daemonPid)
+    } finally {
+      session.close()
     }
-    racePids.add(primeDaemon as number)
-    for (const pid of racePids) {
-      await assertGone(pid)
-      cleanupPids.delete(pid)
-    }
+    await assertGone(primeDaemon as number)
+    cleanupPids.delete(primeDaemon as number)
     assert.equal(existsSync(join(raceDir, 'host.json')), false, 'a successful stop must not leave a ready Host record')
     assert.equal(existsSync(join(raceDir, 'daemon.sock')), false, 'a successful stop must withdraw the daemon socket')
   } finally {
@@ -355,6 +376,119 @@ async function spawnCli(env: NodeJS.ProcessEnv, cwd: string, args: readonly stri
       resolve({ status, stdout, stderr, json })
     })
   })
+}
+
+interface RawIpcReply {
+  readonly ok: boolean
+  readonly result?: unknown
+  readonly error?: { readonly code: string; readonly message: string }
+}
+
+interface RawIpcSession {
+  call(
+    method: 'host.start' | 'host.stop',
+    params: Record<string, unknown>,
+  ): { readonly id: string; readonly promise: Promise<RawIpcReply> }
+  close(): void
+}
+
+interface PendingCall {
+  readonly resolve: (reply: RawIpcReply) => void
+  readonly reject: (error: Error) => void
+  readonly timer: NodeJS.Timeout
+}
+
+function openIpcSession(socketPath: string): RawIpcSession {
+  const socket: Socket = createConnection(socketPath)
+  socket.setEncoding('utf8')
+  const pending = new Map<string, PendingCall>()
+  let buffer = ''
+  const failAll = (error: Error): void => {
+    for (const [id, call] of pending) {
+      clearTimeout(call.timer)
+      pending.delete(id)
+      call.reject(error)
+    }
+  }
+  socket.on('error', failAll)
+  socket.on('close', () => { failAll(new Error('IPC session closed before a reply')) })
+  socket.on('data', (chunk: string) => {
+    buffer += chunk
+    while (true) {
+      const newline = buffer.indexOf('\n')
+      if (newline === -1) return
+      const line = buffer.slice(0, newline)
+      buffer = buffer.slice(newline + 1)
+      if (line.trim() === '') continue
+      let parsed: unknown
+      try {
+        parsed = JSON.parse(line)
+      } catch (error) {
+        failAll(error instanceof Error ? error : new Error(String(error)))
+        return
+      }
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) continue
+      const record = parsed as Record<string, unknown>
+      const id = record.id
+      if (typeof id !== 'string') continue
+      const call = pending.get(id)
+      if (call === undefined) continue
+      pending.delete(id)
+      clearTimeout(call.timer)
+      if (record.ok === true) {
+        call.resolve({ ok: true, result: record.result })
+        continue
+      }
+      const error = typeof record.error === 'object' && record.error !== null && !Array.isArray(record.error)
+        ? record.error as Record<string, unknown>
+        : {}
+      call.resolve({
+        ok: false,
+        error: {
+          code: typeof error.code === 'string' ? error.code : 'IPC_PROTOCOL',
+          message: typeof error.message === 'string' ? error.message : 'IPC failure',
+        },
+      })
+    }
+  })
+  return {
+    call(method, params) {
+      const id = randomUUID()
+      const promise = new Promise<RawIpcReply>((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pending.delete(id)
+          reject(new Error(`IPC ${method} timed out`))
+        }, 30_000)
+        pending.set(id, { resolve, reject, timer })
+        socket.write(`${JSON.stringify({ id, method, params })}\n`)
+      })
+      return { id, promise }
+    },
+    close() {
+      failAll(new Error('IPC session closed'))
+      socket.destroy()
+    },
+  }
+}
+
+async function waitForHostRecord(
+  stateDir: string,
+  predicate: (record: Record<string, unknown>) => boolean,
+): Promise<Record<string, unknown>> {
+  const deadline = Date.now() + 30_000
+  while (Date.now() < deadline) {
+    try {
+      const parsed: unknown = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8'))
+      if (typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)) {
+        const record = parsed as Record<string, unknown>
+        if (predicate(record)) return record
+      }
+    } catch {
+      // The record is atomically replaced; absence or a partial read retries.
+    }
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+  throw new Error('the Host record did not reach the expected state')
 }
 
 async function assertGone(pid: number): Promise<void> {

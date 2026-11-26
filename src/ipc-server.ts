@@ -119,5 +119,7 @@ async function respond(socket: Socket, line: string, handle: (request: IpcReques
 
 function writeLine(socket: Socket, line: string): void {
   if (socket.destroyed) return
-  socket.end(`${line}\n`)
+  // Keep the NDJSON connection open: a client may pipeline several requests
+  // (for example a queued start followed by stop) before closing it.
+  socket.write(`${line}\n`)
 }
