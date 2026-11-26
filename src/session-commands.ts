@@ -179,8 +179,9 @@ export class SessionCommands {
     ]
 
     return await this.flight(keys, async () => {
+      await this.ownWriter(command.deadline)
       assertDeadlineLive(command.deadline)
-      const existing = await this.lookupCreate(requestedId, fingerprint, command.ipcRequestId)
+      const existing = await this.lookupCreate(requestedId, command.delegationId, fingerprint, command.ipcRequestId)
       if (existing !== undefined && existing.state === 'ready') {
         return { delegation: existing, replayed: true }
       }
@@ -324,6 +325,7 @@ export class SessionCommands {
     ]
 
     return await this.flight(keys, async () => {
+      await this.ownWriter(command.deadline)
       assertDeadlineLive(command.deadline)
       const record = await this.registry.get(command.delegationId)
       if (record.state !== 'ready') {
@@ -370,6 +372,7 @@ export class SessionCommands {
    * @returns the observed model and monotonic turn position.
    */
   async verifyModel(command: VerifyModelCommand): Promise<VerifyModelResult> {
+    await this.ownWriter(command.deadline)
     assertDeadlineLive(command.deadline)
     const record = await this.registry.get(command.delegationId)
     const requestId = command.requestId
@@ -395,10 +398,10 @@ export class SessionCommands {
     const turnEnd = events.find(event => event.type === 'turn/end' && event.seq >= target.seq)
     const windowStart = turnStart?.seq ?? target.seq
     const windowEnd = turnEnd?.seq ?? events.at(-1)?.seq ?? target.seq
-    const evidence = events.some(event => event.seq >= windowStart
+    const evidence = events.filter(event => event.seq >= windowStart
       && event.seq <= windowEnd
       && EVIDENCE_TYPES.has(event.type))
-    if (!evidence) {
+    if (evidence.length === 0) {
       throw new DelegationError(
         'DELEGATION_MODEL_EVIDENCE_MISSING',
         `turn at ${String(windowStart)} contains no model-request evidence`,
@@ -406,33 +409,47 @@ export class SessionCommands {
       )
     }
 
-    const header = [...events].reverse().find(event => event.type === 'request/header' && event.seq <= windowEnd)
-    const config = header === undefined ? undefined : headerConfig(header)
-    if (config === undefined) {
-      throw new DelegationError(
-        'DELEGATION_MODEL_EVIDENCE_MISSING',
-        `turn at ${String(windowStart)} has no request header`,
-        { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
-      )
+    const headers = events.filter(event => event.type === 'request/header')
+    const effective: ModelSelection[] = []
+    for (const event of evidence) {
+      const header = [...headers].reverse().find(candidate => candidate.seq <= event.seq)
+      const config = header === undefined ? undefined : headerConfig(header)
+      if (config === undefined) {
+        throw new DelegationError(
+          'DELEGATION_MODEL_EVIDENCE_MISSING',
+          `turn at ${String(windowStart)} has no effective request header`,
+          { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
+        )
+      }
+      effective.push(config)
     }
-    if (!sameModel(config, record.expectedModel)) {
+    const divergent = effective.find(config => !sameModel(config, record.expectedModel))
+    if (divergent !== undefined) {
       throw new DelegationError(
         'DELEGATION_MODEL_MISMATCH',
-        `turn at ${String(windowStart)} used ${config.provider}/${config.model}, not the expected model`,
+        `turn at ${String(windowStart)} used ${divergent.provider}/${divergent.model}, not the expected model`,
         {
           delegationId: record.delegationId,
           turnSeq: windowStart,
           expectedProvider: record.expectedModel.provider,
           expectedModel: record.expectedModel.model,
-          observedProvider: config.provider,
-          observedModel: config.model,
+          observedProvider: divergent.provider,
+          observedModel: divergent.model,
         },
       )
     }
 
+    const observed = effective.at(-1)
+    if (observed === undefined) {
+      throw new DelegationError(
+        'DELEGATION_MODEL_EVIDENCE_MISSING',
+        `turn at ${String(windowStart)} has no effective request header`,
+        { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
+      )
+    }
     assertDeadlineLive(command.deadline)
     await this.registry.recordVerifiedModel(record.delegationId, {
-      model: config,
+      model: observed,
       turnSeq: windowStart,
     })
     return {
@@ -441,7 +458,7 @@ export class SessionCommands {
       ...(requestId === undefined ? {} : { requestId }),
       turnSeq: windowStart,
       expectedModel: record.expectedModel,
-      observedModel: config,
+      observedModel: observed,
       verified: true,
     }
   }
@@ -479,12 +496,28 @@ export class SessionCommands {
     return await this.registry.list()
   }
 
+  private async ownWriter(deadline?: Deadline): Promise<void> {
+    assertDeadlineLive(deadline)
+    const waitMs = deadline === undefined ? undefined : Math.max(0, deadline.remaining())
+    try {
+      await this.registry.ensureWriter(waitMs === undefined ? {} : { waitMs })
+    } catch (error) {
+      if (deadline?.expired() === true
+        && error instanceof DelegationRegistryError
+        && error.code === 'DELEGATION_LEDGER_READONLY') {
+        throw new LiaisonError('IPC_TIMEOUT', 'the request deadline expired while waiting for the delegation ledger')
+      }
+      throw error
+    }
+  }
+
   private host(): HostOperatorAccess {
     return typeof this.access === 'function' ? this.access() : this.access
   }
 
   private async lookupCreate(
     delegationId: string,
+    explicitDelegationId: string | undefined,
     fingerprint: string,
     ipcRequestId: string | undefined,
   ): Promise<DelegationRecord | undefined> {
@@ -493,6 +526,19 @@ export class SessionCommands {
     const byIpc = ipcRequestId === undefined
       ? undefined
       : records.find(record => record.createIpcId === ipcRequestId)
+    if (explicitDelegationId !== undefined
+      && byIpc !== undefined
+      && byIpc.delegationId !== explicitDelegationId) {
+      throw new DelegationRegistryError(
+        'DELEGATION_REPLAY_CONFLICT',
+        `replay key ${ipcRequestId ?? ''} is already bound to ${byIpc.delegationId}`,
+        {
+          requestedDelegationId: explicitDelegationId,
+          boundDelegationId: byIpc.delegationId,
+          ipcRequestId: ipcRequestId ?? '',
+        },
+      )
+    }
     for (const record of [byId, byIpc]) {
       if (record === undefined) continue
       if (record.createFingerprint !== fingerprint) {

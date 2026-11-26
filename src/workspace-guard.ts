@@ -1,6 +1,6 @@
 import { realpath, stat } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { resolve } from 'node:path'
+import { basename, dirname, join, resolve } from 'node:path'
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import { pathsOverlap } from './delegation-registry.ts'
@@ -125,9 +125,9 @@ export async function guardWorkspace(input: WorkspaceGuardInput): Promise<string
   }
 
   const trusted = await Promise.all([
-    canonicalOrResolved(input.stateDir),
-    canonicalOrResolved(resolveDshHome(input.dshHome)),
-    canonicalOrResolved(input.ledgerDir),
+    canonicalizeTrustedPath(input.stateDir),
+    canonicalizeTrustedPath(resolveDshHome(input.dshHome)),
+    canonicalizeTrustedPath(input.ledgerDir),
   ])
 
   for (const stateDir of trusted) {
@@ -150,7 +150,7 @@ export async function guardWorkspace(input: WorkspaceGuardInput): Promise<string
     )
   }
 
-  const home = await canonicalOrResolved(homedir())
+  const home = await canonicalizeTrustedPath(homedir())
   if (cwd === home) {
     throw new DelegationError(
       'WORKSPACE_STATE_OVERLAP',
@@ -162,11 +162,38 @@ export async function guardWorkspace(input: WorkspaceGuardInput): Promise<string
   return cwd
 }
 
-async function canonicalOrResolved(path: string): Promise<string> {
-  try {
-    return await realpath(resolve(path))
-  } catch {
-    return resolve(path)
+/**
+ * Canonicalize a trusted path whose final components may not exist yet.
+ * Resolves the nearest existing real ancestor and appends the missing suffix.
+ * @param path - trusted state, ledger, or home path.
+ * @returns the physical absolute path.
+ */
+async function canonicalizeTrustedPath(path: string): Promise<string> {
+  const absolute = resolve(path)
+  const missing: string[] = []
+  let current = absolute
+  while (true) {
+    try {
+      return join(await realpath(current), ...missing.reverse())
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException | null)?.code !== 'ENOENT') {
+        throw new DelegationError(
+          'WORKSPACE_STATE_OVERLAP',
+          `trusted path ${absolute} cannot be canonicalized`,
+          { path: absolute, reason: errorMessage(error) },
+        )
+      }
+      const parent = dirname(current)
+      if (parent === current) {
+        throw new DelegationError(
+          'WORKSPACE_STATE_OVERLAP',
+          `trusted path ${absolute} has no existing ancestor`,
+          { path: absolute },
+        )
+      }
+      missing.push(basename(current))
+      current = parent
+    }
   }
 }
 

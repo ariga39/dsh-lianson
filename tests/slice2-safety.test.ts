@@ -119,3 +119,68 @@ await test('home and trusted-state overlaps are refused while ordinary sibling w
     await rm(root, { recursive: true, force: true })
   }
 })
+
+await test('trusted paths canonicalize a missing suffix through the nearest existing real ancestor', async () => {
+  const root = await scratchRoot('missing-suffix')
+  try {
+    const physical = join(root, 'physical')
+    const missing = join(physical, 'missing')
+    const link = join(root, 'physical-link')
+    await mkdir(missing, { recursive: true })
+    await symlink(physical, link)
+
+    await expectCode(
+      guardWorkspace(guardInput(root, {
+        cwd: missing,
+        stateDir: join(link, 'missing', 'delegations'),
+      })),
+      'WORKSPACE_STATE_OVERLAP',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('a trusted missing suffix under a symlinked temporary root stays unisolatable', async () => {
+  const root = await scratchRoot('missing-temp')
+  const temporary = await mkdtemp(join(tmpdir(), 'dsh-liaison-missing-temp-'))
+  try {
+    await mkdir(join(root, 'work'), { recursive: true })
+    const link = join(root, 'temp-link')
+    await symlink(temporary, link)
+
+    await expectCode(
+      guardWorkspace(guardInput(root, {
+        stateDir: join(link, 'missing', 'state'),
+      })),
+      'STATE_UNSAFE_TEMP_ROOT',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+    await rm(temporary, { recursive: true, force: true })
+  }
+})
+
+await test('non-absent path errors fail closed instead of accepting a lexical spelling', async () => {
+  const root = await scratchRoot('fail-closed')
+  try {
+    await mkdir(join(root, 'work'), { recursive: true })
+    const file = join(root, 'file')
+    await writeFile(file, 'not a directory\n')
+    const loopA = join(root, 'loop-a')
+    const loopB = join(root, 'loop-b')
+    await symlink(loopB, loopA)
+    await symlink(loopA, loopB)
+
+    await expectCode(
+      guardWorkspace(guardInput(root, { stateDir: join(file, 'child') })),
+      'WORKSPACE_STATE_OVERLAP',
+    )
+    await expectCode(
+      guardWorkspace(guardInput(root, { ledgerDir: join(loopA, 'child') })),
+      'WORKSPACE_STATE_OVERLAP',
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})

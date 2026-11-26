@@ -509,3 +509,95 @@ await test('normalized titles collide with live Host sessions in the same worksp
     await cleanup(item)
   }
 })
+
+await test('create and prompt own the writer before replay lookup while get and list stay read-only', async () => {
+  const item = await fixture('writer-order')
+  try {
+    const order: string[] = []
+    const ensureWriter = item.registry.ensureWriter.bind(item.registry)
+    const list = item.registry.list.bind(item.registry)
+    const get = item.registry.get.bind(item.registry)
+    const promptReceipt = item.registry.promptReceipt.bind(item.registry)
+    item.registry.ensureWriter = async (options) => {
+      order.push('ensureWriter')
+      await ensureWriter(options)
+    }
+    item.registry.list = async () => {
+      order.push('list')
+      return await list()
+    }
+    item.registry.get = async (delegationId) => {
+      order.push('get')
+      return await get(delegationId)
+    }
+    item.registry.promptReceipt = async (delegationId, requestId) => {
+      order.push('promptReceipt')
+      return await promptReceipt(delegationId, requestId)
+    }
+
+    await item.commands.create(createCommand(item))
+    assert.equal(order[0], 'ensureWriter')
+    assert.ok(order.indexOf('ensureWriter') < order.indexOf('list'))
+
+    order.length = 0
+    await item.commands.prompt({ delegationId: 'del-1', requestId: 'request-order', content: 'order' })
+    assert.equal(order[0], 'ensureWriter')
+    assert.ok(order.indexOf('ensureWriter') < order.indexOf('get'))
+    assert.ok(order.indexOf('ensureWriter') < order.indexOf('promptReceipt'))
+
+    order.length = 0
+    await item.commands.get({ delegationId: 'del-1' })
+    await item.commands.list()
+    assert.equal(order.includes('ensureWriter'), false)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('an explicit delegation id conflicting with a replay-key binding is rejected before Host mutation', async () => {
+  const item = await fixture('replay-key-conflict')
+  try {
+    await item.commands.create(createCommand(item, {
+      delegationId: 'del-key',
+      ipcRequestId: 'shared-key',
+    }))
+    const sessionCreates = item.host.requestedSessionIds.length
+    const promptCalls = item.host.promptCalls
+
+    await expectCode(
+      item.commands.create(createCommand(item, {
+        delegationId: 'del-other',
+        ipcRequestId: 'shared-key',
+      })),
+      'DELEGATION_REPLAY_CONFLICT',
+    )
+    assert.equal(item.host.requestedSessionIds.length, sessionCreates)
+    assert.equal(item.host.promptCalls, promptCalls)
+    assert.equal((await item.registry.list()).some(record => record.delegationId === 'del-other'), false)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('verify-model rejects any divergent effective configuration even when a later header matches', async () => {
+  const item = await fixture('verify-every-config')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      requestHeader(1, 'provider-b', 'model-b'),
+      userMessage(2, 'request-all-configs'),
+      wireEvent(3, 'assistant/message', { content: [{ type: 'text', text: 'first request' }] }),
+      requestHeader(4, 'provider-a', 'model-a'),
+      wireEvent(5, 'assistant/message', { content: [{ type: 'text', text: 'second request' }] }),
+      wireEvent(6, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+
+    await expectCode(
+      item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-all-configs' }),
+      'DELEGATION_MODEL_MISMATCH',
+    )
+  } finally {
+    await cleanup(item)
+  }
+})
