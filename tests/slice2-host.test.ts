@@ -1,5 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
@@ -23,6 +24,7 @@ import {
 import {
   TWO_MODEL_A,
   TWO_MODEL_B,
+  TWO_MODEL_BLOCKED_FILE,
   TWO_MODEL_DONE,
   TWO_MODEL_PROVIDER,
   TWO_MODEL_WRITE_FILE,
@@ -56,6 +58,19 @@ function headerConfigOf(event: SessionWireEvent): Record<string, unknown> | unde
   if (event.type !== 'request/header') return undefined
   const header = objectOf(objectOf(event.data)?.['header'])
   return objectOf(header?.['config'])
+}
+
+function toolResultErrorCode(event: SessionWireEvent): string | undefined {
+  if (event.type !== 'tool/result') return undefined
+  const error = objectOf(objectOf(event.data)?.['error'])
+  const code = error?.['code']
+  return typeof code === 'string' ? code : undefined
+}
+
+function toolCallArguments(event: SessionWireEvent): string | undefined {
+  if (event.type !== 'tool/call') return undefined
+  const args = objectOf(event.data)?.['arguments']
+  return typeof args === 'string' ? args : undefined
 }
 
 async function completedEvents(
@@ -121,7 +136,7 @@ await test('real keyless Host: two models, stable prompt receipts, model proof, 
         insert: [{
           id: 'slice2-two-model-provider',
           name: fixturePath,
-          config: {},
+          config: { worktreeA, worktreeB },
         }],
       },
     ], null, 2))
@@ -248,6 +263,24 @@ await test('real keyless Host: two models, stable prompt receipts, model proof, 
     assert.notEqual(markerA, markerB)
     assert.match(JSON.stringify(eventsA), new RegExp(TWO_MODEL_DONE, 'u'))
     assert.match(JSON.stringify(eventsB), new RegExp(TWO_MODEL_DONE, 'u'))
+
+    const crossCallA = eventsA.find(event =>
+      toolCallArguments(event)?.includes(join(worktreeB, TWO_MODEL_BLOCKED_FILE)) === true)
+    const crossCallB = eventsB.find(event =>
+      toolCallArguments(event)?.includes(join(worktreeA, TWO_MODEL_BLOCKED_FILE)) === true)
+    assert.ok(crossCallA, 'delegation A must ask the ordinary write tool to target B')
+    assert.ok(crossCallB, 'delegation B must ask the ordinary write tool to target A')
+
+    const deniedA = eventsA.filter(event => toolResultErrorCode(event) === 'FS_SANDBOX_DENIED')
+    const deniedB = eventsB.filter(event => toolResultErrorCode(event) === 'FS_SANDBOX_DENIED')
+    assert.equal(deniedA.length, 1, 'A sibling write must be denied by the real fs sandbox')
+    assert.equal(deniedB.length, 1, 'B sibling write must be denied by the real fs sandbox')
+    assert.match(JSON.stringify(deniedA[0]?.data), /\[sandbox: file access denied under workspace-write mode\]/u)
+    assert.match(JSON.stringify(deniedB[0]?.data), /\[sandbox: file access denied under workspace-write mode\]/u)
+    assert.equal(existsSync(join(worktreeA, TWO_MODEL_BLOCKED_FILE)), false)
+    assert.equal(existsSync(join(worktreeB, TWO_MODEL_BLOCKED_FILE)), false)
+    assert.equal(await readFile(join(worktreeA, 'README.md'), 'utf8'), 'fixture\n')
+    assert.equal(await readFile(join(worktreeB, 'README.md'), 'utf8'), 'fixture\n')
 
     const summaries = unwrap(await activeOperator.remote.session.list({}))
     const sessionA = summaries.items.find(item => item.sessionId === delegationA.delegation.sessionId)

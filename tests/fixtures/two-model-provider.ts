@@ -1,3 +1,4 @@
+import { join } from 'node:path'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import type { Context } from '@deepseek-ai/cordis'
 import {
@@ -17,19 +18,33 @@ export const TWO_MODEL_A = 'model-a'
 export const TWO_MODEL_B = 'model-b'
 /** Relative file the scripted write tool creates in the Session cwd. */
 export const TWO_MODEL_WRITE_FILE = 'isolation.txt'
+/** Sentinel the scripted write tool attempts in the sibling checkout. */
+export const TWO_MODEL_BLOCKED_FILE = 'cross-checkout-sentinel.txt'
 /** Final answer prefix. */
 export const TWO_MODEL_DONE = 'TWO_MODEL_DONE'
+
+/** Paths the scripted cross-checkout write attempts target. */
+export interface TwoModelProviderConfig {
+  readonly worktreeA: string
+  readonly worktreeB: string
+}
 
 export const name = 'slice2-two-model-provider'
 export const inject = ['llm']
 
 /** Mount one keyless provider that advertises two distinct models. */
-export function apply(ctx: Context): void {
-  ctx.llm.registerAdapter([TWO_MODEL_PROVIDER], new TwoModelAdapter())
+export function apply(ctx: Context, config: TwoModelProviderConfig): void {
+  ctx.llm.registerAdapter([TWO_MODEL_PROVIDER], new TwoModelAdapter(config))
 }
 
 class TwoModelAdapter extends LlmAdapter {
+  private readonly config: TwoModelProviderConfig
   private callSequence = 0
+
+  constructor(config: TwoModelProviderConfig) {
+    super()
+    this.config = config
+  }
 
   override listModels(provider: string): Promise<readonly LlmModelInfo[]> {
     return Promise.resolve([
@@ -61,27 +76,38 @@ class TwoModelAdapter extends LlmAdapter {
       return
     }
 
-    const callId = brandString<ToolCallId>(
-      `two-model-write-${String(options.sessionId ?? 'session')}-${String(this.callSequence += 1)}`,
-    )
-    const argumentsJson = JSON.stringify({
+    const session = String(options.sessionId ?? 'unknown')
+    const ownFile = JSON.stringify({
       file_path: TWO_MODEL_WRITE_FILE,
-      content: `${options.model}:${String(options.sessionId ?? 'unknown')}`,
+      content: `${options.model}:${session}`,
     })
-    yield { type: 'block-start', index: 0, blockType: 'tool-call' }
+    const siblingRoot = options.model === TWO_MODEL_A ? this.config.worktreeB : this.config.worktreeA
+    const blockedFile = JSON.stringify({
+      file_path: join(siblingRoot, TWO_MODEL_BLOCKED_FILE),
+      content: `cross-checkout:${options.model}:${session}`,
+    })
+    yield* this.call(0, ownFile)
+    yield* this.call(1, blockedFile)
+    yield { type: 'usage', usage: { inputTokens: 12, outputTokens: 6 } }
+    yield { type: 'finish', reason: { kind: 'tool-calls' } }
+  }
+
+  private *call(index: number, argumentsJson: string): Iterable<StreamChunk> {
+    const callId = brandString<ToolCallId>(
+      `two-model-write-${String(index)}-${String(this.callSequence += 1)}`,
+    )
+    yield { type: 'block-start', index, blockType: 'tool-call' }
     yield {
       type: 'tool-call-delta',
-      index: 0,
+      index,
       id: callId,
       name: 'write',
       argumentsDelta: argumentsJson,
     }
     yield {
       type: 'block-end',
-      index: 0,
+      index,
       block: { type: 'tool-call', id: callId, name: 'write', arguments: argumentsJson },
     }
-    yield { type: 'usage', usage: { inputTokens: 9, outputTokens: 3 } }
-    yield { type: 'finish', reason: { kind: 'tool-calls' } }
   }
 }
