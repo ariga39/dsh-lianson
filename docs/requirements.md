@@ -20,4 +20,4 @@ The reference is compte-rendu #401. AGY helped design the change, two OpenCode s
 3. A user opening the test-migration session can read the assigned scope, see which callers dsh inspected, and see the tests and their results. Closing the page leaves the task running.
 4. Codex verifies routing behavior and both deliverables, follows the agreed review, and accepts the result. The whole workflow also succeeds when the user never opens Web.
 
-The [development plan](development-plan.md) maps these requirements to the pinned upstream implementation and its integration tests.
+Delivery architecture and build order are documented in [design.md](design.md), the [agent guide](../AGENTS.md), and the [open GitHub issues](https://github.com/ariga39/dsh-lianson/issues?q=is%3Aissue+is%3Aopen).

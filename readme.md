@@ -4,4 +4,4 @@ The goal of dsh-liaison is to let Codex delegate coding work to DeepSeek Harness
 
 The design relies on dsh for session history, prompt deduplication, and workspace isolation. The liaison layer only needs to connect an assignment to its dsh session and expose the controls Codex uses.
 
-[Project requirements](docs/requirements.md) · [Open issues](https://github.com/ariga39/dsh-lianson/issues) · [Contributor guide](AGENTS.md)
+[Project requirements](docs/requirements.md) · [Design](docs/design.md) · [Open issues](https://github.com/ariga39/dsh-lianson/issues) · [Contributor guide](AGENTS.md)
