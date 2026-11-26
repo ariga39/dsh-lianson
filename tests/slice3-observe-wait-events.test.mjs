@@ -54,6 +54,15 @@ function wireEvent(seq, type = 'fixture/event') {
   return { type, seq, time: 1_000 + seq, data: { seq } }
 }
 
+function historyPage(cursor, overrides = {}) {
+  const records = []
+  for (let seq = 0; seq <= cursor; seq += 1) {
+    const event = overrides[seq] ?? wireEvent(seq)
+    records.push({ type: 'event', event })
+  }
+  return { cursor, hasMore: false, records }
+}
+
 function fixturePage(cursor, seqs, hasMore = false) {
   return {
     cursor,
@@ -453,22 +462,17 @@ test('slice3: waitForSubagents joins live grandchildren behind an idle direct ch
         childSessionId: 'child',
         mode: 'one-shot',
       })
-      return {
-        cursor: 6,
-        hasMore: false,
-        records: [{
-          type: 'event',
-          event: {
-            type: 'user/message',
-            seq: 6,
-            time: 1,
-            data: {
-              content: [{ type: 'text', text: 'grand settled' }],
-              source: { kind: 'subagent-settled', senderSessionId: 'grand', stopReason: 'completed' },
-            },
+      return historyPage(6, {
+        6: {
+          type: 'user/message',
+          seq: 6,
+          time: 1,
+          data: {
+            content: [{ type: 'text', text: 'grand settled' }],
+            source: { kind: 'subagent-settled', senderSessionId: 'grand', stopReason: 'completed' },
           },
-        }],
-      }
+        },
+      })
     },
   }
   const waiter = new StateWaiter({
@@ -616,9 +620,9 @@ test('slice3: settlement notice delayed past the old grace still prevents idle',
     async sessionEvents({ address }) {
       assert.deepEqual(address, { kind: 'session', sessionId: 'session-root' })
       if (now >= noticeAt) {
-        return { cursor: 31, hasMore: false, records: [noticeEvent] }
+        return historyPage(31, { 31: noticeEvent.event })
       }
-      return { cursor: 30, hasMore: false, records: [] }
+      return historyPage(30)
     },
   }
   const waiter = new StateWaiter({
@@ -643,7 +647,7 @@ test('slice3: settlement notice delayed past the old grace still prevents idle',
   assert.deepEqual(result.subagents.activeSubagents, [])
 })
 
-test('slice3: settled child without a durable notice is explicitly indeterminate', async () => {
+test('slice3: initially inactive child without a durable notice is explicitly indeterminate', async () => {
   const registry = {
     async get(delegationId) {
       return { delegationId, sessionId: 'session-root', state: 'ready' }
@@ -678,14 +682,14 @@ test('slice3: settled child without a durable notice is explicitly indeterminate
       if (sessionId !== 'child') throw new Error(`unexpected state for ${sessionId}`)
       return {
         cursor: 4,
-        active: now < 50,
-        running: now < 50,
+        active: false,
+        running: false,
         queue: [],
         pendingInput: [],
       }
     },
     async sessionEvents() {
-      return { cursor: 30, hasMore: false, records: [] }
+      return historyPage(30)
     },
   }
   const waiter = new StateWaiter({
@@ -771,6 +775,320 @@ test('slice3: unreadable parent notice history returns indeterminate without han
   assert.equal(result.indeterminate, true)
   assert.equal(result.indeterminateReason, 'subagent-settlement-notice-unavailable')
   assert.ok(result.elapsedMs < 1_000, 'unobservable notice evidence must not wait for the deadline')
+})
+
+test('slice3: child pending input is never reported as idle', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-root', state: 'ready' }
+    },
+  }
+  let now = 0
+  const adapter = {
+    async sessionWait() {
+      return {
+        reason: 'idle',
+        state: { cursor: 20, active: true, running: false, queue: [], pendingInput: [] },
+        output: { records: [], truncated: false },
+      }
+    },
+    async sessionProjections({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return {
+          kind: 'sequenced',
+          asOfSeq: 20,
+          values: { subagentCatalog: [{ id: 'child', mode: 'one-shot', label: 'child', createdAt: 1 }] },
+        }
+      }
+      if (sessionId === 'child') {
+        return { kind: 'sequenced', asOfSeq: 5, values: { subagentCatalog: [] } }
+      }
+      throw new Error(`unexpected projections for ${sessionId}`)
+    },
+    async sessionState({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return { cursor: 20, active: true, running: false, queue: [], pendingInput: [] }
+      }
+      if (sessionId !== 'child') throw new Error(`unexpected state for ${sessionId}`)
+      return {
+        cursor: 5,
+        active: true,
+        running: false,
+        queue: [],
+        pendingInput: ['question'],
+      }
+    },
+    async sessionEvents() { throw new Error('no settlement notice is needed for pending input') },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 50,
+  })
+  const result = await waiter.wait({
+    delegationId: 'child-input',
+    timeoutMs: 2_000,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'indeterminate')
+  assert.equal(result.indeterminate, true)
+  assert.equal(result.indeterminateReason, 'subagent-input-required')
+  assert.deepEqual(result.subagents.localSubagents[0].pendingInput, ['question'])
+})
+
+test('slice3: initially inactive siblings both match notices from one parent page', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-root', state: 'ready' }
+    },
+  }
+  let now = 0
+  const notice = (seq, childId) => ({
+    type: 'user/message',
+    seq,
+    time: 1,
+    data: {
+      content: [{ type: 'text', text: `${childId} settled` }],
+      source: { kind: 'subagent-settled', senderSessionId: childId, stopReason: 'completed' },
+    },
+  })
+  const children = ['child-a', 'child-b']
+  const adapter = {
+    async sessionWait() {
+      return {
+        reason: 'idle',
+        state: { cursor: 31, active: true, running: false, queue: [], pendingInput: [] },
+        output: { records: [], truncated: false },
+      }
+    },
+    async sessionProjections({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return {
+          kind: 'sequenced',
+          asOfSeq: 31,
+          values: {
+            subagentCatalog: children.map((id, index) => ({
+              id, mode: 'one-shot', label: id, createdAt: index + 1,
+            })),
+          },
+        }
+      }
+      if (children.includes(sessionId)) {
+        return { kind: 'sequenced', asOfSeq: 4, values: { subagentCatalog: [] } }
+      }
+      throw new Error(`unexpected projections for ${sessionId}`)
+    },
+    async sessionState({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return { cursor: 31, active: true, running: false, queue: [], pendingInput: [] }
+      }
+      if (!children.includes(sessionId)) throw new Error(`unexpected state for ${sessionId}`)
+      return {
+        cursor: 4,
+        active: false,
+        running: false,
+        queue: [],
+        pendingInput: [],
+      }
+    },
+    async sessionEvents({ address }) {
+      assert.deepEqual(address, { kind: 'session', sessionId: 'session-root' })
+      return historyPage(31, {
+        30: notice(30, 'child-a'),
+        31: notice(31, 'child-b'),
+      })
+    },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 50,
+  })
+  const result = await waiter.wait({
+    delegationId: 'siblings',
+    timeoutMs: 2_000,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'idle')
+  assert.ok(result.elapsedMs < 1_000, 'both sibling notices match before the deadline')
+  assert.equal(result.subagents.localSubagents.length, 2)
+})
+
+test('slice3: fresh root cursor backfills completed follow-up output before idle', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-root', state: 'ready' }
+    },
+  }
+  let now = 0
+  const notice = {
+    type: 'user/message',
+    seq: 31,
+    time: 1,
+    data: {
+      content: [{ type: 'text', text: 'child settled' }],
+      source: { kind: 'subagent-settled', senderSessionId: 'child', stopReason: 'completed' },
+    },
+  }
+  const followUp = (seq, text) => ({
+    type: 'assistant/message',
+    seq,
+    time: 2 + seq,
+    data: {
+      turn: 2,
+      step: 1,
+      message: {
+        role: 'assistant',
+        content: [{ type: 'text', text }],
+        source: { kind: 'model', provider: 'fixture', model: 'fixture' },
+      },
+    },
+  })
+  const adapter = {
+    async sessionWait() {
+      return {
+        reason: 'idle',
+        state: { cursor: 30, active: true, running: false, queue: [], pendingInput: [] },
+        output: { records: [], truncated: false },
+      }
+    },
+    async sessionProjections({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return {
+          kind: 'sequenced',
+          asOfSeq: 30,
+          values: { subagentCatalog: [{ id: 'child', mode: 'one-shot', label: 'child', createdAt: 1 }] },
+        }
+      }
+      if (sessionId === 'child') {
+        return { kind: 'sequenced', asOfSeq: 4, values: { subagentCatalog: [] } }
+      }
+      throw new Error(`unexpected projections for ${sessionId}`)
+    },
+    async sessionState({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return { cursor: 33, active: true, running: false, queue: [], pendingInput: [] }
+      }
+      if (sessionId !== 'child') throw new Error(`unexpected state for ${sessionId}`)
+      return {
+        cursor: 4,
+        active: false,
+        running: false,
+        queue: [],
+        pendingInput: [],
+      }
+    },
+    async sessionEvents() {
+      return historyPage(33, {
+        31: notice,
+        32: followUp(32, 'FOLLOWUP_PREFIX '),
+        33: followUp(33, 'FOLLOWUP_DONE'),
+      })
+    },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 50,
+  })
+  const result = await waiter.wait({
+    delegationId: 'follow-up-output',
+    afterSeq: 30,
+    timeoutMs: 2_000,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'idle')
+  assert.equal(result.cursor, 33)
+  assert.ok(result.backfilled >= 1)
+  assert.ok(result.assistantMessages.some(message =>
+    message.text.includes('FOLLOWUP_PREFIX') || message.text.includes('FOLLOWUP_DONE')))
+})
+
+test('slice3: fresh root pending input prevents idle and is reported as input-required', async () => {
+  const registry = {
+    async get(delegationId) {
+      return { delegationId, sessionId: 'session-root', state: 'ready' }
+    },
+  }
+  let now = 0
+  const notice = {
+    type: 'user/message',
+    seq: 31,
+    time: 1,
+    data: {
+      content: [{ type: 'text', text: 'child settled' }],
+      source: { kind: 'subagent-settled', senderSessionId: 'child', stopReason: 'completed' },
+    },
+  }
+  const adapter = {
+    async sessionWait() {
+      return {
+        reason: 'idle',
+        state: { cursor: 30, active: true, running: false, queue: [], pendingInput: [] },
+        output: { records: [], truncated: false },
+      }
+    },
+    async sessionProjections({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return {
+          kind: 'sequenced',
+          asOfSeq: 30,
+          values: { subagentCatalog: [{ id: 'child', mode: 'one-shot', label: 'child', createdAt: 1 }] },
+        }
+      }
+      if (sessionId === 'child') {
+        return { kind: 'sequenced', asOfSeq: 4, values: { subagentCatalog: [] } }
+      }
+      throw new Error(`unexpected projections for ${sessionId}`)
+    },
+    async sessionState({ sessionId }) {
+      if (sessionId === 'session-root') {
+        return {
+          cursor: 31,
+          active: true,
+          running: false,
+          queue: [],
+          pendingInput: ['question'],
+        }
+      }
+      if (sessionId !== 'child') throw new Error(`unexpected state for ${sessionId}`)
+      return {
+        cursor: 4,
+        active: false,
+        running: false,
+        queue: [],
+        pendingInput: [],
+      }
+    },
+    async sessionEvents() {
+      return historyPage(31, { 31: notice })
+    },
+  }
+  const waiter = new StateWaiter({
+    registry,
+    adapter,
+    clock: () => now,
+    sleep: async milliseconds => { now += milliseconds },
+    subagentPollMs: 50,
+  })
+  const result = await waiter.wait({
+    delegationId: 'fresh-root-input',
+    timeoutMs: 2_000,
+    sliceTimeoutMs: 200,
+    waitForSubagents: true,
+  })
+  assert.equal(result.reason, 'input-required')
+  assert.deepEqual(result.pendingInput, ['question'])
+  assert.equal(result.state.cursor, 31)
 })
 
 test('slice3: subagent status reports unknown, external and unreadable children honestly', async () => {

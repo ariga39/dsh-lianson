@@ -12,6 +12,6 @@
     "test:slice1": "node scripts/bootstrap.mjs && node --test tests/slice1-host-ipc.test.mjs",
     "test:all": "node scripts/bootstrap.mjs && node --test tests/*.test.mjs",
     "test:slice2": "node scripts/bootstrap.mjs && node --test tests/slice2-*.test.mjs",
-    "test:slice3": "node --test tests/slice3-*.test.mjs"
+    "test:slice3": "node scripts/bootstrap.mjs && node --test tests/slice3-*.test.mjs"
   }
 }
