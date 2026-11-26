@@ -1,3 +1,12 @@
+import {
+  DELEGATION_REGISTRY_ERROR_CODES,
+  isDelegationRegistryError,
+} from './delegation-registry.ts'
+import {
+  DELEGATION_ERROR_CODES,
+  isDelegationError,
+} from './workspace-guard.ts'
+
 /** Closed error vocabulary shared by the daemon, CLI, and lifecycle modules. */
 export const LIAISON_ERROR_CODES = [
   'INVALID_ARGUMENT',
@@ -18,6 +27,8 @@ export const LIAISON_ERROR_CODES = [
   'IPC_PROTOCOL',
   'IPC_TIMEOUT',
   'OPERATOR_UNAVAILABLE',
+  ...DELEGATION_REGISTRY_ERROR_CODES,
+  ...DELEGATION_ERROR_CODES,
 ] as const
 
 /** One known failure kind. */
@@ -77,6 +88,9 @@ export function asLiaisonError(
   message = 'unexpected failure',
 ): LiaisonError {
   if (isLiaisonError(error)) return error
+  if (isDelegationRegistryError(error) || isDelegationError(error)) {
+    return new LiaisonError(error.code, error.message, { cause: error, details: error.details })
+  }
   const detail = error instanceof Error && error.message !== '' ? error.message : message
   return new LiaisonError(fallback, detail, { cause: error })
 }

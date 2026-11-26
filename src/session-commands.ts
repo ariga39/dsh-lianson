@@ -10,6 +10,8 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/types'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title'
+import type { Deadline } from './deadline.ts'
+import { LiaisonError } from './errors.ts'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
 import type { RemoteFailure, RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import {
@@ -45,10 +47,10 @@ export interface SessionCommandsRemote {
  * Production supplies this from HostManager; tests may adapt the real Host operator.
  */
 export interface HostOperatorAccess {
-  hostContext(): Promise<VerifiedHostContext>
+  hostContext(deadline?: Deadline): Promise<VerifiedHostContext>
   withOperator<T>(
     operation: (remote: SessionCommandsRemote, signal: AbortSignal) => Promise<RemoteResult<T>>,
-    timeoutMs?: number,
+    timeoutOrDeadline?: number | Deadline,
   ): Promise<RemoteResult<T>>
 }
 
@@ -62,6 +64,7 @@ export interface CreateDelegationCommand {
   readonly agentPreset?: string
   readonly cwd: string
   readonly ipcRequestId?: string
+  readonly deadline?: Deadline
 }
 
 /** Result of a create command, distinguishing a replay from a new Host mutation. */
@@ -76,6 +79,7 @@ export interface PromptCommand {
   readonly content: string
   readonly requestId?: string
   readonly ipcRequestId?: string
+  readonly deadline?: Deadline
 }
 
 /** Acceptance receipt; completion belongs to later output workflows. */
@@ -94,6 +98,7 @@ export interface VerifyModelCommand {
   readonly delegationId: string
   readonly requestId?: string
   readonly ipcRequestId?: string
+  readonly deadline?: Deadline
 }
 
 /** Verified model evidence for one requested turn. */
@@ -174,12 +179,14 @@ export class SessionCommands {
     ]
 
     return await this.flight(keys, async () => {
+      assertDeadlineLive(command.deadline)
       const existing = await this.lookupCreate(requestedId, fingerprint, command.ipcRequestId)
       if (existing !== undefined && existing.state === 'ready') {
         return { delegation: existing, replayed: true }
       }
 
-      const context = await this.host().hostContext()
+      assertDeadlineLive(command.deadline)
+      const context = await this.host().hostContext(command.deadline)
       const cwd = await guardWorkspace({
         cwd: command.cwd,
         stateDir: context.stateDir,
@@ -204,6 +211,7 @@ export class SessionCommands {
       const sessionId = existing?.state === 'creating' && existing.createFingerprint === fingerprint
         ? existing.sessionId
         : `session-${randomUUID()}`
+      assertDeadlineLive(command.deadline)
       const begun = await this.registry.beginCreate({
         delegationId,
         sessionId,
@@ -218,18 +226,21 @@ export class SessionCommands {
         return { delegation: begun.record, replayed: true }
       }
 
+      assertDeadlineLive(command.deadline)
       const workspace = await this.callRemote(
         remote => remote.workspace.create({ path: begun.record.cwd }),
         'WORKSPACE_INVALID_CWD',
+        command.deadline,
       )
       const workspaceId = String(workspace.workspace.workspaceId)
+      assertDeadlineLive(command.deadline)
       const created = await this.host().withOperator(
         remote => remote.session.create({
           workspaceId: workspace.workspace.workspaceId,
           sessionId: brandString<SessionId>(begun.record.sessionId),
           ...(begun.record.agentPreset === undefined ? {} : { agentPreset: begun.record.agentPreset }),
         }),
-        this.timeoutMs,
+        command.deadline ?? this.timeoutMs,
       )
       if (!created.ok) {
         const failure = await this.handleCreateFailure(begun.record, created.error)
@@ -254,6 +265,7 @@ export class SessionCommands {
           title: begun.record.title,
         }),
         'DELEGATION_TITLE_CONFLICT',
+        undefined,
       )
       if (renamed.title !== begun.record.title) {
         throw new DelegationError(
@@ -273,6 +285,7 @@ export class SessionCommands {
             : { reasoningEffort: begun.record.expectedModel.reasoningEffort }),
         }),
         'DELEGATION_MODEL_UNAVAILABLE',
+        undefined,
       )
       if (!sameModel(selected.selected, begun.record.expectedModel)) {
         throw new DelegationError(
@@ -311,6 +324,7 @@ export class SessionCommands {
     ]
 
     return await this.flight(keys, async () => {
+      assertDeadlineLive(command.deadline)
       const record = await this.registry.get(command.delegationId)
       if (record.state !== 'ready') {
         throw new DelegationError(
@@ -329,20 +343,22 @@ export class SessionCommands {
           )
         }
         if (existing.accepted) return promptResult(record, existing, true)
-        return await this.resolvePendingPrompt(record, requestId, command.content, existing)
+        return await this.resolvePendingPrompt(record, requestId, command.content, existing, command.deadline)
       }
 
       const state = await this.callRemote(
         (remote, signal) => remote.session.state({ sessionId: brandString<SessionId>(record.sessionId) }, signal),
         'DELEGATION_SESSION_CONFLICT',
+        command.deadline,
       )
+      assertDeadlineLive(command.deadline)
       const admission = await this.registry.beginPrompt(record.delegationId, {
         requestId,
         contentHash,
         beforeCursor: state.cursor,
       })
       if (admission.receipt.accepted) return promptResult(record, admission.receipt, true)
-      await this.dispatchPrompt(record, requestId, command.content)
+      await this.dispatchPrompt(record, requestId, command.content, command.deadline)
       const accepted = await this.registry.acceptPrompt(record.delegationId, requestId)
       return promptResult(record, accepted, false)
     })
@@ -354,14 +370,16 @@ export class SessionCommands {
    * @returns the observed model and monotonic turn position.
    */
   async verifyModel(command: VerifyModelCommand): Promise<VerifyModelResult> {
+    assertDeadlineLive(command.deadline)
     const record = await this.registry.get(command.delegationId)
     const requestId = command.requestId
       ?? (command.ipcRequestId === undefined ? undefined : `request-${digest(command.ipcRequestId)}`)
     const state = await this.callRemote(
       (remote, signal) => remote.session.state({ sessionId: brandString<SessionId>(record.sessionId) }, signal),
       'DELEGATION_SESSION_CONFLICT',
+      command.deadline,
     )
-    const events = await this.readEvents(record, state.cursor)
+    const events = await this.readEvents(record, state.cursor, command.deadline)
     const target = locateTarget(events, requestId)
     if (target === undefined) {
       throw new DelegationError(
@@ -412,6 +430,7 @@ export class SessionCommands {
       )
     }
 
+    assertDeadlineLive(command.deadline)
     await this.registry.recordVerifiedModel(record.delegationId, {
       model: config,
       turnSeq: windowStart,
@@ -574,6 +593,7 @@ export class SessionCommands {
     requestId: string,
     content: string,
     receipt: PromptReceipt,
+    deadline?: Deadline,
   ): Promise<PromptCommandResult> {
     let state: SessionState
     try {
@@ -581,7 +601,7 @@ export class SessionCommands {
         (remote, signal) => remote.session.state({
           sessionId: brandString<SessionId>(record.sessionId),
         }, signal),
-        this.timeoutMs,
+        deadline ?? this.timeoutMs,
       )
       if (!observed.ok) {
         if (observed.error.code === 'session/not-found') {
@@ -614,7 +634,7 @@ export class SessionCommands {
 
     let events: readonly SessionWireEvent[]
     try {
-      events = await this.readEvents(record, state.cursor)
+      events = await this.readEvents(record, state.cursor, deadline)
     } catch {
       throw new DelegationError(
         'DELEGATION_REQUEST_ID_UNCERTAIN',
@@ -628,12 +648,18 @@ export class SessionCommands {
       return promptResult(record, accepted, true)
     }
 
-    await this.dispatchPrompt(record, requestId, content)
+    await this.dispatchPrompt(record, requestId, content, deadline)
     const accepted = await this.registry.acceptPrompt(record.delegationId, requestId)
     return promptResult(record, accepted, true)
   }
 
-  private async dispatchPrompt(record: DelegationRecord, requestId: string, content: string): Promise<void> {
+  private async dispatchPrompt(
+    record: DelegationRecord,
+    requestId: string,
+    content: string,
+    deadline?: Deadline,
+  ): Promise<void> {
+    assertDeadlineLive(deadline)
     const result = await this.host().withOperator(
       (remote, signal) => remote.session.prompt({
         requestId: brandString<SessionRequestId>(requestId),
@@ -641,12 +667,16 @@ export class SessionCommands {
         mode: 'queue',
         content: [{ type: 'text', text: content }],
       }, signal),
-      this.timeoutMs,
+      deadline ?? this.timeoutMs,
     )
     if (!result.ok) throw this.delegationError(result.error, 'DELEGATION_SESSION_CONFLICT')
   }
 
-  private async readEvents(record: DelegationRecord, throughSeq: number): Promise<readonly SessionWireEvent[]> {
+  private async readEvents(
+    record: DelegationRecord,
+    throughSeq: number,
+    deadline?: Deadline,
+  ): Promise<readonly SessionWireEvent[]> {
     const events = new Map<number, SessionWireEvent>()
     const through = throughSeq
     let before: number | undefined
@@ -659,6 +689,7 @@ export class SessionCommands {
           maxMessages: EVENTS_PAGE_MESSAGES,
         }, signal),
         'DELEGATION_SESSION_CONFLICT',
+        deadline,
       )
       for (const entry of value.records) events.set(entry.event.seq, entry.event)
       if (!value.hasMore) break
@@ -672,8 +703,9 @@ export class SessionCommands {
   private async callRemote<T>(
     operation: (remote: SessionCommandsRemote, signal: AbortSignal) => Promise<RemoteResult<T>>,
     fallback: DelegationErrorCode,
+    deadline?: Deadline,
   ): Promise<T> {
-    const result = await this.host().withOperator(operation, this.timeoutMs)
+    const result = await this.host().withOperator(operation, deadline ?? this.timeoutMs)
     if (!result.ok) throw this.delegationError(result.error, fallback)
     return result.value
   }
@@ -705,6 +737,12 @@ export class SessionCommands {
         if (this.flights.get(key) === run) this.flights.delete(key)
       }
     }
+  }
+}
+
+function assertDeadlineLive(deadline?: Deadline): void {
+  if (deadline?.expired() === true) {
+    throw new LiaisonError('IPC_TIMEOUT', 'the request deadline expired before it could run')
   }
 }
 

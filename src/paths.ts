@@ -43,3 +43,6 @@ export function statePaths(stateDir: string): StatePaths {
     readyFile: join(stateDir, 'host-ready.json'),
   }
 }
+
+export { ledgerPaths, resolveLedgerPath } from './delegation-registry.ts'
+export type { LedgerPaths } from './delegation-registry.ts'

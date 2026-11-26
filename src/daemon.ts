@@ -5,7 +5,10 @@ import { acquireLock } from './flock.ts'
 import { HostManager, type HostManagerOptions } from './host-manager.ts'
 import { startIpcServer, type IpcServer } from './ipc-server.ts'
 import { LiaisonError } from './errors.ts'
-import { statePaths } from './paths.ts'
+import { DelegationRegistry } from './delegation-registry.ts'
+import type { IpcRequest } from './ipc-protocol.ts'
+import { ledgerPaths, resolveLedgerPath, statePaths } from './paths.ts'
+import { SessionCommands } from './session-commands.ts'
 
 /**
  * Run the foreground daemon until an explicit `host.stop` or signal.
@@ -19,20 +22,37 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   const daemonLock = await acquireLock(paths.daemonLock, { waitMs: 0 })
   if (daemonLock === undefined) return 0
   const manager = new HostManager(options)
+  const ledgerFile = resolveLedgerPath(options.env ?? process.env)
+  const registry = new DelegationRegistry({ ledgerFile })
+  const ledgerDir = ledgerPaths(ledgerFile).ledgerDir
+  const commands = new SessionCommands({ registry, access: manager, ledgerDir })
   const done = Promise.withResolvers<void>()
   const runtime: { server?: IpcServer } = {}
   const mutations = createMutationGate()
   let closing = false
   let shuttingDown: Promise<void> | undefined
+  let ledgerClose: Promise<void> | undefined
+
+  const closeLedger = (): Promise<void> => {
+    ledgerClose ??= registry.close().catch(() => undefined)
+    return ledgerClose
+  }
 
   const shutdown = (): Promise<void> => {
     if (shuttingDown !== undefined) return shuttingDown
     closing = true
     shuttingDown = mutations.run(async () => {
-      await runtime.server?.close()
-      await manager.close()
-      await daemonLock.release()
-      done.resolve()
+      try {
+        await runtime.server?.close()
+      } finally {
+        await closeLedger()
+        try {
+          await manager.close()
+        } finally {
+          await daemonLock.release()
+          done.resolve()
+        }
+      }
     })
     return shuttingDown
   }
@@ -42,11 +62,7 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
     timer.unref()
   }
 
-  const handle = async (request: {
-    readonly method: 'host.start' | 'host.status' | 'host.ping' | 'host.stop'
-    readonly params: Record<string, unknown>
-    readonly deadline: number
-  }): Promise<unknown> => {
+  const handle = async (request: IpcRequest): Promise<unknown> => {
     if (closing && request.method !== 'host.stop') {
       throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
     }
@@ -84,6 +100,45 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
       const ping = await manager.ping()
       return { ...ping, daemonPid: process.pid }
     }
+    if (request.method === 'delegation.get') {
+      const lookup = delegationLookup(request.params)
+      const delegation = await commands.get(lookup)
+      return { delegation, daemonPid: process.pid }
+    }
+    if (request.method === 'delegation.list') {
+      return { delegations: await commands.list(), daemonPid: process.pid }
+    }
+    if (request.method === 'delegation.create') {
+      const deadline = requestDeadline(request)
+      assertRequestLive(deadline)
+      const result = await mutations.run(async () => {
+        assertRequestLive(deadline)
+        if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
+        return await commands.create({ ...createCommandOf(request.params), deadline })
+      })
+      return { ...result, daemonPid: process.pid }
+    }
+    if (request.method === 'delegation.prompt') {
+      const deadline = requestDeadline(request)
+      assertRequestLive(deadline)
+      const result = await mutations.run(async () => {
+        assertRequestLive(deadline)
+        if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
+        return await commands.prompt({ ...promptCommandOf(request.params), deadline })
+      })
+      return { ...result, daemonPid: process.pid }
+    }
+    if (request.method === 'delegation.verifyModel') {
+      const deadline = requestDeadline(request)
+      assertRequestLive(deadline)
+      const result = await mutations.run(async () => {
+        assertRequestLive(deadline)
+        if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
+        return await commands.verifyModel({ ...verifyCommandOf(request.params), deadline })
+      })
+      return { ...result, daemonPid: process.pid }
+    }
+
     const deadline = requestDeadline(request)
     assertRequestLive(deadline)
     let committed = false
@@ -98,13 +153,15 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
           // only after its own deadline and irreversible-action checks.
           committed = true
           closing = true
+          void closeLedger()
         })
       })
       return { ...outcome, daemonPid: process.pid }
     } finally {
       if (committed) {
-        // Withdraw before the reply settles: an immediate next start must not
-        // connect to a daemon that is already shutting down.
+        // The observed close promise is awaited exactly once here; a ledger
+        // failure never skips socket withdrawal or the scheduled shutdown.
+        await closeLedger()
         await runtime.server?.withdraw().catch(() => undefined)
         scheduleShutdown()
       }
@@ -134,6 +191,91 @@ function assertRequestLive(deadline: Deadline): void {
   if (deadline.expired()) {
     throw new LiaisonError('IPC_TIMEOUT', 'the request deadline expired before it could run')
   }
+}
+
+function delegationLookup(params: Record<string, unknown>): { readonly delegationId?: string; readonly sessionId?: string } {
+  const delegationId = optionalString(params, 'delegationId')
+  const sessionId = optionalString(params, 'sessionId')
+  if ((delegationId === undefined) === (sessionId === undefined)) {
+    throw new LiaisonError('INVALID_ARGUMENT', 'delegation.get requires exactly one of delegationId or sessionId')
+  }
+  return {
+    ...(delegationId === undefined ? {} : { delegationId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
+  }
+}
+
+function createCommandOf(params: Record<string, unknown>): {
+  readonly delegationId?: string
+  readonly title: string
+  readonly provider: string
+  readonly model: string
+  readonly reasoningEffort?: string
+  readonly agentPreset?: string
+  readonly cwd: string
+  readonly ipcRequestId?: string
+} {
+  return {
+    ...optionalParam(params, 'delegationId'),
+    title: requiredString(params, 'title'),
+    provider: requiredString(params, 'provider'),
+    model: requiredString(params, 'model'),
+    ...optionalParam(params, 'reasoningEffort'),
+    ...optionalParam(params, 'agentPreset'),
+    cwd: requiredString(params, 'cwd'),
+    ...optionalParam(params, 'ipcRequestId'),
+  }
+}
+
+function promptCommandOf(params: Record<string, unknown>): {
+  readonly delegationId: string
+  readonly content: string
+  readonly requestId?: string
+  readonly ipcRequestId?: string
+} {
+  return {
+    delegationId: requiredString(params, 'delegationId'),
+    content: requiredString(params, 'content'),
+    ...optionalParam(params, 'requestId'),
+    ...optionalParam(params, 'ipcRequestId'),
+  }
+}
+
+function verifyCommandOf(params: Record<string, unknown>): {
+  readonly delegationId: string
+  readonly requestId?: string
+  readonly ipcRequestId?: string
+} {
+  return {
+    delegationId: requiredString(params, 'delegationId'),
+    ...optionalParam(params, 'requestId'),
+    ...optionalParam(params, 'ipcRequestId'),
+  }
+}
+
+function requiredString(params: Record<string, unknown>, field: string): string {
+  const value = params[field]
+  if (typeof value !== 'string' || value === '') {
+    throw new LiaisonError('INVALID_ARGUMENT', `${field} must be a non-empty string`)
+  }
+  return value
+}
+
+function optionalString(params: Record<string, unknown>, field: string): string | undefined {
+  const value = params[field]
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || value === '') {
+    throw new LiaisonError('INVALID_ARGUMENT', `${field} must be a non-empty string`)
+  }
+  return value
+}
+
+function optionalParam<K extends string>(
+  params: Record<string, unknown>,
+  field: K,
+): Partial<Record<K, string>> {
+  const value = optionalString(params, field)
+  return value === undefined ? {} : { [field]: value } as Record<K, string>
 }
 
 /** Serialize manager selection/replacement and write transitions. */

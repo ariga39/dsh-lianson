@@ -1,9 +1,20 @@
 import { randomUUID } from 'node:crypto'
 import { LIAISON_ERROR_CODES, LiaisonError, type LiaisonErrorDetails, type WireError } from './errors.ts'
+import type { DelegationRecord, ModelTarget } from './delegation-registry.ts'
 import type { HostInspection, HostSummary, PingOutcome, StopOutcome } from './host-manager.ts'
 
 /** Methods accepted by the local daemon. */
-export const IPC_METHODS = ['host.start', 'host.status', 'host.ping', 'host.stop'] as const
+export const IPC_METHODS = [
+  'host.start',
+  'host.status',
+  'host.ping',
+  'host.stop',
+  'delegation.create',
+  'delegation.get',
+  'delegation.list',
+  'delegation.prompt',
+  'delegation.verifyModel',
+] as const
 
 /** One daemon method. */
 export type IpcMethod = (typeof IPC_METHODS)[number]
@@ -40,6 +51,39 @@ export interface IpcResultMap {
   readonly 'host.status': (HostInspection | HostSummary) & { readonly daemonPid: number | null }
   readonly 'host.ping': PingOutcome & { readonly daemonPid: number }
   readonly 'host.stop': StopOutcome & { readonly daemonPid: number | null }
+  readonly 'delegation.create': {
+    readonly delegation: DelegationRecord
+    readonly replayed: boolean
+    readonly daemonPid: number
+  }
+  readonly 'delegation.get': {
+    readonly delegation: DelegationRecord
+    readonly daemonPid: number | null
+  }
+  readonly 'delegation.list': {
+    readonly delegations: readonly DelegationRecord[]
+    readonly daemonPid: number | null
+  }
+  readonly 'delegation.prompt': {
+    readonly accepted: true
+    readonly completed: false
+    readonly replayed: boolean
+    readonly delegationId: string
+    readonly sessionId: string
+    readonly requestId: string
+    readonly beforeCursor: number
+    readonly daemonPid: number
+  }
+  readonly 'delegation.verifyModel': {
+    readonly delegationId: string
+    readonly sessionId: string
+    readonly requestId?: string
+    readonly turnSeq: number
+    readonly expectedModel: ModelTarget
+    readonly observedModel: ModelTarget
+    readonly verified: true
+    readonly daemonPid: number
+  }
 }
 
 /** Parameters by method. */
@@ -52,6 +96,32 @@ export interface IpcParamsMap {
   readonly 'host.status': { readonly ensure?: boolean }
   readonly 'host.ping': Record<string, never>
   readonly 'host.stop': { readonly keepHost?: boolean }
+  readonly 'delegation.create': {
+    readonly delegationId?: string
+    readonly title: string
+    readonly provider: string
+    readonly model: string
+    readonly reasoningEffort?: string
+    readonly agentPreset?: string
+    readonly cwd: string
+    readonly ipcRequestId?: string
+  }
+  readonly 'delegation.get': {
+    readonly delegationId?: string
+    readonly sessionId?: string
+  }
+  readonly 'delegation.list': Record<string, never>
+  readonly 'delegation.prompt': {
+    readonly delegationId: string
+    readonly content: string
+    readonly requestId?: string
+    readonly ipcRequestId?: string
+  }
+  readonly 'delegation.verifyModel': {
+    readonly delegationId: string
+    readonly requestId?: string
+    readonly ipcRequestId?: string
+  }
 }
 
 /** Create one correlated request with one caller wall deadline. */

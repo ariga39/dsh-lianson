@@ -4,6 +4,7 @@ import { rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
 import { createDeadline, type Deadline } from './deadline.ts'
 import { LiaisonError } from './errors.ts'
 import { acquireLock } from './flock.ts'
@@ -23,6 +24,7 @@ import {
   type HostIdentityExpectation,
 } from './proc-identity.ts'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
+import type { VerifiedHostContext } from './session-commands.ts'
 
 /** One launching Host record, written before the child can publish readiness. */
 export interface LaunchingHostRecord {
@@ -272,28 +274,49 @@ export class HostManager {
     }
   }
 
+  /**
+   * Return verified Host metadata without credentials.
+   * @param deadline - optional complete foreground budget.
+   */
+  async hostContext(deadline?: Deadline): Promise<VerifiedHostContext> {
+    const record = await this.resolveReadyHost(deadline)
+    return {
+      stateDir: this.paths.stateDir,
+      dshHome: record.dshHome,
+      cwd: record.cwd,
+      hostPid: record.hostPid,
+      origin: record.origin,
+      port: record.port,
+    }
+  }
+
+  /**
+   * Run one single-attempt operator RPC over the one existing connection.
+   * @param operation - typed Remote callback.
+   * @param timeoutOrDeadline - millisecond budget or shared foreground deadline.
+   * @returns the Remote result.
+   */
+  async withOperator<T>(
+    operation: (remote: ClientRemote, signal: AbortSignal) => Promise<RemoteResult<T>>,
+    timeoutOrDeadline?: number | Deadline,
+  ): Promise<RemoteResult<T>> {
+    const deadline = typeof timeoutOrDeadline === 'number'
+      ? createDeadline(timeoutOrDeadline)
+      : timeoutOrDeadline ?? createDeadline(15_000)
+    if (deadline.expired()) throw deadlineFailure()
+    const record = await this.resolveReadyHost(deadline)
+    if (deadline.expired()) throw deadlineFailure()
+    await this.attachOperator(record, deadline)
+    const operator = this.operator
+    if (operator === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'no operator connection is available')
+    return await operator.withClientUntil(operation, deadline)
+  }
+
   /** Read-only authenticated RPC used as the liveness proof. */
   async ping(): Promise<PingOutcome> {
     // One absolute budget covers probe, attach/replacement, readiness, and RPC.
     const deadline = createDeadline(this.pingTimeoutMs())
-    const record = await this.readRecord()
-    if (record === undefined || record.state !== 'ready') {
-      throw new LiaisonError('HOST_NOT_RUNNING', 'no managed Host is recorded')
-    }
-    const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
-    if (identity.kind === 'unverified') {
-      throw new LiaisonError('HOST_IDENTITY_UNVERIFIED', 'the recorded Host process cannot be verified', {
-        details: { reason: identity.reason, hostPid: record.hostPid },
-      })
-    }
-    if (identity.kind === 'dead-or-reused') {
-      throw new LiaisonError('HOST_NOT_RUNNING', 'the recorded Host is not running')
-    }
-    const probeBudget = Math.min(3_000, deadline.remaining())
-    if (probeBudget <= 0) throw pingDeadlineFailure()
-    if (!await probeLoopback(record.origin, probeBudget)) {
-      throw new LiaisonError('HOST_UNREACHABLE', 'the recorded Host is not reachable on its loopback origin')
-    }
+    const record = await this.resolveReadyHost(deadline, pingDeadlineFailure)
     await this.attachOperator(record, deadline)
     const operator = this.operator
     if (operator === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'no operator connection is available')
@@ -852,6 +875,31 @@ export class HostManager {
     const configured = env.DSH_HOME
     if (configured !== undefined && configured.trim() !== '') return configured
     return join(env.HOME !== undefined && env.HOME.trim() !== '' ? env.HOME : homedir(), '.dsh')
+  }
+
+  private async resolveReadyHost(
+    deadline?: Deadline,
+    expiredFailure: () => LiaisonError = deadlineFailure,
+  ): Promise<ReadyHostRecord> {
+    const record = await this.readRecord()
+    if (record === undefined || record.state !== 'ready') {
+      throw new LiaisonError('HOST_NOT_RUNNING', 'no managed Host is recorded')
+    }
+    const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
+    if (identity.kind === 'unverified') {
+      throw new LiaisonError('HOST_IDENTITY_UNVERIFIED', 'the recorded Host process cannot be verified', {
+        details: { reason: identity.reason, hostPid: record.hostPid },
+      })
+    }
+    if (identity.kind === 'dead-or-reused') {
+      throw new LiaisonError('HOST_NOT_RUNNING', 'the recorded Host is not running')
+    }
+    const probeBudget = Math.min(3_000, deadline?.remaining() ?? 3_000)
+    if (probeBudget <= 0) throw expiredFailure()
+    if (!await probeLoopback(record.origin, probeBudget)) {
+      throw new LiaisonError('HOST_UNREACHABLE', 'the recorded Host is not reachable on its loopback origin')
+    }
+    return record
   }
 
   private async attachOperator(record: ReadyHostRecord, deadline?: Deadline): Promise<void> {

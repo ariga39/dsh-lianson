@@ -1,6 +1,6 @@
 import { chmod, unlink } from 'node:fs/promises'
 import { createServer, type Server, type Socket } from 'node:net'
-import { LiaisonError, wireErrorOf } from './errors.ts'
+import { asLiaisonError, wireErrorOf } from './errors.ts'
 import { ensurePrivateDirectory, isMissing } from './fs-safe.ts'
 import { parseIpcRequest, type IpcRequest } from './ipc-protocol.ts'
 
@@ -109,10 +109,7 @@ async function respond(socket: Socket, line: string, handle: (request: IpcReques
     const result = await handle(request)
     writeLine(socket, JSON.stringify({ id, ok: true, result }))
   } catch (error) {
-    const failure = error instanceof LiaisonError ? error : undefined
-    const wire = failure === undefined
-      ? wireErrorOf(new LiaisonError('IPC_PROTOCOL', 'the daemon could not handle the request', { cause: error }))
-      : wireErrorOf(failure)
+    const wire = wireErrorOf(asLiaisonError(error, 'IPC_PROTOCOL', 'the daemon could not handle the request'))
     writeLine(socket, JSON.stringify({ id, ok: false, error: wire }))
   }
 }
