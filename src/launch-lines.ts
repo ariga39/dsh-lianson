@@ -52,7 +52,7 @@ export function findLaunchUrl(lines: readonly string[]): string | undefined {
  * @returns the text with every token query value replaced.
  */
 export function redact(text: string): string {
-  return text.replace(/([?&]token=)[^\s&)]+/gu, '$1<redacted>')
+  return text.replace(/(^|[?&\s])(token=)[^\s&)]+/gimu, '$1$2<redacted>')
 }
 
 function stripCarriageReturn(line: string): string {

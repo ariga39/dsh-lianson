@@ -70,15 +70,33 @@ export function upstreamArtifactRequirements(upstreamRoot: string): ArtifactRequ
  */
 export function missingUpstreamArtifacts(upstreamRoot: string): string[] {
   const root = resolve(upstreamRoot)
-  const missing = upstreamArtifactRequirements(root)
-    .filter(requirement => !existsSync(requirement.path))
-    .map(requirement => `${requirement.label}: ${requirement.path}`)
+  const missing = missingRequirements(upstreamArtifactRequirements(root))
   const indexPath = join(root, 'apps/web/dist/index.html')
   if (existsSync(indexPath)) missing.push(...missingWebAssets(indexPath))
   return missing
 }
 
-function missingWebAssets(indexPath: string): string[] {
+/**
+ * List requirement entries whose path is absent.
+ * @param requirements - required file entries.
+ * @param isPresent - injectable presence check for focused tests.
+ * @returns missing requirement labels and paths.
+ */
+export function missingRequirements(
+  requirements: readonly ArtifactRequirement[],
+  isPresent: (path: string) => boolean = existsSync,
+): string[] {
+  return requirements
+    .filter(requirement => !isPresent(requirement.path))
+    .map(requirement => `${requirement.label}: ${requirement.path}`)
+}
+
+/**
+ * List assets referenced by the built Web entry that are absent.
+ * @param indexPath - absolute path to the built `index.html`.
+ * @returns one label per missing local reference.
+ */
+export function missingWebAssets(indexPath: string): string[] {
   const directory = dirname(indexPath)
   const html = readFileSync(indexPath, 'utf8')
   const missing: string[] = []

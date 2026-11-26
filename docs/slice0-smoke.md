@@ -32,7 +32,22 @@ The command:
    graph and Web dist only when a requirement is missing, then installs the
    pinned Playwright Chromium browser.
 4. Runs `tsc --noEmit`, type-aware Oxlint over `src`, `scripts`, and `tests`,
-   and the Node test in `tests/slice0.test.ts`.
+   and the Node tests.
+
+## Checks
+
+```sh
+corepack pnpm run smoke:slice0   # bootstrap, typecheck, lint, and all tests
+corepack pnpm run verify         # typecheck, lint, and all tests
+corepack pnpm run typecheck      # tsc --noEmit
+corepack pnpm run lint           # type-aware Oxlint
+corepack pnpm run test           # node:test
+```
+
+`tests/slice0.test.ts` owns the end-to-end proof. `tests/harness.test.ts` keeps
+focused regressions for launch-line concatenation across chunk and CRLF
+boundaries, complete redacted stderr on early close, missing Web/declaration
+artifact detection, and isolation from a failing user Git hook.
 
 ## What the test proves
 
