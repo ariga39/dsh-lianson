@@ -2,7 +2,6 @@ import { createHash, randomUUID } from 'node:crypto'
 import { resolve } from 'node:path'
 import type { ClientRemote } from '@deepseek-ai/dsh-api-gateway/client'
 import type {
-  SessionEventEntry,
   SessionQueuedItem,
   SessionRequestId,
   SessionState,
@@ -126,6 +125,13 @@ export interface SessionCommandsOptions {
   readonly ledgerDir: string
   readonly titleMaxBytes?: number
   readonly timeoutMs?: number
+}
+
+interface EventScan {
+  readonly events: readonly SessionWireEvent[]
+  readonly complete: boolean
+  readonly earliestSeq: number | undefined
+  readonly accepted: boolean
 }
 
 interface ModelSelection {
@@ -398,15 +404,43 @@ export class SessionCommands {
   async verifyModel(command: VerifyModelCommand): Promise<VerifyModelResult> {
     await this.ownWriter(command.deadline)
     assertDeadlineLive(command.deadline)
-    const record = await this.registry.get(command.delegationId)
-    const requestId = command.requestId
+    const bound = await this.findPromptBinding(command.ipcRequestId)
+    if (bound !== undefined) {
+      if (bound.delegationId !== command.delegationId) {
+        throw new DelegationRegistryError(
+          'DELEGATION_PROMPT_CONFLICT',
+          `prompt key ${command.ipcRequestId ?? ''} belongs to ${bound.delegationId}, not ${command.delegationId}`,
+          {
+            ipcRequestId: command.ipcRequestId ?? '',
+            requestedDelegationId: command.delegationId,
+            boundDelegationId: bound.delegationId,
+          },
+        )
+      }
+      if (command.requestId !== undefined && command.requestId !== bound.requestId) {
+        throw new DelegationRegistryError(
+          'DELEGATION_PROMPT_CONFLICT',
+          `prompt key ${command.ipcRequestId ?? ''} belongs to request ${bound.requestId}`,
+          {
+            ipcRequestId: command.ipcRequestId ?? '',
+            requestedRequestId: command.requestId,
+            boundRequestId: bound.requestId,
+          },
+        )
+      }
+    }
+    const delegationId = bound?.delegationId ?? command.delegationId
+    const record = await this.registry.get(delegationId)
+    const requestId = bound?.requestId
+      ?? command.requestId
       ?? (command.ipcRequestId === undefined ? undefined : `request-${digest(command.ipcRequestId)}`)
     const state = await this.callRemote(
       (remote, signal) => remote.session.state({ sessionId: brandString<SessionId>(record.sessionId) }, signal),
       'DELEGATION_SESSION_CONFLICT',
       command.deadline,
     )
-    const events = await this.readEvents(record, state.cursor, command.deadline)
+    const scan = await this.scanEvents(record, state.cursor, command.deadline)
+    const events = scan.events
     const target = locateTarget(events, requestId)
     if (target === undefined) {
       throw new DelegationError(
@@ -419,6 +453,13 @@ export class SessionCommands {
     }
 
     const turnStart = [...events].reverse().find(event => event.type === 'turn/start' && event.seq <= target.seq)
+    if (turnStart === undefined && !scan.complete) {
+      throw new DelegationError(
+        'DELEGATION_MODEL_EVIDENCE_MISSING',
+        `delegation ${record.delegationId} turn history is incomplete`,
+        { delegationId: record.delegationId, ...(requestId === undefined ? {} : { requestId }) },
+      )
+    }
     const turnEnd = events.find(event => event.type === 'turn/end' && event.seq >= target.seq)
     const windowStart = turnStart?.seq ?? target.seq
     const windowEnd = turnEnd?.seq ?? events.at(-1)?.seq ?? target.seq
@@ -759,20 +800,33 @@ export class SessionCommands {
       return promptResult(record, accepted, true)
     }
 
-    let events: readonly SessionWireEvent[]
-    try {
-      events = await this.readEvents(record, state.cursor, deadline)
-    } catch {
+    if (state.cursor < receipt.beforeCursor) {
       throw new DelegationError(
         'DELEGATION_REQUEST_ID_UNCERTAIN',
-        `cannot read the Host log for ${requestId}`,
+        `the Host cursor rolled back for ${requestId}`,
         { delegationId: record.delegationId, requestId },
       )
     }
-    const persisted = events.some(event => event.seq > receipt.beforeCursor && requestIdOf(event) === requestId)
-    if (persisted) {
-      const accepted = await this.registry.acceptPrompt(record.delegationId, requestId)
-      return promptResult(record, accepted, true)
+    if (state.cursor > receipt.beforeCursor) {
+      const scan = await this.scanEvents(
+        record,
+        state.cursor,
+        deadline,
+        page => page.some(event => event.seq > receipt.beforeCursor
+          && event.seq <= state.cursor
+          && requestIdOf(event) === requestId),
+      )
+      if (scan.accepted) {
+        const accepted = await this.registry.acceptPrompt(record.delegationId, requestId)
+        return promptResult(record, accepted, true)
+      }
+      if (!scan.complete) {
+        throw new DelegationError(
+          'DELEGATION_REQUEST_ID_UNCERTAIN',
+          `cannot prove contiguous coverage for ${requestId}`,
+          { delegationId: record.delegationId, requestId },
+        )
+      }
     }
 
     await this.dispatchPrompt(record, requestId, content, deadline)
@@ -799,32 +853,63 @@ export class SessionCommands {
     if (!result.ok) throw this.delegationError(result.error, 'DELEGATION_SESSION_CONFLICT')
   }
 
-  private async readEvents(
+  private async scanEvents(
     record: DelegationRecord,
     throughSeq: number,
     deadline?: Deadline,
-  ): Promise<readonly SessionWireEvent[]> {
-    const events = new Map<number, SessionWireEvent>()
-    const through = throughSeq
+    accept?: (page: readonly SessionWireEvent[]) => boolean,
+  ): Promise<EventScan> {
+    const collected = new Map<number, SessionWireEvent>()
     let before: number | undefined
+    let complete = throughSeq < 0
     for (let page = 0; page < MAX_EVENT_PAGES; page += 1) {
+      assertDeadlineLive(deadline)
       const value = await this.callRemote(
         (remote, signal) => remote.session.events({
           address: { kind: 'session', sessionId: brandString<SessionId>(record.sessionId) },
-          throughSeq: through,
+          throughSeq,
           ...(before === undefined ? {} : { beforeSeq: before }),
           maxMessages: EVENTS_PAGE_MESSAGES,
         }, signal),
         'DELEGATION_SESSION_CONFLICT',
         deadline,
       )
-      for (const entry of value.records) events.set(entry.event.seq, entry.event)
+      const pageEvents = value.records.map(entry => entry.event)
+      if (pageEvents.length === 0) {
+        complete = throughSeq < 0
+        break
+      }
+      const first = pageEvents[0]?.seq
+      const last = pageEvents.at(-1)?.seq
+      if (first === undefined || last === undefined) break
+      if (before === undefined) {
+        if (last !== throughSeq) break
+      } else if (last !== before - 1 || first >= before) {
+        break
+      }
+      for (const event of pageEvents) collected.set(event.seq, event)
+      if (accept?.(pageEvents) === true) {
+        return {
+          events: sortedEvents(collected),
+          complete: false,
+          earliestSeq: first,
+          accepted: true,
+        }
+      }
+      if (first <= 0) {
+        complete = true
+        break
+      }
       if (!value.hasMore) break
-      const earliest = earliestSeq(value.records)
-      if (earliest === undefined || earliest <= 0) break
-      before = earliest
+      before = first
     }
-    return [...events.values()].sort((left, right) => left.seq - right.seq)
+    const events = sortedEvents(collected)
+    return {
+      events,
+      complete,
+      earliestSeq: events[0]?.seq,
+      accepted: false,
+    }
   }
 
   private async callRemote<T>(
@@ -939,9 +1024,8 @@ function queueHasRequest(queue: readonly SessionQueuedItem[] | null, requestId: 
   return queue?.some(item => item.rpcId !== undefined && String(item.rpcId) === requestId) === true
 }
 
-function earliestSeq(records: readonly SessionEventEntry[]): number | undefined {
-  return records.reduce<number | undefined>((earliest, entry) =>
-    earliest === undefined || entry.event.seq < earliest ? entry.event.seq : earliest, undefined)
+function sortedEvents(events: Map<number, SessionWireEvent>): readonly SessionWireEvent[] {
+  return [...events.values()].sort((left, right) => left.seq - right.seq)
 }
 
 function detailText(failure: RemoteFailure, field: string): string | undefined {

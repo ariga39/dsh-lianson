@@ -455,8 +455,9 @@ await test('normal delegation CLI: two models, worktree isolation, replay, verif
 
     const help = await runCli(env, worktreeA, ['delegation', '--help'])
     const helpText = stringField(okResult(help), 'result')
-    assert.match(helpText, /separate new operation/u)
-    assert.match(helpText, /--id <key>/u)
+    assert.match(helpText, /Only an invocation with no identifier/u)
+    assert.match(helpText, /--delegation-id or --id/u)
+    assert.match(helpText, /--request-id or --id/u)
     assertNoSecrets(help)
 
     const delegationA = `delegation-a-${nonce}`

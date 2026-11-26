@@ -33,9 +33,9 @@ const DELEGATION_HELP = [
   'list',
   'verify-model --delegation-id <id> [--request-id <id>] [--id <key>]',
   '',
-  '--id <key> supplies the original caller identity for a retry after a lost reply.',
-  'Without --id, each create or prompt invocation is a separate new operation.',
-  'The CLI never retries a Host mutation internally.',
+  'Retries: create is identified by --delegation-id or --id; prompt is identified by',
+  '--request-id or --id. Only an invocation with no identifier for that command is a',
+  'separate new operation. The CLI never retries a Host mutation internally.',
 ].join('\n')
 const DAEMON_BOOT_TIMEOUT_MS = 20_000
 /** Bound on one active `host.start`, including its Host readiness deadline. */

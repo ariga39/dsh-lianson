@@ -44,6 +44,10 @@ function contentHash(content: string): string {
   return createHash('sha256').update(content).digest('hex')
 }
 
+function derivedRequestId(ipcRequestId: string): string {
+  return `request-${createHash('sha256').update(ipcRequestId).digest('hex').slice(0, 32)}`
+}
+
 async function expectCode(
   promise: Promise<unknown>,
   code: DelegationErrorCode | DelegationRegistryErrorCode,
@@ -227,14 +231,26 @@ function fakeHost(): FakeHost {
         if (address.kind !== 'session') return { ok: false, error: remoteFailure('session/not-found', 'not a session') }
         const all = eventsOf(String(address.sessionId))
         const through = request.throughSeq ?? all.at(-1)?.seq ?? 0
-        const before = request.beforeSeq
-        const selected = all.filter(event => event.seq <= through && (before === undefined || event.seq < before))
+        const end = Math.min(through + 1, request.beforeSeq ?? through + 1)
+        const maxMessages = request.maxMessages ?? 1_000
+        let count = 0
+        let cut = 0
+        for (let index = end - 1; index >= 0; index -= 1) {
+          const type = all[index]?.type
+          if (type !== 'user/message' && type !== 'assistant/message' && type !== 'tool/result'
+            && type !== 'developer/message' && type !== 'system/message') continue
+          count += 1
+          if (count >= maxMessages) {
+            cut = index
+            break
+          }
+        }
         return {
           ok: true,
           value: {
-            records: selected.map(eventEntry),
+            records: all.slice(cut, end).map(eventEntry),
             cursor: through,
-            hasMore: false,
+            hasMore: cut > 0,
           },
         }
       },
@@ -952,6 +968,183 @@ await test('prompt dictionaries treat inherited Object names as literal caller k
     )
   } finally {
     await restarted?.close()
+    await cleanup(item)
+  }
+})
+
+await test('pending prompt positives can acknowledge early while negatives require full contiguous coverage', async () => {
+  const item = await fixture('prompt-deep-scan')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    const fillerCount = 32 * 400 + 50
+    const events: SessionWireEvent[] = [wireEvent(0, 'turn/start', { turn: 1 })]
+    for (let index = 1; index <= fillerCount; index += 1) {
+      events.push(wireEvent(index, 'assistant/message', { content: [{ type: 'text', text: 'filler' }] }))
+    }
+    events.push(userMessage(fillerCount + 1, 'request-near-head'))
+    item.host.events.set(created.delegation.sessionId, events)
+
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-near-head',
+      contentHash: contentHash('near'),
+      beforeCursor: 0,
+    })
+    const positive = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-near-head',
+      content: 'near',
+    })
+    assert.equal(positive.replayed, true)
+    assert.equal(item.host.promptCalls, 0)
+    assert.equal((await item.registry.promptReceipt('del-1', 'request-near-head'))?.accepted, true)
+
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-beyond-scan',
+      contentHash: contentHash('missing'),
+      beforeCursor: 0,
+    })
+    await expectCode(
+      item.commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'request-beyond-scan',
+        content: 'missing',
+      }),
+      'DELEGATION_REQUEST_ID_UNCERTAIN',
+    )
+    assert.equal(item.host.promptCalls, 0)
+    assert.equal((await item.registry.promptReceipt('del-1', 'request-beyond-scan'))?.accepted, false)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('an empty pending window is complete, while cursor rollback is uncertain', async () => {
+  const item = await fixture('prompt-empty-window')
+  try {
+    await item.commands.create(createCommand(item))
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-empty',
+      contentHash: contentHash('empty'),
+      beforeCursor: 0,
+    })
+    const accepted = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-empty',
+      content: 'empty',
+    })
+    assert.equal(accepted.replayed, true)
+    assert.equal(item.host.promptCalls, 1)
+
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-rollback',
+      contentHash: contentHash('rollback'),
+      beforeCursor: 5,
+    })
+    await expectCode(
+      item.commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'request-rollback',
+        content: 'rollback',
+      }),
+      'DELEGATION_REQUEST_ID_UNCERTAIN',
+    )
+    assert.equal(item.host.promptCalls, 1)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('verify-model refuses to certify a turn whose start was truncated from the scan', async () => {
+  const item = await fixture('verify-truncated-turn')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    const fillerCount = 32 * 400 + 50
+    const events: SessionWireEvent[] = [wireEvent(0, 'turn/start', { turn: 1 })]
+    for (let index = 1; index <= fillerCount; index += 1) {
+      events.push(wireEvent(index, 'assistant/message', { content: [{ type: 'text', text: 'filler' }] }))
+    }
+    const base = fillerCount + 1
+    events.push(
+      requestHeader(base, 'provider-a', 'model-a'),
+      userMessage(base + 1, 'request-deep-turn'),
+      wireEvent(base + 2, 'assistant/message', { content: [{ type: 'text', text: 'deep evidence' }] }),
+      wireEvent(base + 3, 'turn/end', { reason: { kind: 'completed' } }),
+    )
+    item.host.events.set(created.delegation.sessionId, events)
+    await expectCode(
+      item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-deep-turn' }),
+      'DELEGATION_MODEL_EVIDENCE_MISSING',
+    )
+  } finally {
+    await cleanup(item)
+  }
+})
+
+
+await test('verify-model resolves a persisted prompt key before explicit request or delegation conflicts', async () => {
+  const item = await fixture('verify-key-binding')
+  try {
+    const first = await item.commands.create(createCommand(item, { delegationId: 'del-1', title: 'Alpha' }))
+    const second = await item.commands.create(createCommand(item, { delegationId: 'del-2', title: 'Beta' }))
+    await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'custom-turn',
+      content: 'keyed verification',
+      ipcRequestId: 'verify-key',
+    })
+    item.host.events.set(first.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      requestHeader(1, 'provider-a', 'model-a'),
+      userMessage(2, 'custom-turn'),
+      wireEvent(3, 'assistant/message', { content: [{ type: 'text', text: 'custom' }] }),
+      wireEvent(4, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+
+    const byKey = await item.commands.verifyModel({
+      delegationId: 'del-1',
+      ipcRequestId: 'verify-key',
+    })
+    assert.equal(byKey.requestId, 'custom-turn')
+    assert.deepEqual(byKey.observedModel, { provider: 'provider-a', model: 'model-a' })
+
+    const byBoth = await item.commands.verifyModel({
+      delegationId: 'del-1',
+      requestId: 'custom-turn',
+      ipcRequestId: 'verify-key',
+    })
+    assert.equal(byBoth.requestId, 'custom-turn')
+
+    await expectCode(
+      item.commands.verifyModel({
+        delegationId: 'del-1',
+        requestId: 'different-turn',
+        ipcRequestId: 'verify-key',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
+    await expectCode(
+      item.commands.verifyModel({
+        delegationId: 'del-2',
+        ipcRequestId: 'verify-key',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
+
+    const legacyRequestId = derivedRequestId('legacy-key')
+    item.host.events.set(second.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      requestHeader(1, 'provider-a', 'model-a'),
+      userMessage(2, legacyRequestId),
+      wireEvent(3, 'assistant/message', { content: [{ type: 'text', text: 'legacy' }] }),
+      wireEvent(4, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+    const legacy = await item.commands.verifyModel({
+      delegationId: 'del-2',
+      ipcRequestId: 'legacy-key',
+    })
+    assert.equal(legacy.requestId, legacyRequestId)
+    assert.deepEqual(legacy.observedModel, { provider: 'provider-a', model: 'model-a' })
+  } finally {
     await cleanup(item)
   }
 })
