@@ -31,28 +31,48 @@ export async function startDshWeb({ root, cwd, dshHome, overlayPath, bin = BIN }
 
   let output = ''
   let token
-  const append = chunk => {
-    output = `${output}${String(chunk)}`.slice(-100_000)
-    const match = /dsh web: (http:\/\/[^\s]+)/u.exec(output)
-    if (match?.[1] !== undefined) token = tokenOfUrl(match[1]) ?? token
-    const rawToken = /[?&]token=([^&#\s)"'`]+)/u.exec(output)
-    if (rawToken?.[1] !== undefined) token = rawToken[1]
-  }
+  const pending = { stdout: '', stderr: '' }
+  let launchResolve
+  let timer
   const diagnostics = () => scrubTokenDiagnostics(output, token)
+
+  const observeLine = line => {
+    const match = /dsh web: (http:\/\/\S+)/u.exec(line)
+    if (match?.[1] !== undefined) {
+      token = tokenOfUrl(match[1]) ?? token
+      return match[1]
+    }
+    const rawToken = /[?&]token=([^&#\s)"'`]+)/u.exec(line)
+    if (rawToken?.[1] !== undefined) token = rawToken[1]
+    return undefined
+  }
+
+  const consume = (stream, chunk) => {
+    output = `${output}${String(chunk)}`.slice(-100_000)
+    let text = `${pending[stream]}${String(chunk)}`
+    while (true) {
+      // Frame only complete lines; a trailing \r may be the first half of CRLF.
+      const lineEnd = /\r\n|\n|\r(?!$)/u.exec(text)
+      if (lineEnd === null) break
+      const line = text.slice(0, lineEnd.index)
+      text = text.slice(lineEnd.index + lineEnd[0].length)
+      const launchUrl = observeLine(line)
+      if (launchUrl === undefined || launchResolve === undefined) continue
+      const resolve = launchResolve
+      launchResolve = undefined
+      clearTimeout(timer)
+      resolve(launchUrl)
+    }
+    pending[stream] = text
+  }
 
   let launchUrl
   try {
     launchUrl = await new Promise((resolve, reject) => {
-      const timer = setTimeout(() => reject(new Error(`dsh web did not become ready:\n${diagnostics()}`)), 120_000)
-      const onData = chunk => {
-        append(chunk)
-        const match = /dsh web: (http:\/\/[^\s]+)/u.exec(output)
-        if (match?.[1] === undefined) return
-        clearTimeout(timer)
-        resolve(match[1])
-      }
-      child.stdout.on('data', onData)
-      child.stderr.on('data', onData)
+      launchResolve = resolve
+      timer = setTimeout(() => reject(new Error(`dsh web did not become ready:\n${diagnostics()}`)), 120_000)
+      child.stdout.on('data', chunk => { consume('stdout', chunk) })
+      child.stderr.on('data', chunk => { consume('stderr', chunk) })
       child.once('error', error => {
         clearTimeout(timer)
         reject(new Error(scrubTokenDiagnostics(error.message, token)))

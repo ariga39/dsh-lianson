@@ -52,3 +52,64 @@ test('startup failure diagnostics never expose a synthetic launch canary', async
     await rm(root, { recursive: true, force: true })
   }
 })
+
+test('announce URL split across chunks and CRLF is framed before parsing', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh split announce-'))
+  const canary = 'CANARY_SPLIT_TOKEN_4a91'
+  const url = `http://127.0.0.1:4321/?token=${canary}`
+  try {
+    const fakeBin = join(root, 'fake-cli.mjs')
+    await writeFile(fakeBin, [
+      "process.stdout.write('dsh web: http://127.0.0.1:4321/?tok')",
+      `setTimeout(() => process.stdout.write('en=${canary}\\r'), 10)`,
+      "setTimeout(() => process.stdout.write('\\n'), 20)",
+      'setTimeout(() => process.exit(0), 80)',
+      '',
+    ].join('\n'))
+    const web = await startDshWeb({
+      root,
+      cwd: root,
+      dshHome: join(root, 'home'),
+      overlayPath: join(root, 'overlay.yml'),
+      bin: fakeBin,
+    })
+    try {
+      assert.equal(web.launchUrl, url)
+      assert.equal(web.diagnostics().includes(canary), false)
+      assert.match(web.diagnostics(), /<redacted>/u)
+    } finally {
+      await web.close()
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+test('split startup failure rejects without using a partial URL or printing its token', { timeout: 10_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh split failure-'))
+  const canary = 'CANARY_SPLIT_FAILURE_6c02'
+  try {
+    const fakeBin = join(root, 'fake-cli.mjs')
+    await writeFile(fakeBin, [
+      "process.stderr.write('dsh web: http://127.0.0.1:4321/?tok')",
+      `setTimeout(() => { process.stderr.write('en=${canary}'); process.exit(1) }, 10)`,
+      '',
+    ].join('\n'))
+    await assert.rejects(
+      startDshWeb({
+        root,
+        cwd: root,
+        dshHome: join(root, 'home'),
+        overlayPath: join(root, 'overlay.yml'),
+        bin: fakeBin,
+      }),
+      error => {
+        assert.equal(error.message.includes(canary), false)
+        assert.match(error.message, /<redacted>/u)
+        return true
+      },
+    )
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
