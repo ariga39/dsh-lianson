@@ -6,13 +6,13 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { createLaunchLineCollector } from '../src/launch-lines.ts'
-import { startAnnouncedProcess } from '../src/host.ts'
-import { missingRequirements, missingWebAssets, upstreamArtifactRequirements } from '../scripts/artifacts.ts'
-import { captureCommand, runCommand } from '../scripts/commands.ts'
-import { stageUpstream } from '../scripts/upstream.ts'
+import { createLaunchLineCollector } from '../slice0/launch-lines.ts'
+import { startAnnouncedProcess } from '../slice0/host.ts'
+import { missingRequirements, missingWebAssets, upstreamArtifactRequirements } from '../../scripts/artifacts.ts'
+import { captureCommand, runCommand } from '../../scripts/commands.ts'
+import { stageUpstream } from '../../scripts/upstream.ts'
 
-const projectRoot = fileURLToPath(new URL('..', import.meta.url))
+const projectRoot = fileURLToPath(new URL('../..', import.meta.url))
 const upstreamRoot = join(projectRoot, 'deepseek-harness')
 
 async function waitForProcessGone(pid: number, timeoutMs: number): Promise<void> {
@@ -28,8 +28,8 @@ async function waitForProcessGone(pid: number, timeoutMs: number): Promise<void>
   }
   throw new Error(`process ${String(pid)} did not exit within ${String(timeoutMs)}ms`)
 }
-const announceFixture = fileURLToPath(new URL('./fixtures/announce.ts', import.meta.url))
-const exitGapFixture = fileURLToPath(new URL('./fixtures/exit-gap.ts', import.meta.url))
+const announceFixture = fileURLToPath(new URL('../fixtures/announce.ts', import.meta.url))
+const exitGapFixture = fileURLToPath(new URL('../fixtures/exit-gap.ts', import.meta.url))
 
 await test('announcement survives chunk and CRLF splits', async () => {
   const collector = createLaunchLineCollector()

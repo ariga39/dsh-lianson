@@ -31,8 +31,8 @@ The command:
    assets referenced by the built Web entry; it emits the upstream artifact
    graph and Web dist only when a requirement is missing, then installs the
    pinned Playwright Chromium browser.
-4. Runs `tsc --noEmit`, type-aware Oxlint over `src`, `scripts`, and `tests`,
-   and the Node tests.
+4. Runs `tsc --noEmit`, type-aware Oxlint over `src`, `bin`, `scripts`, and
+   `tests`, and the Node tests.
 
 ## Checks
 
@@ -41,16 +41,19 @@ corepack pnpm run smoke:slice0   # bootstrap, typecheck, lint, and all tests
 corepack pnpm run verify         # typecheck, lint, and all tests
 corepack pnpm run typecheck      # tsc --noEmit
 corepack pnpm run lint           # type-aware Oxlint
-corepack pnpm run test           # node:test
+corepack pnpm run test           # unit, real-Host integration, and Slice 0
+corepack pnpm run test:unit      # fast unit tests
+corepack pnpm run test:integration # real isolated Host plugin tests
+corepack pnpm run test:slice0    # Playwright Slice 0 smoke
 ```
 
-`tests/slice0.test.ts` owns the end-to-end proof. `tests/harness.test.ts` keeps
-focused regressions for launch-line concatenation across chunk and CRLF
-boundaries, complete redacted stderr on early close, missing Web/declaration
-artifact detection, and isolation from a failing user Git hook.
-`tests/failure.test.ts` covers token-free failure reporting through a real
-`node:test` reporter, shutdown-only Host stderr after reaping, and preservation
-of the original failure when cleanup fails.
+`tests/slice0.test.ts` owns the end-to-end proof, with its harness in
+`tests/slice0/`. `tests/unit/harness.test.ts` keeps focused regressions for
+launch-line concatenation across chunk and CRLF boundaries, complete redacted
+stderr on early close, missing Web/declaration artifact detection, and isolation
+from a failing user Git hook. `tests/unit/failure.test.ts` covers token-free
+failure reporting through a real `node:test` reporter, shutdown-only Host stderr
+after reaping, and preservation of the original failure when cleanup fails.
 
 ## What the test proves
 

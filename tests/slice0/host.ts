@@ -11,6 +11,8 @@ export interface StartDshWebOptions {
   readonly agentsHome: string
   readonly bundledSkillDir: string
   readonly patchPath: string
+  /** Additional environment entries for the isolated Host, such as a test socket override. */
+  readonly env?: Readonly<Record<string, string>>
   readonly timeoutMs?: number
 }
 
@@ -148,6 +150,7 @@ function cleanEnvironment(options: StartDshWebOptions): NodeJS.ProcessEnv {
     NODE_NO_WARNINGS: '1',
     SSH_CONNECTION: '',
     SSH_TTY: '',
+    ...options.env,
   }
 }
 

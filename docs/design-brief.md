@@ -1,5 +1,7 @@
 # Design brief
 
+> **Historical note**: This brief records the earlier external-daemon design. The current implementation is an in-process `dsh` plugin with a stateless CLI; see the [agent guide](../agent.md), [requirements](requirements.md), and open GitHub issues for the active direction.
+
 AGY prepared the [development plan](development-plan.md) against the [requirements](requirements.md). Codex independently examined the implementation, discussed findings with AGY, and verified the agreed revision. This brief records the questions and evidence used for that design.
 
 ## Source baseline

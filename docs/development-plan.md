@@ -1,5 +1,7 @@
 # Development Plan: Orchestrating DeepSeek Harness (`dsh`) from Codex
 
+> **Historical design note**: This plan describes an earlier external-daemon architecture. The shipped direction is an in-process Cordis plugin inside `dsh web` plus a stateless CLI, documented by the [agent guide](../agent.md), [readme](../readme.md), and open GitHub issues. Use this plan for its upstream references and protocol observations, not as the current delivery sequence.
+
 > **Status**: Finalized implementation plan corresponding to [requirements.md](requirements.md) and [design-brief.md](design-brief.md) (design only; no source code changes in this phase).
 > **Upstream baseline**: DeepSeek Harness commit [`4b399c39a6d1479cd84ca591b4d7c88e24d38a96`](https://github.com/deepseek-ai/deepseek-harness/tree/4b399c39a6d1479cd84ca591b4d7c88e24d38a96) (`0.2.3-alpha.2`, 2026-11-22). All upstream tests cited below were verified from source and have not yet been executed during the design phase.
 

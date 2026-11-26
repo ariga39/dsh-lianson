@@ -12,18 +12,18 @@
 
 ## Current Baseline vs. Planned Capability
 
-- **Available now on `main` (`4f78093`)**:
+- **Available now on `main`**:
   - Clean-checkout bootstrap (`scripts/bootstrap.ts`) pinning unmodified upstream `deepseek-harness` at `4b399c39a6d1479cd84ca591b4d7c88e24d38a96`.
   - **Slice 0 keyless E2E smoke** verifying external session creation, duplicate `requestId` handling, mid-turn Playwright `dsh Web` viewing during a pending question and active stream, safe browser close, and contiguous history ([docs/slice0-smoke.md](docs/slice0-smoke.md)).
+  - **In-process plugin and stateless CLI** (`src/plugin.ts`, `bin/dsh-liaison.ts`): a `0600` user-only Unix socket with single-owner `flock` election, an in-memory authenticated loopback answering operator that re-exchanges `/connect` after mux loss, and `dsh-liaison status|ping` JSON commands.
 - **Planned (not yet shipped; delivered strictly sequentially)**:
-  1. In-process plugin with single-owner UDS HTTP endpoint and stateless `commander` CLI (`status`, `ping`).
-  2. SQLite delegation bindings (`create`, `get`, `list`, `prompt`, `verify-model`) with worktree isolation and single-key idempotent prompts.
-  3. Observation (`status`, segmented `wait`, contiguous `events`, `subagentCatalog`).
-  4. Bound-session approvals and user questions (`interaction list|approve|reject|answer`) coexisting with `dsh Web`.
-  5. Mid-turn `steer`, `queue` edits, bounded `stop`, and original-session `rework`.
-  6. CLI JSON contract tests, verified persistent plugin installation, and operator runbook.
-  7. Keyless two-delegation routing rehearsal with live 138-observation verification.
-  8. Real-world acceptance with live model, real review, unattended and Web-observed proof, and live 138-observation SHA binding.
+  1. SQLite delegation bindings (`create`, `get`, `list`, `prompt`, `verify-model`) with worktree isolation and single-key idempotent prompts.
+  2. Observation (`status`, segmented `wait`, contiguous `events`, `subagentCatalog`).
+  3. Bound-session approvals and user questions (`interaction list|approve|reject|answer`) coexisting with `dsh Web`.
+  4. Mid-turn `steer`, `queue` edits, bounded `stop`, and original-session `rework`.
+  5. CLI JSON contract tests, verified persistent plugin installation, and operator runbook.
+  6. Keyless two-delegation routing rehearsal with live 138-observation verification.
+  7. Real-world acceptance with live model, real review, unattended and Web-observed proof, and live 138-observation SHA binding.
 
 > Persistent installation (`dsh plugin` / `$DSH_HOME/cordis.patch.yml`) and `dsh Desktop` sharing are source-confirmed upstream mechanisms still pending runtime verification; they are not yet verified on this baseline.
 
@@ -36,8 +36,22 @@ corepack pnpm run smoke:slice0   # bootstrap pinned upstream, then run full veri
 corepack pnpm run verify         # typecheck + lint + test
 corepack pnpm run typecheck      # tsc --noEmit
 corepack pnpm run lint           # type-aware Oxlint
-corepack pnpm run test           # node --test tests/*.test.ts
+corepack pnpm run test           # unit, real-Host integration, and Slice 0
+corepack pnpm run test:unit      # fast unit tests
+corepack pnpm run test:integration # real isolated Host plugin tests
+corepack pnpm run test:slice0    # Playwright Slice 0 smoke
 ```
+
+With the plugin mounted in a running `dsh web`, the stateless CLI reads the
+user-only socket and prints one JSON document:
+
+```sh
+node bin/dsh-liaison.ts status
+node bin/dsh-liaison.ts ping
+```
+
+Set `DSH_LIAISON_SOCKET` to override the default `$XDG_RUNTIME_DIR/dsh-liaison/dsh-liaison.sock`
+(falling back to `$HOME/.local/state/dsh-liaison/dsh-liaison.sock`).
 
 ## Issues and Documentation
 

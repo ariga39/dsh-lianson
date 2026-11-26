@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { PINNED_NODE, PINNED_PNPM, PINNED_UPSTREAM_COMMIT, PINNED_UPSTREAM_URL } from '../src/constants.ts'
+import { PINNED_NODE, PINNED_PNPM, PINNED_UPSTREAM_COMMIT, PINNED_UPSTREAM_URL } from './pinned.ts'
 import { missingUpstreamArtifacts } from './artifacts.ts'
 import { captureCommand, runCommand } from './commands.ts'
 import { assertUpstreamIdentity, stageUpstream } from './upstream.ts'

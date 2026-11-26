@@ -4,7 +4,7 @@
 
 `dsh-liaison` connects an external orchestrator (such as Codex) to a running DeepSeek Harness (`dsh`) server so coding delegations can be created, driven, observed, adjudicated, and reworked programmatically while a user can inspect the same live sessions in `dsh Web` without disrupting execution or spending orchestrator tokens summarizing work.
 
-Product requirements live in [docs/requirements.md](docs/requirements.md). The current `main` baseline (`4f78093`) ships the upstream bootstrap and Slice 0 keyless smoke ([docs/slice0-smoke.md](docs/slice0-smoke.md)); the plugin and CLI commands below are planned sequential work, not yet shipped. Earlier documents (`docs/development-plan.md`, `docs/design-brief.md`) capture an earlier external-daemon design; follow open issues and this guide where they differ.
+Product requirements live in [docs/requirements.md](docs/requirements.md). The current `main` baseline ships the upstream bootstrap, Slice 0 keyless smoke ([docs/slice0-smoke.md](docs/slice0-smoke.md)), and the in-process plugin with `status`/`ping`; delegation, observation, and interaction commands below are planned sequential work. Earlier documents (`docs/development-plan.md`, `docs/design-brief.md`) capture a historical external-daemon design; follow open issues and this guide where they differ.
 
 ## Architecture (In-Process `dsh` Plugin + Stateless CLI)
 

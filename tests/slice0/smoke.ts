@@ -51,7 +51,7 @@ const CONTROL_WAIT_MS = 30_000
  * @returns typed evidence for the test's assertions.
  */
 export async function runSlice0(): Promise<Slice0Report> {
-  const projectRoot = fileURLToPath(new URL('..', import.meta.url))
+  const projectRoot = fileURLToPath(new URL('../..', import.meta.url))
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-slice0-'))
   const workspace = join(root, 'workspace')
   const dshHome = join(root, 'dsh-home')

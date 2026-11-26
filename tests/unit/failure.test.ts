@@ -3,10 +3,10 @@ import { spawnSync } from 'node:child_process'
 import { test } from 'node:test'
 import { inspect } from 'node:util'
 import { fileURLToPath } from 'node:url'
-import { failureWithHostDiagnostics, launchTokenOf } from '../src/failure.ts'
+import { failureWithHostDiagnostics, launchTokenOf } from '../slice0/failure.ts'
 
 const SECRET = 'canary-launch-token-0123456789abcdef'
-const canaryFixture = fileURLToPath(new URL('./fixtures/report-canary.ts', import.meta.url))
+const canaryFixture = fileURLToPath(new URL('../fixtures/report-canary.ts', import.meta.url))
 
 await test('a fresh failure keeps the redacted primary message and omits nested causes', async () => {
   const deep = new Error(`deep cause ${SECRET}`)

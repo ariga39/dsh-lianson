@@ -1,5 +1,5 @@
 import { test } from 'node:test'
-import { failureWithHostDiagnostics } from '../../src/failure.ts'
+import { failureWithHostDiagnostics } from '../slice0/failure.ts'
 
 const secret = process.env.DSH_CANARY_TOKEN
 if (secret === undefined || secret === '') throw new Error('DSH_CANARY_TOKEN is required')

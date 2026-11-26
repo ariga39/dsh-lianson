@@ -17,7 +17,10 @@ const REQUIRED_SPECIFIERS = [
   '@deepseek-ai/dsh-api-workspace-controller/remote',
   '@deepseek-ai/dsh-brand',
   '@deepseek-ai/dsh-client-connection/client',
+  '@deepseek-ai/dsh-cmdline',
   '@deepseek-ai/dsh-commands/remote',
+  '@deepseek-ai/dsh-home-paths',
+  '@deepseek-ai/dsh-host-webserver',
   '@deepseek-ai/dsh-llm',
   '@deepseek-ai/dsh-permission-presets/remote',
   '@deepseek-ai/dsh-session/types',
@@ -25,6 +28,7 @@ const REQUIRED_SPECIFIERS = [
   '@deepseek-ai/dsh-typert-registry',
   '@deepseek-ai/dsh-user-questions/remote',
   '@deepseek-ai/dsh-user-questions/types',
+  '@deepseek-ai/node-addon-system/flock',
 ] as const
 
 /**

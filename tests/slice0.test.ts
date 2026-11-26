@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { test } from 'node:test'
-import { runSlice0 } from '../src/smoke.ts'
+import { runSlice0 } from './slice0/smoke.ts'
 
 await test('slice 0: keyless external operator against a real dsh web instance', { timeout: 300_000 }, async () => {
   const report = await runSlice0()
