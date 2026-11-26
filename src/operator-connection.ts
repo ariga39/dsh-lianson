@@ -470,16 +470,25 @@ async function waitForGeneration(
   signal: AbortSignal,
   lost?: AbortSignal,
 ): Promise<void> {
-  if (connection.generation.getSnapshot() !== undefined) return
-  if (lost?.aborted === true) {
-    throw new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator transport closed before generation readiness')
+  const abortError = (): Error | undefined => {
+    if (signal.aborted) return new Error('operator connection was aborted')
+    if (lost?.aborted === true) {
+      return new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator transport closed before generation readiness')
+    }
+    return undefined
   }
+  // An already-aborted handoff must reject before a snapshot can look ready.
+  const initialFailure = abortError()
+  if (initialFailure !== undefined) throw initialFailure
+  if (connection.generation.getSnapshot() !== undefined) return
   await new Promise<void>((resolve, reject) => {
     let settled = false
+    const timer: { current?: NodeJS.Timeout } = {}
+    let unsubscribe: () => void = () => {}
     const finish = (error?: Error): void => {
       if (settled) return
       settled = true
-      clearTimeout(timer)
+      if (timer.current !== undefined) clearTimeout(timer.current)
       unsubscribe()
       signal.removeEventListener('abort', onAbort)
       lost?.removeEventListener('abort', onLost)
@@ -490,15 +499,29 @@ async function waitForGeneration(
     const onLost = (): void => {
       finish(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator transport closed before generation readiness'))
     }
-    const unsubscribe = connection.generation.subscribe(() => {
+    const disposer = connection.generation.subscribe(() => {
+      const failure = abortError()
+      if (failure !== undefined) {
+        finish(failure)
+        return
+      }
       if (connection.generation.getSnapshot() !== undefined) finish()
     })
-    const timer = setTimeout(() => {
+    unsubscribe = disposer
+    if (settled) {
+      disposer()
+      return
+    }
+    timer.current = setTimeout(() => {
       finish(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator generation was not ready in time'))
     }, timeoutMs)
     signal.addEventListener('abort', onAbort, { once: true })
     lost?.addEventListener('abort', onLost, { once: true })
-    if (connection.generation.getSnapshot() !== undefined || lost?.aborted === true) finish()
+    // Re-check after listener registration so a signal that aborted during
+    // subscription cannot be mistaken for a successful generation.
+    const failure = abortError()
+    if (failure !== undefined) finish(failure)
+    else if (connection.generation.getSnapshot() !== undefined) finish()
   })
 }
 

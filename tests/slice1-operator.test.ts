@@ -566,6 +566,70 @@ function requestMethodOf(init: RequestInit | undefined): string | undefined {
   }
 }
 
+await test('close settles promptly when the transport is already lost at mount handoff', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-handoff-close-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  let operator: OperatorConnection | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    await manager.close()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const target: OperatorTarget = {
+      origin: stringField(record, 'origin'),
+      launchToken: stringField(record, 'launchToken'),
+    }
+    const mounted = Promise.withResolvers<void>()
+    let closeTask: Promise<void> | undefined
+    operator = new OperatorConnection({
+      connectTimeoutMs: 5_000,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 5_000,
+      onWebSocket: (socket) => {
+        ;(socket as unknown as WebSocket).terminate()
+        closeTask ??= operator?.close()
+        mounted.resolve()
+      },
+    })
+    const started = Date.now()
+    const mounting = operator.setHost(target, 5_000)
+    await mounted.promise
+    assert.ok(closeTask !== undefined)
+    await closeTask
+    await Promise.allSettled([mounting])
+    assert.ok(Date.now() - started < 2_000, 'close must not wait for the lost handoff generation timeout')
+    await assert.rejects(operator.waitReady(30_000), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'OPERATOR_UNAVAILABLE')
+      return true
+    })
+  } finally {
+    await operator?.close()
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
 await test('host ping uses one deadline across probe, attach, readiness, and RPC', { timeout: 180_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-ping-deadline-'))
   const workspace = join(root, 'workspace')

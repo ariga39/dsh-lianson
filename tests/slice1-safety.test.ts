@@ -565,6 +565,44 @@ await test('spawn failure is reported and leaves no launch ownership behind', as
   }
 })
 
+await test('expiry after the launching record but before spawn leaves no spawn or residue', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-prespawn-expiry-'))
+  try {
+    const stateDir = join(root, 'state')
+    const recordPath = join(stateDir, 'host.json')
+    let spawnCalls = 0
+    const spawnProcess = (() => {
+      spawnCalls += 1
+      throw new Error('the deadline-expired launch must not spawn')
+    }) as unknown as typeof spawn
+    const deadline = {
+      end: 0,
+      remaining: () => 1_000,
+      expired: () => existsSync(recordPath),
+    }
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      startTimeoutMs: 5_000,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      spawnProcess,
+    })
+    await assert.rejects(manager.start({}, deadline), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'IPC_TIMEOUT')
+      return true
+    })
+    assert.equal(spawnCalls, 0, 'no child may be spawned after the pre-spawn deadline check')
+    assert.equal(existsSync(recordPath), false)
+    assert.equal(existsSync(join(stateDir, 'host-observer.patch.json')), false)
+    assert.equal(existsSync(join(stateDir, 'host-ready.json')), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 await test('a real child exiting before readiness fails promptly and cleans ownership', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-early-exit-'))
   let child: ChildProcess | undefined

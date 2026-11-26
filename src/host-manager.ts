@@ -202,14 +202,14 @@ export class HostManager {
       const record = await this.readRecord()
       if (record === undefined) {
         assertDeadlineLive(deadline)
-        return await this.launchAndAttach(launch)
+        return await this.launchAndAttach(launch, deadline)
       }
       if (record.state === 'launching') {
         await this.recoverLaunching(record, deadline)
         // A recovery may have consumed the whole budget; a new replacement
         // spawn needs its own pre-commit check.
         assertDeadlineLive(deadline)
-        return await this.launchAndAttach(launch)
+        return await this.launchAndAttach(launch, deadline)
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
       if (identity.kind === 'unverified') {
@@ -221,7 +221,7 @@ export class HostManager {
         assertDeadlineLive(deadline)
         await this.cleanupFiles()
         assertDeadlineLive(deadline)
-        return await this.launchAndAttach(launch)
+        return await this.launchAndAttach(launch, deadline)
       }
       assertDeadlineLive(deadline)
       if (!await probeLoopback(record.origin)) {
@@ -400,8 +400,8 @@ export class HostManager {
     await this.closeOperator()
   }
 
-  private async launchAndAttach(launch: EffectiveLaunchOptions): Promise<HostSummary> {
-    const record = await this.launch(launch)
+  private async launchAndAttach(launch: EffectiveLaunchOptions, deadline?: Deadline): Promise<HostSummary> {
+    const record = await this.launch(launch, deadline)
     // Readiness is committed: operator attachment is recoverable background
     // work, never physical launch rollback. A temporary /connect outage must
     // leave the verified Host and its ready record intact.
@@ -409,7 +409,7 @@ export class HostManager {
     return summaryOf(record)
   }
 
-  private async launch(launch: EffectiveLaunchOptions): Promise<ReadyHostRecord> {
+  private async launch(launch: EffectiveLaunchOptions, deadline?: Deadline): Promise<ReadyHostRecord> {
     await ensurePrivateDirectory(this.paths.stateDir)
     // The one-shot path can have been tampered into a directory; always remove
     // whatever occupies it before the observer writes its real file.
@@ -442,6 +442,9 @@ export class HostManager {
     let spawnError: Error | undefined
     let childExit: { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined
     try {
+      // Commit point adjacency: every prelaunch write above has completed.
+      // There is deliberately no await between this check and spawnProcess.
+      assertDeadlineLive(deadline)
       child = this.spawnProcess(process.execPath, args, {
         cwd: launch.cwd,
         env: this.hostEnvironment(launchId),
