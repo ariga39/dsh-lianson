@@ -1,6 +1,6 @@
 /** Conflict-safe delegation session creation and idempotent prompt submission. */
 
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { realpath, stat } from 'node:fs/promises'
 import { LiaisonError, remoteCodeOf } from './errors.mjs'
 import { hostTempWritableRoots, pathsOverlap } from './host-writable-roots.mjs'
@@ -200,12 +200,22 @@ export class SessionCommands {
    * @param {{ delegationId: string, content: string, requestId?: string }} request - target and prompt.
    * @returns acceptance evidence, never a completion claim.
    */
-  async submitPrompt({ delegationId, content, requestId, ipcRequestId, ipcFingerprint }) {
+  async submitPrompt({ delegationId, content, requestId }) {
     const record = await this.#requireReady(delegationId)
     this.#registry.assertWritable()
     if (typeof content !== 'string' || content.trim() === '') throw new TypeError('content is required')
     const stableRequestId = requestId ?? `request-${randomUUID()}`
+    const contentHash = createHash('sha256').update(content).digest('hex')
     const before = await this.#adapter.sessionState({ sessionId: record.sessionId })
+    const prompt = await this.#registry.beginPrompt({
+      delegationId,
+      sessionId: record.sessionId,
+      requestId: stableRequestId,
+      contentHash,
+      beforeCursor: before.cursor,
+    })
+    if (prompt.status === 'accepted') return prompt.response
+
     const accepted = await this.#adapter.prompt({
       requestId: stableRequestId,
       sessionId: record.sessionId,
@@ -224,12 +234,14 @@ export class SessionCommands {
       sessionId: record.sessionId,
       requestId: stableRequestId,
       accepted: true,
-      beforeCursor: before.cursor,
+      beforeCursor: prompt.beforeCursor,
       completed: false,
     }
-    if (ipcRequestId !== undefined && ipcFingerprint !== undefined) {
-      await this.#registry.recordPromptReplay(ipcRequestId, ipcFingerprint, result)
-    }
+    await this.#registry.acceptPrompt({
+      sessionId: record.sessionId,
+      requestId: stableRequestId,
+      response: result,
+    })
     return result
   }
 

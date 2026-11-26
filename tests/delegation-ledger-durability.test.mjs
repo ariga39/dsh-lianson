@@ -49,6 +49,28 @@ test('delegation ledger publishes memory only after the durable write', { timeou
   assert.equal((await restartedAfter.get('durable')).state, 'ready')
 })
 
+test('close fences new writes, drains queued writes, and releases ownership', { timeout: 30_000 }, async t => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-ledger-close-'))
+  t.after(async () => { await rm(root, { recursive: true, force: true }) })
+  const filePath = join(root, 'state', 'delegations.json')
+  const writer = new DelegationRegistry({ filePath })
+  assert.equal(await writer.acquireWriter(), true)
+
+  const draining = writer.beginCreate(input('draining', join(root, 'workspace')))
+  const closing = writer.close()
+  const late = writer.beginCreate(input('late', join(root, 'workspace')))
+  await draining
+  await assert.rejects(late, error => {
+    assert.equal(error?.code, 'delegation/ledger-closing')
+    return true
+  })
+  await closing
+  const restarted = new DelegationRegistry({ filePath })
+  assert.equal((await restarted.get('draining')).state, 'creating')
+  assert.equal(await restarted.acquireWriter(), true, 'the lifetime lock is free after close drains')
+  await restarted.close()
+})
+
 test('one ledger file has one lifetime writer and read-only readers stay fresh', { timeout: 30_000 }, async t => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-ledger-writer-'))
   t.after(async () => { await rm(root, { recursive: true, force: true }) })
@@ -72,9 +94,20 @@ test('one ledger file has one lifetime writer and read-only readers stay fresh',
       return true
     },
   )
+  await assert.rejects(
+    reader.ensureWriter({ timeoutMs: 50 }),
+    error => {
+      assert.equal(error?.code, 'delegation/ledger-readonly')
+      return true
+    },
+  )
 
-  await writer.close()
-  assert.equal(await reader.acquireWriter(), true, 'ownership can move after the writer exits')
+  const closing = new Promise(resolve => {
+    setTimeout(() => { writer.close().then(resolve) }, 100)
+  })
+  assert.equal(await reader.ensureWriter({ timeoutMs: 2_000 }), true,
+    'a live reader takes ownership when the previous writer exits')
+  await closing
   await reader.beginCreate(input('second', cwd))
   await reader.markReady('second')
   const restarted = new DelegationRegistry({ filePath })

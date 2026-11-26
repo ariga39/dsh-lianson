@@ -28,6 +28,7 @@ export class DelegationService {
   /** Create or resume one delegation session. */
   async create(params) {
     try {
+      await this.#ensureWritable()
       return await this.#commands.createDelegation(params)
     } catch (error) {
       if (error?.name === 'TypeError') throw badRequest(error)
@@ -83,6 +84,7 @@ export class DelegationService {
   /** Submit one idempotent prompt. */
   async prompt(params) {
     try {
+      await this.#ensureWritable()
       return await this.#commands.submitPrompt(params)
     } catch (error) {
       if (error?.name === 'TypeError') throw badRequest(error)
@@ -90,28 +92,14 @@ export class DelegationService {
     }
   }
 
-  /**
-   * Replay one durable accepted prompt by IPC request id.
-   * @param {string} requestId - caller IPC request id.
-   * @param {string} fingerprint - canonical request fingerprint.
-   * @returns the original accepted result, or undefined.
-   */
-  async promptReplay(requestId, fingerprint) {
-    const entry = await this.#registry.getPromptReplay(requestId)
-    if (entry === undefined) return undefined
-    if (entry.fingerprint !== fingerprint) {
-      throw new LiaisonError(
-        'IPC_ID_CONFLICT',
-        `Request id "${requestId}" was already used with different command parameters`,
-        { requestId },
-      )
-    }
-    return entry.response
-  }
-
   /** Verify one prompt's persisted request-header model. */
   async verifyModel(params) {
+    await this.#ensureWritable()
     return this.#commands.verifyRequestModel(params)
+  }
+
+  async #ensureWritable() {
+    await this.#registry.ensureWriter()
   }
 
   /**

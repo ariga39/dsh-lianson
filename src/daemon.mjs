@@ -192,20 +192,10 @@ async function dispatch(request) {
       return { envelope: success(command, await delegations.list(), id) }
     }
     if (key === 'delegation.prompt') {
-      const ipcRequestId = typeof id === 'string' && id !== '' ? id : undefined
-      const ipcFingerprint = requestFingerprint(command, params)
-      if (ipcRequestId !== undefined) {
-        const replay = await delegations.promptReplay(ipcRequestId, ipcFingerprint)
-        if (replay !== undefined) return { envelope: success(command, replay, id) }
-      }
       await requireDelegationHost()
       const requestId = stablePromptRequestId(params.requestId, id)
       const promptParams = requestId === undefined ? params : { ...params, requestId }
-      const result = await delegations.prompt({
-        ...promptParams,
-        ...(ipcRequestId === undefined ? {} : { ipcRequestId, ipcFingerprint }),
-      })
-      return { envelope: success(command, result, id) }
+      return { envelope: success(command, await delegations.prompt(promptParams), id) }
     }
     if (key === 'delegation.verifyModel') {
       await requireDelegationHost()

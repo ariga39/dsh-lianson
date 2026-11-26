@@ -19,6 +19,10 @@ function cloneMap(map) {
   return new Map([...map.entries()].map(([key, value]) => [key, clone(value)]))
 }
 
+function promptKey(sessionId, requestId) {
+  return `${sessionId}\u0000${requestId}`
+}
+
 function normalizeModel(model) {
   return {
     provider: model.provider,
@@ -34,7 +38,7 @@ function sameModel(left, right) {
 }
 
 function emptyLedger() {
-  return { version: 1, delegations: [], createReplays: [], promptReplays: [] }
+  return { version: 1, delegations: [], createReplays: [], promptRequests: [] }
 }
 
 /**
@@ -48,11 +52,13 @@ export class DelegationRegistry {
   #filePath
   #records = new Map()
   #createReplays = new Map()
-  #promptReplays = new Map()
+  #promptRequests = new Map()
   #loadPromise
   #tail = Promise.resolve()
   #readOnly = false
   #writerLock = null
+  #closing = false
+  #closePromise
 
   /** @param {{ filePath: string }} options - absolute ledger path. */
   constructor({ filePath }) {
@@ -77,6 +83,11 @@ export class DelegationRegistry {
    * @returns true when this registry became the writer.
    */
   async acquireWriter() {
+    if (this.#closing) {
+      throw new LiaisonError('delegation/ledger-closing', 'delegation ledger is shutting down', {
+        filePath: this.#filePath,
+      })
+    }
     if (this.#writerLock !== null) return true
     await mkdir(dirname(this.#filePath), { recursive: true, mode: 0o700 })
     let release
@@ -97,11 +108,45 @@ export class DelegationRegistry {
     return true
   }
 
-  /** Release the lifetime writer lock. Process exit releases it as well. */
+  /** Release the lifetime writer lock after in-flight writes settle. */
   async close() {
-    const release = this.#writerLock
-    this.#writerLock = null
-    await release?.()
+    if (this.#closePromise !== undefined) return this.#closePromise
+    this.#closing = true
+    const tail = this.#tail
+    this.#closePromise = (async () => {
+      await tail.catch(() => {})
+      const release = this.#writerLock
+      this.#writerLock = null
+      await release?.()
+    })()
+    return this.#closePromise
+  }
+
+  /**
+   * Become the writer if ownership is available. A live read-only daemon uses
+   * this bounded retry after another runtime releases the ledger.
+   * @param {{ timeoutMs?: number }} [options]
+   * @returns true when writes are available.
+   */
+  async ensureWriter({ timeoutMs = 2_000 } = {}) {
+    if (this.#closing) {
+      throw new LiaisonError('delegation/ledger-closing', 'delegation ledger is shutting down', {
+        filePath: this.#filePath,
+      })
+    }
+    if (this.#writerLock !== null) return true
+    const deadline = Date.now() + timeoutMs
+    while (true) {
+      if (await this.acquireWriter()) return true
+      if (Date.now() >= deadline) {
+        throw new LiaisonError(
+          'delegation/ledger-readonly',
+          `delegation ledger "${this.#filePath}" is owned by another writer`,
+          { filePath: this.#filePath },
+        )
+      }
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
   }
 
   /** Fail if this process does not own the durable ledger writer lock. */
@@ -156,9 +201,9 @@ export class DelegationRegistry {
    * @returns the persisted record.
    */
   async beginCreate(input) {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
       const now = new Date().toISOString()
       const expectedModel = normalizeModel(input.expectedModel)
@@ -256,9 +301,9 @@ export class DelegationRegistry {
    * @returns the persisted record.
    */
   async markConflict(delegationId, conflict) {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
       const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') return clone(record)
@@ -284,9 +329,9 @@ export class DelegationRegistry {
    * @returns the persisted record.
    */
   async markAttachFailed(delegationId, failure) {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
       const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') return clone(record)
@@ -332,9 +377,9 @@ export class DelegationRegistry {
    * @returns the persisted record.
    */
   async markReady(delegationId, replay = {}) {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
       const record = this.#require(draft.records, delegationId)
       if (record.state === 'ready') {
@@ -379,38 +424,91 @@ export class DelegationRegistry {
   }
 
   /**
-   * Read one durable prompt acceptance by caller IPC request id.
-   * @param {string} requestId - the original IPC request id.
-   * @returns `{ requestId, fingerprint, response }` or undefined.
+   * Read one durable prompt request, keyed by the bound session and stable Host
+   * request id so a fresh IPC id still finds the original acceptance.
+   * @param {string} sessionId - bound Host session id.
+   * @param {string} requestId - stable Host prompt request id.
+   * @returns the request record or undefined.
    */
-  async getPromptReplay(requestId) {
+  async getPromptRequest(sessionId, requestId) {
     await this.#load()
-    const entry = this.#promptReplays.get(requestId)
+    const entry = this.#promptRequests.get(promptKey(sessionId, requestId))
     return entry === undefined ? undefined : clone(entry)
   }
 
   /**
-   * Persist one accepted prompt result so a daemon restart can return its
-   * original beforeCursor instead of a post-turn cursor.
-   * @param {string} requestId - caller IPC request id.
-   * @param {string} fingerprint - canonical request fingerprint.
-   * @param {object} response - accepted prompt result.
+   * Durably record the original cursor and content fingerprint before sending a
+   * prompt. Reusing the Host request id with different content is rejected.
+   * @param {{ delegationId: string, sessionId: string, requestId: string, contentHash: string, beforeCursor: number }} input
+   * @returns the existing or newly persisted request record.
    */
-  async recordPromptReplay(requestId, fingerprint, response) {
-    return this.#enqueue(async () => {
+  async beginPrompt(input) {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
-      draft.promptReplays.set(requestId, {
-        requestId,
-        fingerprint,
-        response: clone(response),
-      })
-      while (draft.promptReplays.size > 4_096) {
-        draft.promptReplays.delete(draft.promptReplays.keys().next().value)
+      const key = promptKey(input.sessionId, input.requestId)
+      const existing = draft.promptRequests.get(key)
+      if (existing !== undefined) {
+        if (existing.contentHash !== input.contentHash || existing.delegationId !== input.delegationId) {
+          throw new LiaisonError(
+            'delegation/prompt-conflict',
+            `prompt request "${input.requestId}" was already used with different content`,
+            {
+              delegationId: input.delegationId,
+              sessionId: input.sessionId,
+              requestId: input.requestId,
+            },
+          )
+        }
+        return clone(existing)
+      }
+      const now = new Date().toISOString()
+      const record = {
+        delegationId: input.delegationId,
+        sessionId: input.sessionId,
+        requestId: input.requestId,
+        contentHash: input.contentHash,
+        beforeCursor: input.beforeCursor,
+        status: 'pending',
+        createdAt: now,
+        updatedAt: now,
+      }
+      draft.promptRequests.set(key, record)
+      while (draft.promptRequests.size > 4_096) {
+        draft.promptRequests.delete(draft.promptRequests.keys().next().value)
       }
       await this.#commit(draft)
-      return clone(response)
+      return clone(record)
+    })
+  }
+
+  /**
+   * Persist the accepted prompt result while preserving the original cursor.
+   * @param {{ sessionId: string, requestId: string, response: object }} input
+   * @returns the accepted request record.
+   */
+  async acceptPrompt(input) {
+    return this.#enqueue(async admitted => {
+      await this.#load()
+      this.#assertWritableOperation(admitted)
+      const draft = this.#draft()
+      const key = promptKey(input.sessionId, input.requestId)
+      const record = draft.promptRequests.get(key)
+      if (record === undefined) {
+        throw new LiaisonError(
+          'delegation/prompt-not-found',
+          `prompt request "${input.requestId}" is not in the ledger`,
+          { sessionId: input.sessionId, requestId: input.requestId },
+        )
+      }
+      if (record.status !== 'accepted') {
+        record.status = 'accepted'
+        record.response = clone(input.response)
+        record.updatedAt = new Date().toISOString()
+        await this.#commit(draft)
+      }
+      return clone(record)
     })
   }
 
@@ -421,9 +519,9 @@ export class DelegationRegistry {
    * @returns the persisted record.
    */
   async setVerifiedModel(delegationId, model) {
-    return this.#enqueue(async () => {
+    return this.#enqueue(async admitted => {
       await this.#load()
-      this.#assertWritable()
+      this.#assertWritableOperation(admitted)
       const draft = this.#draft()
       const record = this.#require(draft.records, delegationId)
       record.verifiedModel = normalizeModel(model)
@@ -437,11 +535,31 @@ export class DelegationRegistry {
     return {
       records: cloneMap(this.#records),
       createReplays: cloneMap(this.#createReplays),
-      promptReplays: cloneMap(this.#promptReplays),
+      promptRequests: cloneMap(this.#promptRequests),
+    }
+  }
+
+  #assertWritableOperation(admitted) {
+    if (!admitted) {
+      throw new LiaisonError('delegation/ledger-closing', `delegation ledger "${this.#filePath}" is shutting down`, {
+        filePath: this.#filePath,
+      })
+    }
+    if (this.#readOnly) {
+      throw new LiaisonError(
+        'delegation/ledger-readonly',
+        `delegation ledger "${this.#filePath}" is owned by another writer`,
+        { filePath: this.#filePath },
+      )
     }
   }
 
   #assertWritable() {
+    if (this.#closing) {
+      throw new LiaisonError('delegation/ledger-closing', `delegation ledger "${this.#filePath}" is shutting down`, {
+        filePath: this.#filePath,
+      })
+    }
     if (!this.#readOnly) return
     throw new LiaisonError(
       'delegation/ledger-readonly',
@@ -451,11 +569,17 @@ export class DelegationRegistry {
   }
 
   async #commit(draft) {
-    this.#assertWritable()
-    await this.#persist(draft.records, draft.createReplays, draft.promptReplays)
+    if (this.#readOnly) {
+      throw new LiaisonError(
+        'delegation/ledger-readonly',
+        `delegation ledger "${this.#filePath}" is owned by another writer`,
+        { filePath: this.#filePath },
+      )
+    }
+    await this.#persist(draft.records, draft.createReplays, draft.promptRequests)
     this.#records = draft.records
     this.#createReplays = draft.createReplays
-    this.#promptReplays = draft.promptReplays
+    this.#promptRequests = draft.promptRequests
   }
 
   #pruneCreateReplays(replays) {
@@ -510,7 +634,9 @@ export class DelegationRegistry {
   }
 
   #enqueue(operation) {
-    const running = this.#tail.then(operation, operation)
+    const admitted = !this.#closing
+    const run = () => operation(admitted)
+    const running = this.#tail.then(run, run)
     this.#tail = running.then(() => undefined, () => undefined)
     return running
   }
@@ -527,7 +653,7 @@ export class DelegationRegistry {
   async #readInto() {
     const records = new Map()
     const createReplays = new Map()
-    const promptReplays = new Map()
+    const promptRequests = new Map()
     let text
     try {
       text = await readFile(this.#filePath, 'utf8')
@@ -535,7 +661,7 @@ export class DelegationRegistry {
       if (error?.code !== 'ENOENT') throw error
       this.#records = records
       this.#createReplays = createReplays
-      this.#promptReplays = promptReplays
+      this.#promptRequests = promptRequests
       return
     }
     if (text.trim() !== '') {
@@ -564,20 +690,20 @@ export class DelegationRegistry {
           createReplays.set(entry.requestId, entry)
         }
       }
-      if (Array.isArray(parsed.promptReplays)) {
-        for (const entry of parsed.promptReplays) {
-          if (typeof entry?.requestId !== 'string' || typeof entry?.fingerprint !== 'string') continue
-          if (entry.response === null || typeof entry.response !== 'object') continue
-          promptReplays.set(entry.requestId, entry)
+      if (Array.isArray(parsed.promptRequests)) {
+        for (const entry of parsed.promptRequests) {
+          if (typeof entry?.sessionId !== 'string' || typeof entry?.requestId !== 'string') continue
+          if (typeof entry?.contentHash !== 'string') continue
+          promptRequests.set(promptKey(entry.sessionId, entry.requestId), entry)
         }
       }
     }
     this.#records = records
     this.#createReplays = createReplays
-    this.#promptReplays = promptReplays
+    this.#promptRequests = promptRequests
   }
 
-  async #persist(records, createReplays, promptReplays) {
+  async #persist(records, createReplays, promptRequests) {
     const directory = dirname(this.#filePath)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const temporary = `${this.#filePath}.${process.pid}.${randomUUID()}.tmp`
@@ -585,7 +711,7 @@ export class DelegationRegistry {
       ...emptyLedger(),
       delegations: [...records.values()],
       createReplays: [...createReplays.values()],
-      promptReplays: [...promptReplays.values()],
+      promptRequests: [...promptRequests.values()],
     }, null, 2)}\n`
     let handle
     try {

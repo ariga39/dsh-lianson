@@ -306,13 +306,13 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     }))
     const promptRequest = {
       command: 'delegation.prompt',
-      params: { delegationId: 'restart-prompt', content: 'RESTART_PROMPT' },
-      id: 'restart-prompt-ipc',
+      params: { delegationId: 'restart-prompt', content: 'RESTART_PROMPT', requestId: 'host-stable-prompt' },
+      id: 'restart-prompt-ipc-a',
       timeoutMs: 60_000,
     }
     const firstPrompt = await call(join(stateDir, 'daemon.sock'), promptRequest)
     assert.equal(firstPrompt.ok, true, JSON.stringify(firstPrompt))
-    const derivedRequestId = 'request-restart-prompt-ipc'
+    const derivedRequestId = 'host-stable-prompt'
     assert.equal(firstPrompt.data.requestId, derivedRequestId)
     const originalBeforeCursor = firstPrompt.data.beforeCursor
     await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
@@ -330,13 +330,24 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     await waitForExit(restartedStatus.data.daemonPid)
     await cli(['host', 'status'])
 
-    const secondPrompt = await call(join(stateDir, 'daemon.sock'), promptRequest)
+    const secondPrompt = await call(join(stateDir, 'daemon.sock'), {
+      ...promptRequest,
+      id: 'restart-prompt-ipc-b',
+    })
     assert.equal(secondPrompt.ok, true, JSON.stringify(secondPrompt))
     assert.equal(secondPrompt.data.requestId, derivedRequestId,
-      'a missing prompt requestId derives stably from the IPC id')
+      'the stable Host request id survives a fresh IPC id')
     assert.equal(secondPrompt.data.beforeCursor, originalBeforeCursor,
       'restart replay must not advance beforeCursor past the original request')
     await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
+
+    const changedContent = await call(join(stateDir, 'daemon.sock'), {
+      ...promptRequest,
+      id: 'restart-prompt-ipc-c',
+      params: { ...promptRequest.params, content: 'CHANGED CONTENT' },
+    })
+    assert.equal(changedContent.ok, false)
+    assert.equal(changedContent.error?.code, 'delegation/prompt-conflict')
     const events = eventsOf(await adapter.sessionEvents({
       address: { kind: 'session', sessionId: promptDelegation.data.sessionId },
       maxMessages: 500,

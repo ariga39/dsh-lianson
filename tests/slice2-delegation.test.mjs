@@ -572,6 +572,53 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
       && JSON.stringify(event.data).includes(FINAL)))
   })
 
+  await t.test('prompt acceptance loss before ledger success replays the original cursor', async () => {
+    const { registry, commands } = newCommands('prompt-loss')
+    const params = input('prompt-loss')
+    const created = await commands.createDelegation(params)
+    const requestId = `request-${randomUUID()}`
+    const content = 'PROMPT_ACCEPTED_BEFORE_LEDGER_FAILURE'
+
+    let failAccept = true
+    const faultedRegistry = {
+      get: id => registry.get(id),
+      assertWritable: () => registry.assertWritable(),
+      beginPrompt: input => registry.beginPrompt(input),
+      acceptPrompt: async input => {
+        if (failAccept) {
+          failAccept = false
+          throw new Error('simulated crash after Host accepted prompt')
+        }
+        return registry.acceptPrompt(input)
+      },
+    }
+    const faulted = new SessionCommands({ registry: faultedRegistry, adapter })
+    await assert.rejects(
+      faulted.submitPrompt({ delegationId: params.delegationId, content, requestId }),
+      /simulated crash/u,
+    )
+    const pending = await registry.getPromptRequest(created.sessionId, requestId)
+    assert.equal(pending.status, 'pending')
+    assert.equal(typeof pending.beforeCursor, 'number')
+
+    await assert.rejects(
+      commands.submitPrompt({
+        delegationId: params.delegationId,
+        content: 'DIFFERENT_CONTENT',
+        requestId,
+      }),
+      errorCode('delegation/prompt-conflict'),
+    )
+
+    const retried = await commands.submitPrompt({ delegationId: params.delegationId, content, requestId })
+    assert.equal(retried.accepted, true)
+    assert.equal(retried.beforeCursor, pending.beforeCursor,
+      'retry returns the cursor recorded before the original send')
+    const events = await waitForRequest(adapter, created.sessionId, requestId)
+    assert.equal(events.filter(event =>
+      event.type === 'user/message' && event.data.source?.rpcId === requestId).length, 1)
+  })
+
   await t.test('two linked worktrees stay write-isolated without widening sandbox roots', async () => {
     // Workspace-write deliberately treats /tmp as writable. Put the linked
     // worktrees outside the platform temp area so the fence is meaningful.
