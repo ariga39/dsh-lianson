@@ -27,7 +27,6 @@ import {
   type CreateDelegationCommand,
   type HostOperatorAccess,
   type SessionCommandsRemote,
-  type VerifiedHostContext,
 } from '../src/session-commands.ts'
 import {
   DelegationError,
@@ -245,7 +244,16 @@ function fakeHost(): FakeHost {
   return Object.assign(state, { remote })
 }
 
-function accessFor(host: FakeHost, context: VerifiedHostContext): HostOperatorAccess {
+interface MutableHostContext {
+  stateDir: string
+  dshHome: string
+  cwd: string
+  hostPid: number
+  origin: string
+  port: number
+}
+
+function accessFor(host: FakeHost, context: MutableHostContext): HostOperatorAccess {
   return {
     async hostContext() {
       return context
@@ -265,6 +273,7 @@ interface Fixture {
   readonly registry: DelegationRegistry
   readonly commands: SessionCommands
   readonly host: FakeHost
+  readonly context: MutableHostContext
 }
 
 async function fixture(label: string, configure?: (host: FakeHost) => void): Promise<Fixture> {
@@ -275,7 +284,7 @@ async function fixture(label: string, configure?: (host: FakeHost) => void): Pro
   configure?.(host)
   const ledgerFile = join(root, 'ledger', 'delegations.json')
   const registry = new DelegationRegistry({ ledgerFile, lockWaitMs: 0 })
-  const context: VerifiedHostContext = {
+  const context: MutableHostContext = {
     stateDir: join(root, 'state'),
     dshHome: join(root, 'dsh-home'),
     cwd: root,
@@ -288,7 +297,7 @@ async function fixture(label: string, configure?: (host: FakeHost) => void): Pro
     access: accessFor(host, context),
     ledgerDir: join(root, 'ledger'),
   })
-  return { root, work, ledgerFile, registry, commands, host }
+  return { root, work, ledgerFile, registry, commands, host, context }
 }
 
 async function cleanup(item: Fixture): Promise<void> {
@@ -597,6 +606,106 @@ await test('verify-model rejects any divergent effective configuration even when
       item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-all-configs' }),
       'DELEGATION_MODEL_MISMATCH',
     )
+  } finally {
+    await cleanup(item)
+  }
+})
+
+
+await test('ready replay and prompt dispatch revalidate the recorded cwd against current Host state', async () => {
+  const item = await fixture('revalidate-recorded-cwd')
+  try {
+    await item.commands.create(createCommand(item))
+    const sessionCreates = item.host.requestedSessionIds.length
+
+    item.context.stateDir = join(item.work, 'state')
+    await expectCode(item.commands.create(createCommand(item)), 'WORKSPACE_STATE_OVERLAP')
+    assert.equal(item.host.requestedSessionIds.length, sessionCreates)
+    assert.equal((await item.registry.get('del-1')).state, 'ready')
+
+    item.context.stateDir = join(item.root, 'state')
+    item.context.dshHome = join(item.work, 'dsh-home')
+    await expectCode(item.commands.create(createCommand(item)), 'WORKSPACE_STATE_OVERLAP')
+    assert.equal(item.host.requestedSessionIds.length, sessionCreates)
+
+    item.context.dshHome = join(item.root, 'dsh-home')
+    const ledgerInsideWork = new SessionCommands({
+      registry: item.registry,
+      access: accessFor(item.host, item.context),
+      ledgerDir: join(item.work, 'ledger-inside'),
+    })
+    await expectCode(ledgerInsideWork.create(createCommand(item)), 'WORKSPACE_STATE_OVERLAP')
+    assert.equal(item.host.requestedSessionIds.length, sessionCreates)
+
+    item.context.stateDir = join(item.work, 'state')
+    const promptsBefore = item.host.promptCalls
+    await expectCode(
+      item.commands.prompt({ delegationId: 'del-1', requestId: 'unsafe-new', content: 'unsafe new' }),
+      'WORKSPACE_STATE_OVERLAP',
+    )
+    assert.equal(item.host.promptCalls, promptsBefore)
+    assert.equal(await item.registry.promptReceipt('del-1', 'unsafe-new'), undefined)
+
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'unsafe-pending',
+      contentHash: contentHash('unsafe pending'),
+      beforeCursor: 0,
+    })
+    await expectCode(
+      item.commands.prompt({ delegationId: 'del-1', requestId: 'unsafe-pending', content: 'unsafe pending' }),
+      'WORKSPACE_STATE_OVERLAP',
+    )
+    assert.equal(item.host.promptCalls, promptsBefore)
+    assert.equal((await item.registry.promptReceipt('del-1', 'unsafe-pending'))?.accepted, false)
+
+    item.context.stateDir = join(item.root, 'state')
+    const replay = await item.commands.create(createCommand(item))
+    assert.equal(replay.replayed, true)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('verify-model checks a just-started divergent streaming header but never a later turn', async () => {
+  const item = await fixture('verify-streaming-header')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      requestHeader(1, 'provider-a', 'model-a'),
+      userMessage(2, 'request-streaming'),
+      wireEvent(3, 'assistant/message', { content: [{ type: 'text', text: 'first request' }] }),
+      wireEvent(4, 'step/start', { turn: 1, step: 2 }),
+      requestHeader(5, 'provider-b', 'model-b'),
+    ])
+    await expectCode(
+      item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-streaming' }),
+      'DELEGATION_MODEL_MISMATCH',
+    )
+
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      requestHeader(1, 'provider-b', 'model-b'),
+      userMessage(2, 'request-before'),
+      wireEvent(3, 'assistant/message', { content: [{ type: 'text', text: 'before' }] }),
+      wireEvent(4, 'turn/end', { reason: { kind: 'completed' } }),
+      wireEvent(5, 'turn/start', { turn: 2 }),
+      requestHeader(6, 'provider-a', 'model-a'),
+      userMessage(7, 'request-selected'),
+      wireEvent(8, 'assistant/message', { content: [{ type: 'text', text: 'selected' }] }),
+      wireEvent(9, 'turn/end', { reason: { kind: 'completed' } }),
+      wireEvent(10, 'turn/start', { turn: 3 }),
+      requestHeader(11, 'provider-b', 'model-b'),
+      userMessage(12, 'request-after'),
+      wireEvent(13, 'assistant/message', { content: [{ type: 'text', text: 'after' }] }),
+      wireEvent(14, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+    const selected = await item.commands.verifyModel({
+      delegationId: 'del-1',
+      requestId: 'request-selected',
+    })
+    assert.equal(selected.turnSeq, 5)
+    assert.deepEqual(selected.observedModel, { provider: 'provider-a', model: 'model-a' })
   } finally {
     await cleanup(item)
   }

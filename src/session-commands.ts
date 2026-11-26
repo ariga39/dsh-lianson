@@ -183,6 +183,7 @@ export class SessionCommands {
       assertDeadlineLive(command.deadline)
       const existing = await this.lookupCreate(requestedId, command.delegationId, fingerprint, command.ipcRequestId)
       if (existing !== undefined && existing.state === 'ready') {
+        await this.assertRecordedWorkspace(existing, command.deadline)
         return { delegation: existing, replayed: true }
       }
 
@@ -345,9 +346,11 @@ export class SessionCommands {
           )
         }
         if (existing.accepted) return promptResult(record, existing, true)
+        await this.assertRecordedWorkspace(record, command.deadline)
         return await this.resolvePendingPrompt(record, requestId, command.content, existing, command.deadline)
       }
 
+      await this.assertRecordedWorkspace(record, command.deadline)
       const state = await this.callRemote(
         (remote, signal) => remote.session.state({ sessionId: brandString<SessionId>(record.sessionId) }, signal),
         'DELEGATION_SESSION_CONFLICT',
@@ -410,20 +413,24 @@ export class SessionCommands {
     }
 
     const headers = events.filter(event => event.type === 'request/header')
-    const effective: ModelSelection[] = []
-    for (const event of evidence) {
-      const header = [...headers].reverse().find(candidate => candidate.seq <= event.seq)
-      const config = header === undefined ? undefined : headerConfig(header)
-      if (config === undefined) {
-        throw new DelegationError(
-          'DELEGATION_MODEL_EVIDENCE_MISSING',
-          `turn at ${String(windowStart)} has no effective request header`,
-          { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
-        )
-      }
-      effective.push(config)
+    const inTurn = headers.filter(event => event.seq >= windowStart && event.seq <= windowEnd)
+    const firstInTurn = inTurn[0]?.seq
+    const inheritedIsEffective = inTurn.length === 0
+      || evidence.some(event => firstInTurn !== undefined && event.seq < firstInTurn)
+    const inherited = inheritedIsEffective
+      ? headers.filter(event => event.seq < windowStart).at(-1)
+      : undefined
+    const applicable = inherited === undefined ? inTurn : [inherited, ...inTurn]
+    const effective = applicable.map(headerConfig)
+    if (effective.length === 0 || effective.some(config => config === undefined)) {
+      throw new DelegationError(
+        'DELEGATION_MODEL_EVIDENCE_MISSING',
+        `turn at ${String(windowStart)} has no effective request header`,
+        { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
+      )
     }
-    const divergent = effective.find(config => !sameModel(config, record.expectedModel))
+    const configured = effective.filter((config): config is ModelSelection => config !== undefined)
+    const divergent = configured.find(config => !sameModel(config, record.expectedModel))
     if (divergent !== undefined) {
       throw new DelegationError(
         'DELEGATION_MODEL_MISMATCH',
@@ -439,7 +446,7 @@ export class SessionCommands {
       )
     }
 
-    const observed = effective.at(-1)
+    const observed = configured.at(-1)
     if (observed === undefined) {
       throw new DelegationError(
         'DELEGATION_MODEL_EVIDENCE_MISSING',
@@ -494,6 +501,17 @@ export class SessionCommands {
    */
   async list(): Promise<readonly DelegationRecord[]> {
     return await this.registry.list()
+  }
+
+  private async assertRecordedWorkspace(record: DelegationRecord, deadline?: Deadline): Promise<void> {
+    assertDeadlineLive(deadline)
+    const context = await this.host().hostContext(deadline)
+    await guardWorkspace({
+      cwd: record.cwd,
+      stateDir: context.stateDir,
+      dshHome: context.dshHome,
+      ledgerDir: this.ledgerDir,
+    })
   }
 
   private async ownWriter(deadline?: Deadline): Promise<void> {
