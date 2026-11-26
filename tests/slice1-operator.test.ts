@@ -332,6 +332,228 @@ await test('a never-answering first /connect times out, retries without a foregr
   }
 })
 
+await test('close promptly aborts a stalled foreground RPC and post-close waits', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-close-rpc-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  let operator: OperatorConnection | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    await manager.close()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const target: OperatorTarget = {
+      origin: stringField(record, 'origin'),
+      launchToken: stringField(record, 'launchToken'),
+    }
+    operator = new OperatorConnection({
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 10_000,
+    })
+    await operator.setHost(target, 10_000)
+    const started = Promise.withResolvers<void>()
+    let callError: unknown
+    const call = operator.withClient<never>(() => {
+      started.resolve()
+      return new Promise<never>(() => {})
+    }, 30_000).catch((error: unknown) => { callError = error })
+    await started.promise
+    const closeStarted = Date.now()
+    await operator.close()
+    assert.ok(Date.now() - closeStarted < 2_000, 'close must not wait for a stalled RPC')
+    await call
+    assert.ok(callError instanceof LiaisonError)
+    assert.equal(callError.code, 'OPERATOR_UNAVAILABLE')
+    const waitStarted = Date.now()
+    await assert.rejects(operator.waitReady(30_000), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'OPERATOR_UNAVAILABLE')
+      return true
+    })
+    assert.ok(Date.now() - waitStarted < 1_000, 'a post-close wait must reject immediately')
+  } finally {
+    await operator?.close()
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('an aborted initial upgrade re-exchanges without waiting for the generation timeout', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-upgrade-abort-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  let operator: OperatorConnection | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    await manager.close()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const target: OperatorTarget = {
+      origin: stringField(record, 'origin'),
+      launchToken: stringField(record, 'launchToken'),
+    }
+    const realFetch = globalThis.fetch.bind(globalThis)
+    let connects = 0
+    let sockets = 0
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      if (url.pathname === '/connect') connects += 1
+      return await realFetch(input, init)
+    }
+    operator = new OperatorConnection({
+      fetch: fetchImpl,
+      connectTimeoutMs: 5_000,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 5_000,
+      onWebSocket: (socket) => {
+        sockets += 1
+        if (sockets === 1) (socket as unknown as WebSocket).terminate()
+      },
+    })
+    await operator.setHost(target, 2_500)
+    assert.ok(connects >= 2, 'the aborted upgrade must trigger a fresh /connect')
+    assert.ok(sockets >= 2, 'the retry must open a new transport')
+    const rpc = await operator.withClient(remote => remote.session.list({}), 5_000)
+    assert.equal(rpc.ok, true)
+  } finally {
+    await operator?.close()
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('an authenticated 401 starts a fresh exchange without replaying the mutation', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-401-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  let operator: OperatorConnection | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    await manager.close()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const target: OperatorTarget = {
+      origin: stringField(record, 'origin'),
+      launchToken: stringField(record, 'launchToken'),
+    }
+    const realFetch = globalThis.fetch.bind(globalThis)
+    let connects = 0
+    let rejectRpc = true
+    let mutationAttempts = 0
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      if (url.pathname === '/connect') {
+        connects += 1
+        return await realFetch(input, init)
+      }
+      const method = requestMethodOf(init)
+      if (url.pathname.startsWith('/api/') && method?.includes('workspace') === true) {
+        mutationAttempts += 1
+        if (rejectRpc) {
+          rejectRpc = false
+          return new Response('unauthorized', { status: 401 })
+        }
+      }
+      return await realFetch(input, init)
+    }
+    operator = new OperatorConnection({
+      fetch: fetchImpl,
+      connectTimeoutMs: 5_000,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 10_000,
+    })
+    await operator.setHost(target, 10_000)
+    const mutation = operator
+      .withClient(remote => remote.workspace.create({ path: join(root, 'mutation') }), 5_000)
+      .then(
+        value => ({ kind: 'value' as const, value }),
+        (error: unknown) => ({ kind: 'error' as const, error }),
+      )
+    await waitFor(() => mutationAttempts >= 1, 5_000, 'authenticated mutation 401')
+    await waitFor(() => connects >= 2, 5_000, 'fresh exchange after authenticated 401')
+    const outcome = await mutation
+    if (outcome.kind === 'value') assert.equal(outcome.value.ok, false)
+    else assert.ok(outcome.error instanceof Error)
+    const read = await operator.withClient(remote => remote.session.list({}), 5_000)
+    assert.equal(read.ok, true)
+    assert.equal(mutationAttempts, 1, 'the rejected mutation must not be replayed')
+  } finally {
+    await operator?.close()
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+function requestMethodOf(init: RequestInit | undefined): string | undefined {
+  if (init === undefined) return undefined
+  if (typeof init.body !== 'string') return undefined
+  try {
+    const parsed: unknown = JSON.parse(init.body)
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return undefined
+    const method = (parsed as Record<string, unknown>).method
+    return typeof method === 'string' ? method : undefined
+  } catch {
+    return undefined
+  }
+}
+
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))
 }

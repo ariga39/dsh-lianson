@@ -272,7 +272,7 @@ export class HostManager {
     if (operator === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'no operator connection is available')
     const startedAt = Date.now()
     const result = await operator.withClient(
-      remote => remote.session.list({}),
+      (remote, signal) => remote.session.list({}, signal),
       15_000,
     )
     const value = unwrap(result)
@@ -316,6 +316,7 @@ export class HostManager {
           })
         }
         if (identity.kind !== 'alive-verified') {
+          await this.closeOperator()
           await this.cleanupFiles()
           return { hostPid: null, stoppedHost: false, stopReason: 'already-exited' }
         }
@@ -334,6 +335,7 @@ export class HostManager {
         })
       }
       if (identity.kind === 'dead-or-reused') {
+        await this.closeOperator()
         await this.cleanupFiles()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'already-exited' }
       }

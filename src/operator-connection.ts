@@ -70,8 +70,10 @@ export class OperatorConnection {
   private loopAbort: AbortController | undefined
   private loopDone: Promise<void> | undefined
   private closing = false
+  private closingTask: Promise<void> | undefined
   private lastError: Error | undefined
   private changes: Promise<void> = Promise.resolve()
+  private readonly foreground = new Set<AbortController>()
 
   /**
    * @param options - transport overrides and bound reconnect timing.
@@ -111,7 +113,8 @@ export class OperatorConnection {
    * @param timeoutMs - foreground deadline.
    */
   async waitReady(timeoutMs: number): Promise<void> {
-    if (this.current !== undefined && !this.closing) return
+    if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
+    if (this.current !== undefined) return
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.removeWaiter(waiter)
@@ -132,9 +135,12 @@ export class OperatorConnection {
    */
   async withClient<T>(operation: (remote: ClientRemote, signal: AbortSignal) => Promise<RemoteResult<T>>, timeoutMs: number): Promise<RemoteResult<T>> {
     await this.waitReady(timeoutMs)
+    if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
     const current = this.current
     if (current === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection is not ready')
     const controller = new AbortController()
+    if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
+    this.foreground.add(controller)
     const timer = setTimeout(() => { controller.abort() }, timeoutMs)
     try {
       return await Promise.race([
@@ -143,22 +149,29 @@ export class OperatorConnection {
       ])
     } finally {
       clearTimeout(timer)
+      this.foreground.delete(controller)
     }
   }
 
   /** Stop reconnecting, close the current socket, and reject pending waits. */
   async close(): Promise<void> {
-    await this.serializeChange(async () => {
-      if (this.closing) return
-      this.closing = true
-      this.target = undefined
+    if (this.closingTask !== undefined) {
+      await this.closingTask
+      return
+    }
+    this.closing = true
+    this.target = undefined
+    const failure = new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection closed')
+    for (const waiter of this.readyWaiters.splice(0)) {
+      clearTimeout(waiter.timer)
+      waiter.reject(failure)
+    }
+    for (const controller of this.foreground) controller.abort(failure)
+    this.foreground.clear()
+    this.closingTask = this.serializeChange(async () => {
       await this.detach()
-      const failure = new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection closed')
-      for (const waiter of this.readyWaiters.splice(0)) {
-        clearTimeout(waiter.timer)
-        waiter.reject(failure)
-      }
     })
+    await this.closingTask
   }
 
   private serializeChange<T>(operation: () => Promise<T>): Promise<T> {
@@ -220,8 +233,9 @@ export class OperatorConnection {
       const socket = socketFactory === undefined
         ? new WebSocket(url, { headers: { cookie } })
         : socketFactory(url)
-      this.options.onWebSocket?.(socket, url)
       socket.addEventListener('close', () => { lost.abort() }, { once: true })
+      socket.addEventListener('error', () => { lost.abort() }, { once: true })
+      this.options.onWebSocket?.(socket, url)
       return socket
     }
     try {
@@ -233,7 +247,13 @@ export class OperatorConnection {
             const headers = new Headers(init.headers)
             headers.set('cookie', cookie)
             const url = input instanceof URL ? input : new URL(input, baseUrl)
-            return await baseFetch(url, { ...init, headers })
+            const response = await baseFetch(url, { ...init, headers })
+            if (response.status === 401 && !lost.signal.aborted) {
+              // The authenticated lease was revoked. Start a fresh exchange,
+              // but never replay this RPC (it may be a mutation).
+              lost.abort(new LiaisonError('OPERATOR_UNAVAILABLE', 'operator credential was rejected'))
+            }
+            return response
           },
           createWebSocket,
         },
@@ -250,7 +270,7 @@ export class OperatorConnection {
         await ctx.remote.$mount(contribution)
       }
       const connection = ctx.get('connection') as ConnectionHandle
-      await waitForGeneration(connection, this.generationTimeoutMs(), signal)
+      await waitForGeneration(connection, this.generationTimeoutMs(), signal, lost.signal)
       const opened: OpenedConnection = {
         ctx,
         remote: ctx.remote,
@@ -387,8 +407,16 @@ export async function exchangeOperatorCredential(
   }
 }
 
-async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number, signal: AbortSignal): Promise<void> {
+async function waitForGeneration(
+  connection: ConnectionHandle,
+  timeoutMs: number,
+  signal: AbortSignal,
+  lost?: AbortSignal,
+): Promise<void> {
   if (connection.generation.getSnapshot() !== undefined) return
+  if (lost?.aborted === true) {
+    throw new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator transport closed before generation readiness')
+  }
   await new Promise<void>((resolve, reject) => {
     let settled = false
     const finish = (error?: Error): void => {
@@ -397,10 +425,14 @@ async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number
       clearTimeout(timer)
       unsubscribe()
       signal.removeEventListener('abort', onAbort)
+      lost?.removeEventListener('abort', onLost)
       if (error === undefined) resolve()
       else reject(error)
     }
     const onAbort = (): void => { finish(new Error('operator connection was aborted')) }
+    const onLost = (): void => {
+      finish(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator transport closed before generation readiness'))
+    }
     const unsubscribe = connection.generation.subscribe(() => {
       if (connection.generation.getSnapshot() !== undefined) finish()
     })
@@ -408,7 +440,8 @@ async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number
       finish(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator generation was not ready in time'))
     }, timeoutMs)
     signal.addEventListener('abort', onAbort, { once: true })
-    if (connection.generation.getSnapshot() !== undefined) finish()
+    lost?.addEventListener('abort', onLost, { once: true })
+    if (connection.generation.getSnapshot() !== undefined || lost?.aborted === true) finish()
   })
 }
 
@@ -426,9 +459,13 @@ function abortOutcome(signal: AbortSignal, timeoutMs: number): Promise<never> {
   return new Promise((_resolve, reject) => {
     const fail = (): void => {
       signal.removeEventListener('abort', fail)
-      reject(new LiaisonError('OPERATOR_UNAVAILABLE', `the foreground operator call did not finish within ${String(timeoutMs)}ms`))
+      const reason: unknown = signal.reason
+      reject(reason instanceof Error
+        ? reason
+        : new LiaisonError('OPERATOR_UNAVAILABLE', `the foreground operator call did not finish within ${String(timeoutMs)}ms`))
     }
-    signal.addEventListener('abort', fail, { once: true })
+    if (signal.aborted) fail()
+    else signal.addEventListener('abort', fail, { once: true })
   })
 }
 
