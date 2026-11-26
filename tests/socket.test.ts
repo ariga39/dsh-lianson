@@ -1,6 +1,6 @@
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, rm, stat, writeFile } from 'node:fs/promises'
+import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -79,6 +79,51 @@ describe('Unix-domain socket ownership', () => {
     await third.stop()
   })
 
+
+  it('creates an absent runtime directory with owner-only permissions', async () => {
+    const directory = join(root, 'nested', 'runtime')
+    const server = new UdsServer(join(directory, 'liaison.sock'), join(directory, 'liaison.sock.lock'), async () => {})
+    await server.start()
+    try {
+      assert.equal((await stat(directory)).mode & 0o777, 0o700)
+    } finally {
+      await server.stop()
+    }
+  })
+
+  it('rejects a pre-created runtime directory readable by other users', async () => {
+    const directory = join(root, 'shared-runtime')
+    await mkdir(directory)
+    await chmod(directory, 0o755)
+    const server = new UdsServer(join(directory, 'liaison.sock'), join(directory, 'liaison.sock.lock'), async () => {})
+    await assert.rejects(
+      server.start(),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-runtime-dir',
+    )
+  })
+
+  it('rejects a symlinked runtime directory', async () => {
+    const real = join(root, 'real-runtime')
+    const link = join(root, 'linked-runtime')
+    await mkdir(real)
+    await chmod(real, 0o700)
+    await symlink(real, link)
+    const server = new UdsServer(join(link, 'liaison.sock'), join(link, 'liaison.sock.lock'), async () => {})
+    await assert.rejects(
+      server.start(),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-runtime-dir',
+    )
+  })
+
+  it('rejects a non-directory at the runtime path', async () => {
+    const file = join(root, 'runtime-file')
+    await writeFile(file, 'not a directory')
+    const server = new UdsServer(join(file, 'liaison.sock'), join(file, 'liaison.sock.lock'), async () => {})
+    await assert.rejects(
+      server.start(),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-runtime-dir',
+    )
+  })
   it('refuses to replace a regular file at the socket path', async () => {
     const socketPath = join(root, 'occupied')
     const lockPath = join(root, 'occupied.lock')

@@ -82,6 +82,8 @@ export class DelegationService {
   private readonly trust: TrustPolicy
   private readonly now: () => number
   private readonly newId: () => string
+  /** One serialized create chain per delegation id; unrelated ids stay independent. */
+  private readonly createChains = new Map<string, Promise<void>>()
 
   constructor(options: ServiceOptions) {
     this.ledger = options.ledger
@@ -110,7 +112,26 @@ export class DelegationService {
    * @param input - validated create request.
    * @returns the ready record and whether this call replayed an existing row.
    */
-  async create(input: {
+  create(input: {
+    readonly delegationId: string
+    readonly cwd: string
+    readonly title?: string | undefined
+    readonly model?: string | undefined
+  }): Promise<CreateResult> {
+    const previous = this.createChains.get(input.delegationId) ?? Promise.resolve()
+    const run = previous.then(
+      () => this.createOnce(input),
+      () => this.createOnce(input),
+    )
+    const tail = run.then(() => undefined, () => undefined)
+    this.createChains.set(input.delegationId, tail)
+    void tail.then(() => {
+      if (this.createChains.get(input.delegationId) === tail) this.createChains.delete(input.delegationId)
+    })
+    return run
+  }
+
+  private async createOnce(input: {
     readonly delegationId: string
     readonly cwd: string
     readonly title?: string | undefined

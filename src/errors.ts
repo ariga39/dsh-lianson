@@ -11,6 +11,7 @@ export type LiaisonErrorCode =
   | 'dsh-unavailable'
   | 'plugin-offline'
   | 'socket-in-use'
+  | 'unsafe-runtime-dir'
   | 'ledger'
   | 'protocol'
   | 'internal'

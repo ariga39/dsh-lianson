@@ -70,6 +70,16 @@ describe('trust boundaries', () => {
   })
 
 
+
+  it('treats a literal ..project component as a protected descendant', async () => {
+    const dotted = join(root, 'home', '..project')
+    await mkdir(dotted, { recursive: true })
+    assert.throws(
+      () => assertTrustedCwd(dotted, policy),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
+    )
+  })
+
   it('rejects a worktree inside a root shared by every deployment Session', async () => {
     const shared = join(root, 'shared-grant')
     await mkdir(join(shared, 'worktree'), { recursive: true })

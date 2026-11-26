@@ -67,6 +67,7 @@ function codeOf(code: string): LiaisonError['code'] {
     case 'dsh-unavailable':
     case 'plugin-offline':
     case 'socket-in-use':
+    case 'unsafe-runtime-dir':
     case 'ledger':
     case 'protocol':
     case 'internal':

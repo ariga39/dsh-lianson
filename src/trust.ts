@@ -1,7 +1,7 @@
 /** Trust-boundary checks for a delegation working directory. */
 
 import { realpathSync, statSync } from 'node:fs'
-import { dirname, isAbsolute, relative, resolve } from 'node:path'
+import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { LiaisonError } from './errors.ts'
@@ -99,5 +99,7 @@ function overlaps(left: string, right: string): boolean {
 
 function isInside(root: string, candidate: string): boolean {
   const rel = relative(root, candidate)
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel))
+  // A literal `..project` component is a descendant; only `.` and `..`
+  // whole components move outside the root.
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${sep}`))
 }

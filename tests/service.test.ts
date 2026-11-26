@@ -132,6 +132,54 @@ describe('delegation service', () => {
     assert.equal(replay.delegation.model, 'fixture/model-a')
   })
 
+
+  it('serializes same-id creates so one remote creation serves both callers', async () => {
+    await mkdir(project, { recursive: true })
+    const gate = Promise.withResolvers<void>()
+    remote.workspaceGate = gate.promise
+    const input = { delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' }
+    const first = service.create(input)
+    const second = service.create(input)
+    await waitFor(() => remote.workspaceEntries === 1)
+    gate.resolve()
+    const [left, right] = await Promise.all([first, second])
+    assert.equal(remote.workspaceEntries, 1)
+    assert.equal(left.delegation.sessionId, right.delegation.sessionId)
+    assert.deepEqual([left.replayed, right.replayed].sort((a, b) => Number(a) - Number(b)), [false, true])
+  })
+
+  it('serializes same-id creates with different parameters into a conflict', async () => {
+    await mkdir(project, { recursive: true })
+    const gate = Promise.withResolvers<void>()
+    remote.workspaceGate = gate.promise
+    const first = service.create({ delegationId: 'd1', cwd: project, title: 'First', model: 'fixture/model-a' })
+    const second = service.create({ delegationId: 'd1', cwd: project, title: 'Second', model: 'fixture/model-a' })
+    await waitFor(() => remote.workspaceEntries === 1)
+    gate.resolve()
+    await first
+    await assert.rejects(
+      second,
+      (error: unknown) => error instanceof LiaisonError && error.code === 'conflict',
+    )
+    assert.equal(remote.workspaceEntries, 1)
+    assert.equal(ledger.findDelegation('d1')?.title, 'First')
+  })
+
+  it('does not block creates for different delegation ids', async () => {
+    await mkdir(project, { recursive: true })
+    const gate = Promise.withResolvers<void>()
+    remote.workspaceGate = gate.promise
+    const first = service.create({ delegationId: 'd1', cwd: project, title: 'First', model: 'fixture/model-a' })
+    const second = service.create({ delegationId: 'd2', cwd: project, title: 'Second', model: 'fixture/model-a' })
+    await waitFor(() => remote.workspaceEntries === 2)
+    gate.resolve()
+    const [left, right] = await Promise.all([first, second])
+    assert.equal(left.delegation.delegationId, 'd1')
+    assert.equal(right.delegation.delegationId, 'd2')
+    assert.equal(left.delegation.status, 'ready')
+    assert.equal(right.delegation.status, 'ready')
+  })
+
   it('retries a partially created delegation with the persisted session id', async () => {
     await mkdir(project, { recursive: true })
     remote.failSessionOnce = true
@@ -415,6 +463,8 @@ class FakeRemote implements DshRemote {
   cursor = 5
   page: RemoteEventPage = { cursor: 0, events: [] }
   failSessionOnce = false
+  workspaceGate: Promise<void> | undefined
+  workspaceEntries = 0
   returnDifferentSessionId = false
   failCursorOnce = false
   sessionIdArgument: string | undefined
@@ -427,7 +477,9 @@ class FakeRemote implements DshRemote {
 
   async createWorkspace(): Promise<string> {
     this.calls.push('workspace/create')
+    this.workspaceEntries += 1
     this.onBeforeCreateWorkspace?.()
+    if (this.workspaceGate !== undefined) await this.workspaceGate
     return 'workspace-1'
   }
 
@@ -468,6 +520,14 @@ class FakeRemote implements DshRemote {
   }
 
   async dispose(): Promise<void> {}
+}
+
+async function waitFor(predicate: () => boolean): Promise<void> {
+  for (let attempt = 0; attempt < 500; attempt += 1) {
+    if (predicate()) return
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  throw new Error('condition did not settle')
 }
 
 function event<K extends keyof SessionEventMap>(type: K, seq: number, data: SessionEventMap[K]): SessionWireEvent {

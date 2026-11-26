@@ -47,8 +47,10 @@ export class UdsServer {
    */
   async start(): Promise<void> {
     if (this.started) return
-    await mkdir(dirname(this.socketPath), { recursive: true, mode: 0o700 })
-    await mkdir(dirname(this.lockPath), { recursive: true, mode: 0o700 })
+    const socketDir = dirname(this.socketPath)
+    const lockDir = dirname(this.lockPath)
+    const socketDirIdentity = await ensurePrivateRuntimeDirectory(socketDir)
+    if (lockDir !== socketDir) await ensurePrivateRuntimeDirectory(lockDir)
     const lock = await open(this.lockPath, 'a+', 0o600)
     try {
       await tryLockExclusive(lock.fd)
@@ -60,35 +62,46 @@ export class UdsServer {
       throw error
     }
     this.lock = lock
+    let server: Server | undefined
     try {
       await removeStaleSocket(this.socketPath)
-      const server = createServer((request, response) => {
+      server = createServer((request, response) => {
         void this.handler(request, response).catch(() => {
           if (!response.headersSent) response.writeHead(500, { 'content-type': 'application/json; charset=utf-8' })
           if (!response.writableEnded) response.end(JSON.stringify({ ok: false, error: { code: 'internal', message: 'unhandled request failure' } }))
         })
       })
+      const listening = server
       await new Promise<void>((resolve, reject) => {
         const onError = (error: Error): void => {
-          server.off('listening', onListening)
+          listening.off('listening', onListening)
           reject(error)
         }
         const onListening = (): void => {
-          server.off('error', onError)
+          listening.off('error', onError)
           resolve()
         }
-        server.once('error', onError)
-        server.once('listening', onListening)
-        server.listen(this.socketPath)
+        listening.once('error', onError)
+        listening.once('listening', onListening)
+        listening.listen(this.socketPath)
       })
-      server.on('error', () => {
+      listening.on('error', () => {
         // A later listener error cannot be answered through a request; the
         // plugin reports loopback/health separately. Keep the process alive.
       })
+      const after = await inspectPrivateRuntimeDirectory(socketDir)
+      if (after.dev !== socketDirIdentity.dev || after.ino !== socketDirIdentity.ino) {
+        throw new LiaisonError('unsafe-runtime-dir', 'runtime directory was replaced while binding the socket', { directory: socketDir })
+      }
       await chmod(this.socketPath, 0o600)
-      this.server = server
+      this.server = listening
       this.started = true
     } catch (error) {
+      if (server !== undefined) {
+        server.closeAllConnections()
+        await new Promise<void>((resolve) => { server?.close(() => { resolve() }) })
+      }
+      await rm(this.socketPath, { force: true })
       await this.releaseLock()
       throw error
     }
@@ -124,6 +137,71 @@ export class UdsServer {
     this.lock = undefined
     if (lock !== undefined) await lock.close()
   }
+}
+
+/** One runtime directory's identity, stable across socket binding. */
+interface DirectoryIdentity {
+  readonly dev: bigint
+  readonly ino: bigint
+}
+
+/**
+ * Create the runtime directory when absent and prove it is a real, private
+ * directory owned by this uid. The predictable fallback under `/tmp` may be
+ * pre-created, so ownership, mode, and symlink status are checked, not assumed.
+ * @param directory - runtime directory that will hold the socket and lock.
+ * @returns the directory's device/inode identity for the post-bind check.
+ */
+export async function ensurePrivateRuntimeDirectory(directory: string): Promise<DirectoryIdentity> {
+  try {
+    return await inspectPrivateRuntimeDirectory(directory)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      throw error instanceof LiaisonError
+        ? error
+        : new LiaisonError('unsafe-runtime-dir', `cannot inspect runtime directory ${directory}`, {
+          directory,
+          reason: error instanceof Error ? error.message : String(error),
+        })
+    }
+  }
+  try {
+    await mkdir(directory, { recursive: true, mode: 0o700 })
+  } catch (error) {
+    throw new LiaisonError('unsafe-runtime-dir', `cannot create private runtime directory ${directory}`, {
+      directory,
+      reason: error instanceof Error ? error.message : String(error),
+    })
+  }
+  return inspectPrivateRuntimeDirectory(directory)
+}
+
+/**
+ * Inspect one runtime directory without following a final symlink.
+ * @param directory - directory that must hold the socket.
+ * @returns its device/inode identity.
+ * @throws {LiaisonError} `unsafe-runtime-dir`.
+ */
+export async function inspectPrivateRuntimeDirectory(directory: string): Promise<DirectoryIdentity> {
+  const info = await lstat(directory, { bigint: true })
+  const uid = process.getuid?.()
+  if (uid === undefined) {
+    throw new LiaisonError('unsafe-runtime-dir', 'cannot verify runtime directory ownership on this platform', { directory })
+  }
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new LiaisonError('unsafe-runtime-dir', `runtime directory is not a real directory: ${directory}`, { directory })
+  }
+  if (info.uid !== BigInt(uid)) {
+    throw new LiaisonError('unsafe-runtime-dir', `runtime directory is not owned by uid ${String(uid)}: ${directory}`, { directory })
+  }
+  const mode = info.mode & 0o777n
+  if ((mode & 0o700n) !== 0o700n || (mode & 0o077n) !== 0n) {
+    throw new LiaisonError('unsafe-runtime-dir', `runtime directory mode is not private: ${directory}`, {
+      directory,
+      mode: mode.toString(8),
+    })
+  }
+  return { dev: info.dev, ino: info.ino }
 }
 
 /** Whether a `tryLockExclusive` failure means another descriptor owns the lock. */
