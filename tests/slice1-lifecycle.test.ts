@@ -9,7 +9,9 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
+import { createDeadline } from '../src/deadline.ts'
 import { LiaisonError } from '../src/errors.ts'
+import { acquireLock } from '../src/flock.ts'
 import { HostManager } from '../src/host-manager.ts'
 import { callDaemon } from '../src/ipc-client.ts'
 
@@ -232,6 +234,99 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
     for (const pid of cleanupPids) {
       try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
     }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('expired start and stop waiting on host.lock leave no action or fence', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-lock-expiry-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const cleanupPids = new Set<number>()
+  let held: Awaited<ReturnType<typeof acquireLock>> | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    const prime = runCli(env, workspace, ['host', 'ping'])
+    assert.notEqual(prime.status, 0, 'ping primes a daemon without a Host')
+    const status = runCli(env, workspace, ['host', 'status'])
+    assert.equal(status.status, 0, status.stderr)
+    const daemonPid = objectOf(status.json).daemonPid
+    assert.equal(typeof daemonPid, 'number')
+    cleanupPids.add(daemonPid as number)
+    held = await acquireLock(join(stateDir, 'host.lock'), { waitMs: 0 })
+    assert.ok(held !== undefined, 'the test must hold the kernel host lock')
+    const socketPath = join(stateDir, 'daemon.sock')
+    const queuedStart = callDaemon(socketPath, 'host.start', {}, 250)
+    const queuedStop = callDaemon(socketPath, 'host.stop', { keepHost: false }, 250)
+    const outcomes = await Promise.allSettled([queuedStart, queuedStop])
+    for (const outcome of outcomes) {
+      assert.equal(outcome.status, 'rejected')
+      if (outcome.status === 'rejected') {
+        assert.ok(outcome.reason instanceof LiaisonError)
+        assert.equal(outcome.reason.code, 'IPC_TIMEOUT')
+        assert.match(outcome.reason.message, /outcome may be unknown|deadline expired/u)
+      }
+    }
+    assert.equal(existsSync(join(stateDir, 'host.json')), false, 'an expired start must not create ownership')
+    assert.notEqual(await procState(daemonPid as number), undefined, 'the daemon must remain alive')
+    assert.notEqual(await procState(daemonPid as number), 'Z')
+    assert.equal(existsSync(socketPath), true, 'the expired stop must not withdraw the daemon')
+
+    await held.release()
+    held = undefined
+    const fresh = startHost(env, workspace)
+    assert.equal(fresh.daemonPid, daemonPid, 'the original daemon must remain usable')
+    cleanupPids.add(fresh.hostPid)
+    cleanupPids.add(fresh.daemonPid)
+    const stopped = runCli(env, workspace, ['host', 'stop'])
+    assert.equal(stopped.status, 0, stopped.stderr)
+    await assertGone(fresh.hostPid)
+    await assertGone(fresh.daemonPid)
+    cleanupPids.delete(fresh.hostPid)
+    cleanupPids.delete(fresh.daemonPid)
+    cleanupPids.delete(daemonPid as number)
+  } finally {
+    await held?.release()
+    runCli(env, workspace, ['host', 'stop'])
+    for (const pid of cleanupPids) {
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('a spawn committed before expiry keeps its readiness and ownership', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-spawn-commit-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  try {
+    await mkdir(workspace, { recursive: true })
+    const summary = await manager.start({}, createDeadline(100))
+    assert.equal(summary.state, 'ready')
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(record.state, 'ready')
+    assert.equal(record.hostPid, summary.hostPid)
+    assert.doesNotThrow(() => { process.kill(summary.hostPid, 0) })
+    const stopped = await manager.stop()
+    assert.equal(stopped.stoppedHost, true)
+    await assertGone(summary.hostPid)
+  } finally {
+    await manager.stop().catch(() => undefined)
+    await manager.close().catch(() => undefined)
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 })

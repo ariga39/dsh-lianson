@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,6 +9,7 @@ import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { PING_CALL_TIMEOUT_MS, START_CALL_TIMEOUT_MS, STOP_CALL_TIMEOUT_MS } from '../src/cli.ts'
+import { createDeadline } from '../src/deadline.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { HOST_PING_DEADLINE_MS, HostManager, normalizeLoopbackOrigin } from '../src/host-manager.ts'
 import { statePaths } from '../src/paths.ts'
@@ -462,6 +463,44 @@ await test('identity is re-verified before SIGKILL escalation', async () => {
     })
     await manager.stop()
     assert.deepEqual(signals, ['SIGTERM'], 'a reused PID must never receive SIGKILL')
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('a committed SIGTERM completes verified escalation after the caller budget expires', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-commit-escalate-'))
+  try {
+    const stateDir = join(root, 'state')
+    const record = readyRecord({ hostPid: process.pid, hostStartTime: '1' })
+    await writeState(stateDir, record)
+    const procRoot = join(root, 'proc')
+    const procDir = join(procRoot, String(process.pid))
+    await mkdir(join(procRoot, 'self'), { recursive: true })
+    await writeFile(join(procRoot, 'self', 'stat'), '1 (node) S 0')
+    await mkdir(procDir, { recursive: true })
+    await writeProc(procDir, 'S', '1', record)
+    const observed: Array<{ readonly signal: string; readonly at: number }> = []
+    const startedAt = performance.now()
+    const deadline = createDeadline(300)
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      procRoot,
+      stopGraceMs: 400,
+      killGraceMs: 100,
+      signalProcess: (_pid, signal) => {
+        observed.push({ signal, at: performance.now() - startedAt })
+        if (signal === 'SIGKILL') rmSync(procDir, { recursive: true, force: true })
+      },
+    })
+    const outcome = await manager.stop({}, deadline)
+    assert.equal(outcome.stoppedHost, true)
+    assert.deepEqual(observed.map(entry => entry.signal), ['SIGTERM', 'SIGKILL'])
+    assert.ok((observed[0]?.at ?? Number.POSITIVE_INFINITY) < 300, 'SIGTERM must commit before expiry')
+    assert.ok((observed[1]?.at ?? 0) > 300, 'SIGKILL escalation must complete after expiry')
+    assert.equal(existsSync(join(stateDir, 'host.json')), false)
   } finally {
     await rm(root, { recursive: true, force: true })
   }

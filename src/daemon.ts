@@ -61,7 +61,7 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
         // The same manager/operator handles the start. Launch overrides apply
         // only at the launch decision inside HostManager; a live attach keeps
         // the existing Host's cwd, port, and patches.
-        return await manager.start(launchOptionsOf(request.params, options))
+        return await manager.start(launchOptionsOf(request.params, options), deadline)
       })
       return { ...summary, daemonPid: process.pid }
     }
@@ -73,7 +73,7 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
         const summary = await mutations.run(async () => {
           assertRequestLive(deadline)
           if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
-          return await manager.status(true)
+          return await manager.status(true, deadline)
         })
         return { ...summary, daemonPid: process.pid }
       }
@@ -93,9 +93,19 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
         // Expiry before this point must not set the permanent closing fence
         // or withdraw the daemon; it is a pre-admission failure.
         assertRequestLive(deadline)
-        closing = true
-        acted = true
-        return await manager.stop({ keepHost })
+        try {
+          const result = await manager.stop({ keepHost }, deadline)
+          closing = true
+          acted = true
+          return result
+        } catch (error) {
+          // IPC_TIMEOUT before the lifecycle commit point leaves the daemon
+          // usable. Any other failure keeps the existing shutdown semantics.
+          if (error instanceof LiaisonError && error.code === 'IPC_TIMEOUT') throw error
+          closing = true
+          acted = true
+          throw error
+        }
       })
       return { ...outcome, daemonPid: process.pid }
     } finally {

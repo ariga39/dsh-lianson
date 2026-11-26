@@ -184,18 +184,31 @@ export class HostManager {
   /**
    * Launch or attach to the one managed Host.
    * @param overrides - launch cwd/port/patches used only if this call actually launches.
+   * @param deadline - caller budget; gates lock wait and every pre-commit action.
    */
-  async start(overrides: HostLaunchOverrides = {}): Promise<HostSummary> {
+  async start(overrides: HostLaunchOverrides = {}, deadline?: Deadline): Promise<HostSummary> {
     await assertProcfsSupported(this.procRoot)
     await ensurePrivateDirectory(this.paths.stateDir)
     const launch = this.effectiveLaunchOptions(overrides)
-    const lock = await acquireLock(this.paths.hostLock, { waitMs: this.startTimeoutMs() })
-    if (lock === undefined) throw new LiaisonError('HOST_START_TIMEOUT', 'host lifecycle lock was not acquired')
+    const lock = await acquireLock(this.paths.hostLock, {
+      waitMs: boundedWait(this.startTimeoutMs(), deadline),
+    })
+    if (lock === undefined) {
+      throw deadline?.expired() === true
+        ? deadlineFailure()
+        : new LiaisonError('HOST_START_TIMEOUT', 'host lifecycle lock was not acquired')
+    }
     try {
       const record = await this.readRecord()
-      if (record === undefined) return await this.launchAndAttach(launch)
+      if (record === undefined) {
+        assertDeadlineLive(deadline)
+        return await this.launchAndAttach(launch)
+      }
       if (record.state === 'launching') {
-        await this.recoverLaunching(record)
+        await this.recoverLaunching(record, deadline)
+        // A recovery may have consumed the whole budget; a new replacement
+        // spawn needs its own pre-commit check.
+        assertDeadlineLive(deadline)
         return await this.launchAndAttach(launch)
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
@@ -205,9 +218,12 @@ export class HostManager {
         })
       }
       if (identity.kind === 'dead-or-reused') {
+        assertDeadlineLive(deadline)
         await this.cleanupFiles()
+        assertDeadlineLive(deadline)
         return await this.launchAndAttach(launch)
       }
+      assertDeadlineLive(deadline)
       if (!await probeLoopback(record.origin)) {
         // A verified live Host whose endpoint is momentarily slow stays the
         // owner. Never signal it or tear down its sessions because a probe failed.
@@ -215,7 +231,7 @@ export class HostManager {
           details: { hostPid: record.hostPid, origin: record.origin },
         })
       }
-      await this.attachOperator(record)
+      await this.attachOperator(record, deadline)
       return summaryOf(record)
     } finally {
       await lock.release()
@@ -225,10 +241,11 @@ export class HostManager {
   /**
    * Inspect the record without mutating ownership.
    * @param ensure - launch or attach when true.
+   * @param deadline - caller budget for an ensure transition.
    * @returns status facts.
    */
-  async status(ensure = false): Promise<HostInspection | HostSummary> {
-    if (ensure) return await this.start()
+  async status(ensure = false, deadline?: Deadline): Promise<HostInspection | HostSummary> {
+    if (ensure) return await this.start({}, deadline)
     const record = await this.readRecord()
     if (record === undefined) return { state: 'absent' }
     if (record.state === 'launching') {
@@ -301,18 +318,22 @@ export class HostManager {
    * @param options - `keepHost` stops the daemon's connection but never the Host.
    * @returns a truthful stop outcome.
    */
-  async stop(options: { readonly keepHost?: boolean } = {}): Promise<StopOutcome> {
-    // Fence attachment before waiting for the lifecycle lock: a ping that
-    // already passed its read checks must not create a fresh reconnect loop
-    // after keep-host shutdown begins.
-    this.attachmentClosed = true
+  async stop(options: { readonly keepHost?: boolean } = {}, deadline?: Deadline): Promise<StopOutcome> {
     const lock = await acquireLock(this.paths.hostLock, {
-      waitMs: this.stopGraceMs() + this.killGraceMs() + 5_000,
+      waitMs: boundedWait(this.stopGraceMs() + this.killGraceMs() + 5_000, deadline),
     })
-    if (lock === undefined) throw new LiaisonError('HOST_STOP_FAILED', 'host lifecycle lock was not acquired')
+    if (lock === undefined) {
+      throw deadline?.expired() === true
+        ? deadlineFailure()
+        : new LiaisonError('HOST_STOP_FAILED', 'host lifecycle lock was not acquired')
+    }
     try {
       const record = await this.readRecord()
-      if (record === undefined) return { hostPid: null, stoppedHost: false, stopReason: 'absent' }
+      if (record === undefined) {
+        // Even an absent stop must not begin daemon shutdown after expiry.
+        assertDeadlineLive(deadline)
+        return { hostPid: null, stoppedHost: false, stopReason: 'absent' }
+      }
       if (record.state === 'launching') {
         const identity = await this.resolveLaunchingIdentity(record)
         if (identity.kind === 'unverified') {
@@ -326,15 +347,19 @@ export class HostManager {
           })
         }
         if (identity.kind !== 'alive-verified') {
+          assertDeadlineLive(deadline)
           await this.closeOperator()
           await this.cleanupFiles()
           return { hostPid: null, stoppedHost: false, stopReason: 'already-exited' }
         }
         if (options.keepHost === true) {
+          assertDeadlineLive(deadline)
           throw new LiaisonError('HOST_LAUNCH_INCOMPLETE', 'an interrupted launch cannot be kept')
         }
+        await this.terminate(identity.pid, identity.startTime, record, deadline, () => {
+          this.attachmentClosed = true
+        })
         await this.closeOperator()
-        await this.terminate(identity.pid, identity.startTime, record)
         await this.cleanupFiles()
         return { hostPid: identity.pid, stoppedHost: true, stopReason: 'stopped' }
       }
@@ -345,6 +370,7 @@ export class HostManager {
         })
       }
       if (identity.kind === 'dead-or-reused') {
+        assertDeadlineLive(deadline)
         await this.closeOperator()
         await this.cleanupFiles()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'already-exited' }
@@ -352,11 +378,15 @@ export class HostManager {
       if (options.keepHost === true) {
         // Keeping never signals. Verify first so a dead/reused or unverifiable
         // record reports the truth instead of a false kept claim.
+        assertDeadlineLive(deadline)
+        this.attachmentClosed = true
         await this.closeOperator()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'kept' }
       }
+      await this.terminate(record.hostPid, record.hostStartTime, record, deadline, () => {
+        this.attachmentClosed = true
+      })
       await this.closeOperator()
-      await this.terminateVerified(record)
       await this.cleanupFiles()
       return { hostPid: record.hostPid, stoppedHost: true, stopReason: 'stopped' }
     } finally {
@@ -522,7 +552,7 @@ export class HostManager {
     return false
   }
 
-  private async recoverLaunching(record: LaunchingHostRecord): Promise<void> {
+  private async recoverLaunching(record: LaunchingHostRecord, deadline?: Deadline): Promise<void> {
     const identity = await this.resolveLaunchingIdentity(record)
     if (identity.kind === 'unverified') {
       throw new LiaisonError('HOST_IDENTITY_UNVERIFIED', 'the interrupted launch cannot be verified', {
@@ -534,7 +564,11 @@ export class HostManager {
         details: { candidates: identity.pids.length },
       })
     }
-    if (identity.kind === 'alive-verified') await this.terminate(identity.pid, identity.startTime, record)
+    if (identity.kind === 'alive-verified') {
+      await this.terminate(identity.pid, identity.startTime, record, deadline)
+    } else {
+      assertDeadlineLive(deadline)
+    }
     await this.cleanupFiles()
   }
 
@@ -680,14 +714,12 @@ export class HostManager {
     return undefined
   }
 
-  private async terminateVerified(record: ReadyHostRecord): Promise<void> {
-    await this.terminate(record.hostPid, record.hostStartTime, record)
-  }
-
   private async terminate(
     pid: number,
     startTime: string,
     record: Pick<LaunchingHostRecord, 'launchId' | 'expectedCmdline'>,
+    deadline?: Deadline,
+    onCommitted?: () => void,
   ): Promise<void> {
     const expectation: HostIdentityExpectation = {
       launchId: record.launchId,
@@ -716,10 +748,13 @@ export class HostManager {
     }
 
     if (await verify() === 'gone') return
+    // Commit point: expiry before this check must not start a signal.
+    assertDeadlineLive(deadline)
     if (signal('SIGTERM') === 'gone') return
+    onCommitted?.()
     if (await this.exitObserved(pid, this.stopGraceMs())) return
-    // The PID may have exited and been reused during the grace period: prove
-    // the exact process again before escalating to SIGKILL.
+    // After a committed SIGTERM, verified escalation completes even if the
+    // caller budget expired. Re-verify only to avoid signalling a reused PID.
     if (await verify() === 'gone') return
     if (signal('SIGKILL') === 'gone') return
     if (await this.exitObserved(pid, this.killGraceMs())) return
@@ -902,6 +937,18 @@ async function probeLoopback(origin: string, timeoutMs = 3_000): Promise<boolean
   } finally {
     clearTimeout(timer)
   }
+}
+
+function deadlineFailure(): LiaisonError {
+  return new LiaisonError('IPC_TIMEOUT', 'the request deadline expired before the lifecycle commit point')
+}
+
+function assertDeadlineLive(deadline?: Deadline): void {
+  if (deadline?.expired() === true) throw deadlineFailure()
+}
+
+function boundedWait(timeoutMs: number, deadline?: Deadline): number {
+  return deadline === undefined ? timeoutMs : Math.min(timeoutMs, deadline.remaining())
 }
 
 function pingDeadlineFailure(): LiaisonError {

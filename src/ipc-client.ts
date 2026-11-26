@@ -38,7 +38,12 @@ export async function callDaemon<M extends IpcMethod>(
       else reject(outcome.error)
     }
     const timer = setTimeout(() => {
-      finish({ error: new LiaisonError('IPC_TIMEOUT', `the daemon did not reply within ${String(timeoutMs)}ms`) })
+      finish({
+        error: new LiaisonError(
+          'IPC_TIMEOUT',
+          `the daemon did not reply within ${String(timeoutMs)}ms; outcome may be unknown, reconcile with host status`,
+        ),
+      })
     }, timeoutMs)
     timer.unref()
     socket.setEncoding('utf8')
