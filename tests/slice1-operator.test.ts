@@ -142,6 +142,67 @@ await test('operator recovery: WS drop re-exchanges /connect, rejects the old co
   }
 })
 
+await test('first launch: a temporary operator outage leaves the ready Host and recovers in the background', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-first-launch-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const realFetch = globalThis.fetch.bind(globalThis)
+  let outage = true
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+    if (outage && url.pathname === '/connect') return new Response('temporary outage', { status: 503 })
+    return await realFetch(input, init)
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+    operatorReadyTimeoutMs: 300,
+    operator: {
+      fetch: fetchImpl,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 10_000,
+    },
+  })
+  try {
+    await mkdir(workspace, { recursive: true })
+    await assert.rejects(manager.start(), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'OPERATOR_UNAVAILABLE')
+      return true
+    })
+    const ready = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(ready.state, 'ready', 'the ready record must survive a foreground operator timeout')
+    const hostPid = ready.hostPid
+    assert.equal(typeof hostPid, 'number')
+    assert.doesNotThrow(() => { process.kill(hostPid as number, 0) }, 'the ready Host must still be alive')
+
+    outage = false
+    const ping = await manager.ping()
+    assert.equal(ping.ok, true)
+    assert.equal(ping.hostPid, hostPid, 'background recovery must reach the same Host, not a relaunch')
+    const after = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(after.hostPid, hostPid)
+  } finally {
+    await manager.stop().catch(() => undefined)
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
 function stringField(record: Record<string, unknown>, key: string): string {
   const value = record[key]
   assert.equal(typeof value, 'string')

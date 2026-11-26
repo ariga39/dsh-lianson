@@ -117,6 +117,8 @@ export interface HostManagerOptions {
   readonly startTimeoutMs?: number
   readonly stopGraceMs?: number
   readonly killGraceMs?: number
+  /** Foreground deadline for the initial operator attach, default 20s. */
+  readonly operatorReadyTimeoutMs?: number
   readonly procRoot?: string
   readonly signalProcess?: (pid: number, signal: NodeJS.Signals) => void
   readonly spawnProcess?: typeof spawn
@@ -167,10 +169,10 @@ export class HostManager {
     if (lock === undefined) throw new LiaisonError('HOST_START_TIMEOUT', 'host lifecycle lock was not acquired')
     try {
       const record = await this.readRecord()
-      if (record === undefined) return await this.launch()
+      if (record === undefined) return await this.launchAndAttach()
       if (record.state === 'launching') {
         await this.recoverLaunching(record)
-        return await this.launch()
+        return await this.launchAndAttach()
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
       if (identity.kind === 'unverified') {
@@ -180,12 +182,12 @@ export class HostManager {
       }
       if (identity.kind === 'dead-or-reused') {
         await this.cleanupFiles()
-        return await this.launch()
+        return await this.launchAndAttach()
       }
       if (!await probeLoopback(record.origin)) {
         await this.terminateVerified(record)
         await this.cleanupFiles()
-        return await this.launch()
+        return await this.launchAndAttach()
       }
       await this.attachOperator(record)
       return summaryOf(record)
@@ -329,7 +331,16 @@ export class HostManager {
     await this.closeOperator()
   }
 
-  private async launch(): Promise<HostSummary> {
+  private async launchAndAttach(): Promise<HostSummary> {
+    const record = await this.launch()
+    // Readiness is committed: operator attachment is recoverable background
+    // work, never physical launch rollback. A temporary /connect outage must
+    // leave the verified Host and its ready record intact.
+    await this.attachOperator(record)
+    return summaryOf(record)
+  }
+
+  private async launch(): Promise<ReadyHostRecord> {
     await ensurePrivateDirectory(this.paths.stateDir)
     await removeIfExists(this.paths.readyFile)
     const launchId = `launch-${randomUUID()}`
@@ -410,8 +421,7 @@ export class HostManager {
       await writePrivateFile(this.paths.hostRecord, JSON.stringify(record))
       activeRecord = record
       await removeIfExists(readyFile)
-      await this.attachOperator(record)
-      return summaryOf(record)
+      return record
     } catch (error) {
       // Never delete ownership evidence when the spawned process cannot be
       // verified gone. A later start/stop must resolve it, not lose it.
@@ -699,9 +709,10 @@ export class HostManager {
 
   private async attachOperator(record: ReadyHostRecord): Promise<void> {
     const target: OperatorTarget = { origin: record.origin, launchToken: record.launchToken }
+    const timeoutMs = this.options.operatorReadyTimeoutMs ?? 20_000
     if (this.operator === undefined) this.operator = new OperatorConnection(this.options.operator)
-    if (this.operator.matches(target)) await this.operator.waitReady(20_000)
-    else await this.operator.setHost(target, 20_000)
+    if (this.operator.matches(target)) await this.operator.waitReady(timeoutMs)
+    else await this.operator.setHost(target, timeoutMs)
   }
 
   private async closeOperator(): Promise<void> {

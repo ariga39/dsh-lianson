@@ -112,7 +112,6 @@ export class OperatorConnection {
         const details = this.lastError === undefined ? {} : { lastError: this.lastError.message }
         reject(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection did not become ready in time', { details }))
       }, timeoutMs)
-      timer.unref()
       const waiter: ReadyWaiter = { resolve, reject, timer }
       this.readyWaiters.push(waiter)
     })
@@ -131,7 +130,6 @@ export class OperatorConnection {
     if (current === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection is not ready')
     const controller = new AbortController()
     const timer = setTimeout(() => { controller.abort() }, timeoutMs)
-    timer.unref()
     try {
       return await Promise.race([
         operation(current.remote, controller.signal),
@@ -290,7 +288,6 @@ export class OperatorConnection {
     if (done !== undefined) {
       await new Promise<void>((resolve) => {
         const timer = setTimeout(resolve, DISPOSE_TIMEOUT_MS + 2_000)
-        timer.unref()
         void done.finally(() => { clearTimeout(timer); resolve() })
       })
     }
@@ -358,7 +355,6 @@ async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number
     const timer = setTimeout(() => {
       finish(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator generation was not ready in time'))
     }, timeoutMs)
-    timer.unref()
     signal.addEventListener('abort', onAbort, { once: true })
     if (connection.generation.getSnapshot() !== undefined) finish()
   })
@@ -367,7 +363,6 @@ async function waitForGeneration(connection: ConnectionHandle, timeoutMs: number
 async function disposeContext(ctx: Context): Promise<void> {
   await new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, DISPOSE_TIMEOUT_MS)
-    timer.unref()
     void ctx.fiber.dispose().then(
       () => { clearTimeout(timer); resolve() },
       () => { clearTimeout(timer); resolve() },
@@ -396,7 +391,6 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
       resolve()
     }
     const timer = setTimeout(finish, ms)
-    timer.unref()
     signal.addEventListener('abort', finish, { once: true })
   })
 }
