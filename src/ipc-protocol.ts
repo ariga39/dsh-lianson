@@ -13,6 +13,8 @@ export interface IpcRequest {
   readonly id: string
   readonly method: IpcMethod
   readonly params: Record<string, unknown>
+  /** Caller wall-clock deadline; the daemon converts it to a monotonic budget. */
+  readonly deadline: number
 }
 
 /** Successful daemon reply. */
@@ -52,9 +54,9 @@ export interface IpcParamsMap {
   readonly 'host.stop': { readonly keepHost?: boolean }
 }
 
-/** Create one correlated request. */
-export function makeRequest<M extends IpcMethod>(method: M, params: IpcParamsMap[M]): IpcRequest {
-  return { id: randomUUID(), method, params: { ...params } }
+/** Create one correlated request with one caller wall deadline. */
+export function makeRequest<M extends IpcMethod>(method: M, params: IpcParamsMap[M], timeoutMs: number): IpcRequest {
+  return { id: randomUUID(), method, params: { ...params }, deadline: Date.now() + timeoutMs }
 }
 
 /**
@@ -77,7 +79,11 @@ export function parseIpcRequest(line: string): IpcRequest {
   if (!isIpcMethod(method)) throw new LiaisonError('IPC_PROTOCOL', 'the daemon request has an unknown method')
   const params = record.params === undefined ? {} : recordOf(record.params)
   if (params === undefined) throw new LiaisonError('IPC_PROTOCOL', 'the daemon request params must be an object')
-  return { id, method, params }
+  const deadline = record.deadline
+  if (typeof deadline !== 'number' || !Number.isSafeInteger(deadline) || deadline <= 0) {
+    throw new LiaisonError('IPC_PROTOCOL', 'the daemon request deadline must be a positive epoch millisecond')
+  }
+  return { id, method, params, deadline }
 }
 
 /**

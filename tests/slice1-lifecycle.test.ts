@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
 import { LiaisonError } from '../src/errors.ts'
 import { HostManager } from '../src/host-manager.ts'
+import { callDaemon } from '../src/ipc-client.ts'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const binPath = join(projectRoot, 'bin', 'dsh-liaison.ts')
@@ -235,6 +236,89 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
   }
 })
 
+await test('expired queued start and stop cannot act later; a fresh request still works', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-expired-queue-'))
+  const workspaceA = join(root, 'workspace-a')
+  const workspaceB = join(root, 'workspace-b')
+  const workspaceC = join(root, 'workspace-c')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const cleanupPids = new Set<number>()
+  try {
+    await mkdir(workspaceA, { recursive: true })
+    await mkdir(workspaceB, { recursive: true })
+    await mkdir(workspaceC, { recursive: true })
+    const prime = runCli(env, workspaceA, ['host', 'ping'])
+    assert.notEqual(prime.status, 0, 'ping primes a daemon without a Host')
+    const primeStatus = runCli(env, workspaceA, ['host', 'status'])
+    assert.equal(primeStatus.status, 0, primeStatus.stderr)
+    const daemonPid = objectOf(primeStatus.json).daemonPid
+    assert.equal(typeof daemonPid, 'number')
+    cleanupPids.add(daemonPid as number)
+
+    const firstStart = spawnCli(env, workspaceA, ['host', 'start'])
+    await waitForHostRecord(stateDir, record => record.state === 'launching')
+    const socketPath = join(stateDir, 'daemon.sock')
+    const portB = await freePort()
+    const patchB = await writePatch(root)
+    const queuedStart = callDaemon(socketPath, 'host.start', {
+      cwd: workspaceB,
+      port: portB,
+      patchPaths: [patchB],
+    }, 120)
+    const queuedStop = callDaemon(socketPath, 'host.stop', { keepHost: false }, 120)
+    const queuedOutcomes = Promise.allSettled([queuedStart, queuedStop])
+    await sleep(250)
+    const first = await firstStart
+    assert.equal(first.status, 0, first.stderr)
+    const firstHost = startedHost(first.json)
+    cleanupPids.add(firstHost.hostPid)
+    cleanupPids.add(firstHost.daemonPid)
+    const outcomes = await queuedOutcomes
+    for (const outcome of outcomes) {
+      assert.equal(outcome.status, 'rejected')
+      if (outcome.status === 'rejected') {
+        assert.ok(outcome.reason instanceof LiaisonError)
+        assert.equal(outcome.reason.code, 'IPC_TIMEOUT')
+      }
+    }
+
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(record.state, 'ready')
+    assert.equal(record.hostPid, firstHost.hostPid)
+    assert.equal(record.cwd, workspaceA, 'the expired start must not apply its cwd')
+    const cmdline = record.expectedCmdline
+    assert.ok(Array.isArray(cmdline))
+    const portIndex = cmdline.indexOf('--port')
+    assert.ok(portIndex >= 0)
+    assert.equal(cmdline[portIndex + 1], '0', 'the expired start must not apply its port')
+    assert.ok(!cmdline.includes(patchB), 'the expired start must not apply its patch')
+    assert.notEqual(await procState(firstHost.daemonPid), undefined, 'an expired stop must not withdraw the daemon')
+    assert.notEqual(await procState(firstHost.daemonPid), 'Z')
+    assert.equal(existsSync(socketPath), true, 'an expired stop must not set the closing fence')
+
+    const fresh = startHost(env, workspaceC)
+    assert.equal(fresh.hostPid, firstHost.hostPid, 'a fresh request must still attach the live Host')
+    assert.equal(fresh.daemonPid, firstHost.daemonPid)
+    cleanupPids.add(fresh.daemonPid)
+
+    const stopped = runCli(env, workspaceC, ['host', 'stop'])
+    assert.equal(stopped.status, 0, stopped.stderr)
+    await assertGone(firstHost.hostPid)
+    await assertGone(firstHost.daemonPid)
+    cleanupPids.delete(firstHost.hostPid)
+    cleanupPids.delete(firstHost.daemonPid)
+    cleanupPids.delete(daemonPid as number)
+  } finally {
+    runCli(env, workspaceA, ['host', 'stop'])
+    for (const pid of cleanupPids) {
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
 await test('relaunch applies this start overrides; a live attach keeps the existing Host options', { timeout: 180_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-overrides-'))
   const workspaceA = join(root, 'workspace-a')
@@ -429,6 +513,10 @@ function startHost(env: NodeJS.ProcessEnv, cwd: string, port = 0): StartedHost {
   return startedHost(result.json)
 }
 
+async function sleep(ms: number): Promise<void> {
+  await new Promise(resolve => setTimeout(resolve, ms))
+}
+
 async function freePort(): Promise<number> {
   const server = createServer()
   await new Promise<void>((resolve, reject) => {
@@ -506,6 +594,7 @@ interface RawIpcSession {
   call(
     method: 'host.start' | 'host.stop',
     params: Record<string, unknown>,
+    deadline?: number,
   ): { readonly id: string; readonly promise: Promise<RawIpcReply> }
   close(): void
 }
@@ -570,15 +659,15 @@ function openIpcSession(socketPath: string): RawIpcSession {
     }
   })
   return {
-    call(method, params) {
+    call(method, params, deadline = Date.now() + 30_000) {
       const id = randomUUID()
       const promise = new Promise<RawIpcReply>((resolve, reject) => {
         const timer = setTimeout(() => {
           pending.delete(id)
           reject(new Error(`IPC ${method} timed out`))
-        }, 30_000)
+        }, Math.max(1, deadline - Date.now()))
         pending.set(id, { resolve, reject, timer })
-        socket.write(`${JSON.stringify({ id, method, params })}\n`)
+        socket.write(`${JSON.stringify({ id, method, params, deadline })}\n`)
       })
       return { id, promise }
     },

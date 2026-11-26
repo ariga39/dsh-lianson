@@ -23,7 +23,7 @@ export async function callDaemon<M extends IpcMethod>(
   params: IpcParamsMap[M],
   timeoutMs: number,
 ): Promise<IpcResultMap[M]> {
-  const request = makeRequest(method, params)
+  const request = makeRequest(method, params, timeoutMs)
   const line = `${JSON.stringify(request)}\n`
   return await new Promise<IpcResultMap[M]>((resolve, reject) => {
     let settled = false

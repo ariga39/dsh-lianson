@@ -1,4 +1,5 @@
 import { resolve } from 'node:path'
+import { createDeadline, type Deadline } from './deadline.ts'
 import { ensurePrivateDirectory } from './fs-safe.ts'
 import { acquireLock } from './flock.ts'
 import { HostManager, type HostManagerOptions } from './host-manager.ts'
@@ -44,15 +45,18 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   const handle = async (request: {
     readonly method: 'host.start' | 'host.status' | 'host.ping' | 'host.stop'
     readonly params: Record<string, unknown>
+    readonly deadline: number
   }): Promise<unknown> => {
     if (closing && request.method !== 'host.stop') {
       throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
     }
     if (request.method === 'host.start') {
-      // Selection/replacement and the start transition share one mutation
-      // gate. Concurrent starts therefore share one manager/operator, and a
-      // queued start observes the stop fence when it actually runs.
+      // Admission check plus a second check inside the mutation gate: an
+      // expired queued start must never launch with stale options.
+      const deadline = requestDeadline(request)
+      assertRequestLive(deadline)
       const summary = await mutations.run(async () => {
+        assertRequestLive(deadline)
         if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
         // The same manager/operator handles the start. Launch overrides apply
         // only at the launch decision inside HostManager; a live attach keeps
@@ -64,7 +68,10 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
     if (request.method === 'host.status') {
       const ensure = request.params.ensure === true
       if (ensure) {
+        const deadline = requestDeadline(request)
+        assertRequestLive(deadline)
         const summary = await mutations.run(async () => {
+          assertRequestLive(deadline)
           if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
           return await manager.status(true)
         })
@@ -77,16 +84,27 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
       const ping = await manager.ping()
       return { ...ping, daemonPid: process.pid }
     }
-    closing = true
+    const deadline = requestDeadline(request)
+    assertRequestLive(deadline)
+    let acted = false
     try {
       const keepHost = request.params.keepHost === true
-      const outcome = await mutations.run(async () => await manager.stop({ keepHost }))
+      const outcome = await mutations.run(async () => {
+        // Expiry before this point must not set the permanent closing fence
+        // or withdraw the daemon; it is a pre-admission failure.
+        assertRequestLive(deadline)
+        closing = true
+        acted = true
+        return await manager.stop({ keepHost })
+      })
       return { ...outcome, daemonPid: process.pid }
     } finally {
-      // Withdraw before the reply settles: an immediate next start must not
-      // connect to a daemon that is already shutting down.
-      await runtime.server?.withdraw().catch(() => undefined)
-      scheduleShutdown()
+      if (acted) {
+        // Withdraw before the reply settles: an immediate next start must not
+        // connect to a daemon that is already shutting down.
+        await runtime.server?.withdraw().catch(() => undefined)
+        scheduleShutdown()
+      }
     }
   }
 
@@ -102,6 +120,17 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   process.off('SIGTERM', onSignal)
   process.off('SIGINT', onSignal)
   return 0
+}
+
+/** Convert the caller wall deadline into one monotonic local budget. */
+function requestDeadline(request: { readonly deadline: number }): Deadline {
+  return createDeadline(Math.max(0, request.deadline - Date.now()))
+}
+
+function assertRequestLive(deadline: Deadline): void {
+  if (deadline.expired()) {
+    throw new LiaisonError('IPC_TIMEOUT', 'the request deadline expired before it could run')
+  }
 }
 
 /** Serialize manager selection/replacement and write transitions. */
