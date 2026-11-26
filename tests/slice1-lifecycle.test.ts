@@ -169,6 +169,40 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
       await assertGone(pid)
       cleanupPids.delete(pid)
     }
+
+    // Starts scheduled together and stopped immediately must not orphan a
+    // Host or leave a reconnect loop keeping a replaced manager's daemon alive.
+    const raceDir = join(root, 'race-state')
+    const raceEnv = cliEnv(root, join(root, 'race-dsh'), raceDir)
+    const primePing = runCli(raceEnv, workspace, ['host', 'ping'])
+    assert.notEqual(primePing.status, 0, 'ping primes a daemon without a Host')
+    const primeStatus = runCli(raceEnv, workspace, ['host', 'status'])
+    assert.equal(primeStatus.status, 0, primeStatus.stderr)
+    const primeDaemon = objectOf(primeStatus.json).daemonPid
+    assert.equal(typeof primeDaemon, 'number')
+    cleanupPids.add(primeDaemon as number)
+    const [raceStartA, raceStartB, raceStop] = await Promise.all([
+      spawnCli(raceEnv, workspace, ['host', 'start']),
+      spawnCli(raceEnv, workspace, ['host', 'start']),
+      spawnCli(raceEnv, workspace, ['host', 'stop']),
+    ])
+    assert.equal(raceStop.status, 0, `simultaneous stop failed: ${raceStop.stderr}`)
+    const racePids = new Set<number>([])
+    for (const result of [raceStartA, raceStartB]) {
+      if (result.status !== 0) continue
+      const host = startedHost(result.json)
+      racePids.add(host.hostPid)
+      racePids.add(host.daemonPid)
+      cleanupPids.add(host.hostPid)
+      cleanupPids.add(host.daemonPid)
+    }
+    racePids.add(primeDaemon as number)
+    for (const pid of racePids) {
+      await assertGone(pid)
+      cleanupPids.delete(pid)
+    }
+    assert.equal(existsSync(join(raceDir, 'host.json')), false, 'a successful stop must not leave a ready Host record')
+    assert.equal(existsSync(join(raceDir, 'daemon.sock')), false, 'a successful stop must withdraw the daemon socket')
   } finally {
     runCli(env, workspace, ['host', 'stop'])
     for (const pid of cleanupPids) {
@@ -326,15 +360,28 @@ async function spawnCli(env: NodeJS.ProcessEnv, cwd: string, args: readonly stri
 async function assertGone(pid: number): Promise<void> {
   const deadline = Date.now() + 10_000
   while (Date.now() < deadline) {
-    try {
-      process.kill(pid, 0)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === 'ESRCH') return
-      throw error
-    }
+    const state = await procState(pid)
+    // A zombie has exited and cannot run code; Linux keeps only its exit
+    // status until the parent reaps it.
+    if (state === undefined || state === 'Z') return
     await new Promise(resolve => setTimeout(resolve, 25))
   }
-  throw new Error(`process ${String(pid)} is still alive`)
+  const state = await procState(pid)
+  const cmdline = await readFile(`/proc/${String(pid)}/cmdline`, 'utf8').catch(() => '')
+  const fds = await readdir(`/proc/${String(pid)}/fd`).catch(() => [])
+  throw new Error(`process ${String(pid)} is still ${state ?? 'unknown'}; cmdline=${JSON.stringify(cmdline)}; fds=${fds.join(',')}`)
+}
+
+async function procState(pid: number): Promise<string | undefined> {
+  try {
+    const text = await readFile(`/proc/${String(pid)}/stat`, 'utf8')
+    const close = text.lastIndexOf(')')
+    if (close === -1) return '?'
+    return text.slice(close + 1).trim().split(/\s+/u)[0]
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw error
+  }
 }
 
 async function assertNoTcpPorts(pid: number): Promise<void> {

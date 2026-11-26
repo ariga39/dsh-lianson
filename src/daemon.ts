@@ -20,18 +20,19 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   let manager = new HostManager(options)
   const done = Promise.withResolvers<void>()
   const runtime: { server?: IpcServer } = {}
+  const mutations = createMutationGate()
   let closing = false
   let shuttingDown: Promise<void> | undefined
 
   const shutdown = (): Promise<void> => {
     if (shuttingDown !== undefined) return shuttingDown
     closing = true
-    shuttingDown = (async () => {
+    shuttingDown = mutations.run(async () => {
       await runtime.server?.close()
       await manager.close()
       await daemonLock.release()
       done.resolve()
-    })()
+    })
     return shuttingDown
   }
 
@@ -48,19 +49,28 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
       throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
     }
     if (request.method === 'host.start') {
-      // A daemon may have been started earlier by ping/status with launch
-      // defaults. Honor the normal start invocation when no Host exists yet.
-      if ((await manager.status(false)).state === 'absent') {
-        await manager.close()
-        manager = new HostManager({ ...options, ...launchOptionsOf(request.params, options) })
-      }
-      const summary = await manager.start()
+      // Selection/replacement and the start transition share one mutation
+      // gate. Concurrent starts therefore share one manager/operator, and a
+      // queued start observes the stop fence when it actually runs.
+      const summary = await mutations.run(async () => {
+        if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
+        // A daemon may have been started earlier by ping/status with launch
+        // defaults. Honor the normal start invocation when no Host exists yet.
+        if ((await manager.status(false)).state === 'absent') {
+          await manager.close()
+          manager = new HostManager({ ...options, ...launchOptionsOf(request.params, options) })
+        }
+        return await manager.start()
+      })
       return { ...summary, daemonPid: process.pid }
     }
     if (request.method === 'host.status') {
       const ensure = request.params.ensure === true
       if (ensure) {
-        const summary = await manager.status(true)
+        const summary = await mutations.run(async () => {
+          if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
+          return await manager.status(true)
+        })
         return { ...summary, daemonPid: process.pid }
       }
       const inspection = await manager.status(false)
@@ -73,7 +83,7 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
     closing = true
     try {
       const keepHost = request.params.keepHost === true
-      const outcome = await manager.stop({ keepHost })
+      const outcome = await mutations.run(async () => await manager.stop({ keepHost }))
       return { ...outcome, daemonPid: process.pid }
     } finally {
       // Withdraw before the reply settles: an immediate next start must not
@@ -95,6 +105,19 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   process.off('SIGTERM', onSignal)
   process.off('SIGINT', onSignal)
   return 0
+}
+
+/** Serialize manager selection/replacement and write transitions. */
+function createMutationGate(): { run<T>(operation: () => Promise<T>): Promise<T> } {
+  let tail: Promise<void> = Promise.resolve()
+  return {
+    run<T>(operation: () => Promise<T>): Promise<T> {
+      const start = tail
+      let release: () => void = () => {}
+      tail = new Promise<void>((resolve) => { release = resolve })
+      return start.then(operation).finally(release)
+    },
+  }
 }
 
 function launchOptionsOf(
