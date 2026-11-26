@@ -7,14 +7,24 @@ import { tmpdir } from 'node:os'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import WebSocket from 'ws'
+import { z } from 'zod'
 import { HealthResponseSchema, PingResponseSchema, type HealthResponse } from '../../src/contract.ts'
 import { startDshWeb, type RunningDshWeb } from '../slice0/host.ts'
 
 const projectRoot = fileURLToPath(new URL('../..', import.meta.url))
 const pluginPath = join(projectRoot, 'src', 'plugin.ts')
-const dropUpgradesFixture = fileURLToPath(new URL('../fixtures/drop-upgrades.ts', import.meta.url))
+const muxObserverFixture = fileURLToPath(new URL('../fixtures/mux-observer.ts', import.meta.url))
 const cliPath = join(projectRoot, 'bin', 'dsh-liaison.ts')
+
+const MuxEvidenceSchema = z.object({
+  before: z.object({ status: z.number().int(), authorized: z.boolean() }),
+  oldCookieStatus: z.number().int(),
+  fresh: z.object({ status: z.number().int(), authorized: z.boolean() }),
+  cookieRotated: z.boolean(),
+  mux409Count: z.number().int().nonnegative(),
+}).strict()
+
+type MuxEvidence = z.infer<typeof MuxEvidenceSchema>
 
 interface CliResult {
   readonly code: number | null
@@ -61,6 +71,21 @@ async function waitForHealth(
     await delay(100)
   }
   throw new Error(`timed out waiting for liaison health: ${last}`)
+}
+
+async function waitForEvidence(path: string, timeoutMs: number): Promise<MuxEvidence> {
+  const deadline = Date.now() + timeoutMs
+  let last = 'not written'
+  while (Date.now() < deadline) {
+    try {
+      const raw: unknown = JSON.parse(await readFile(path, 'utf8'))
+      return MuxEvidenceSchema.parse(raw)
+    } catch (error) {
+      last = error instanceof Error ? error.message : String(error)
+      await delay(50)
+    }
+  }
+  throw new Error(`timed out waiting for mux evidence at ${path}: ${last}`)
 }
 
 async function waitForProcessGone(pid: number, timeoutMs: number): Promise<void> {
@@ -117,7 +142,10 @@ async function startHost(options: {
   readonly dshHome?: string
   readonly explicitSocket?: string
   readonly xdgRuntime?: string
-  readonly extraPlugins?: readonly string[]
+  readonly extraPlugins?: readonly {
+    readonly name: string
+    readonly config?: Record<string, unknown>
+  }[]
   readonly timeoutMs?: number
 }): Promise<HostFixture> {
   const root = await mkdtemp(join(tmpdir(), `liaison-${options.label}-`))
@@ -139,7 +167,11 @@ async function startHost(options: {
     {
       insert: [
         { id: 'dsh-liaison', name: pluginPath },
-        ...(options.extraPlugins ?? []).map((name, index) => ({ id: `fixture-${String(index)}`, name })),
+        ...(options.extraPlugins ?? []).map((plugin, index) => ({
+          id: `fixture-${String(index)}`,
+          name: plugin.name,
+          ...(plugin.config === undefined ? {} : { config: plugin.config }),
+        })),
       ],
     },
   ], null, 2))
@@ -157,58 +189,6 @@ async function startHost(options: {
     timeoutMs: options.timeoutMs ?? 90_000,
   })
   return { root, dshHome, socketPath, env, host }
-}
-
-async function exchangeAndDropForeignMux(launchUrl: string): Promise<number> {
-  const application = new URL(launchUrl)
-  const token = application.searchParams.get('token')
-  if (token === null || token === '') throw new Error('launch URL carries no token')
-  const connect = new URL('/connect', application.origin)
-  connect.searchParams.set('token', token)
-  connect.searchParams.set('interactions', 'answer')
-  const response = await fetch(connect, { redirect: 'manual', signal: AbortSignal.timeout(10_000) })
-  await response.body?.cancel()
-  if (response.status !== 302) throw new Error(`foreign /connect returned ${String(response.status)}`)
-  const setCookie = response.headers.get('set-cookie')
-  if (setCookie === null) throw new Error('foreign /connect omitted Set-Cookie')
-  const cookie = setCookie.split(';', 1)[0]
-  if (cookie === undefined || cookie === '') throw new Error('foreign /connect returned an empty cookie')
-
-  const mux = new URL('/api/remote.mux', application.origin)
-  mux.protocol = application.protocol === 'https:' ? 'wss:' : 'ws:'
-  const socket = new WebSocket(mux, { headers: { cookie } })
-  await new Promise<void>((resolve, reject) => {
-    const timer = setTimeout(() => {
-      reject(new Error('timed out opening the foreign mux'))
-    }, 10_000)
-    socket.once('open', () => {
-      clearTimeout(timer)
-      resolve()
-    })
-    socket.once('error', (error) => {
-      clearTimeout(timer)
-      reject(error)
-    })
-    socket.once('unexpected-response', (_request, upgrade) => {
-      clearTimeout(timer)
-      reject(new Error(`foreign mux upgrade returned HTTP ${String(upgrade.statusCode)}`))
-    })
-  })
-  socket.terminate()
-
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline) {
-    const probe = await fetch(new URL('/api/session/modelCatalog', application.origin), {
-      method: 'POST',
-      headers: { cookie, 'content-type': 'application/json' },
-      body: '{}',
-      signal: AbortSignal.timeout(5_000),
-    })
-    await probe.body?.cancel()
-    if (probe.status === 401) return probe.status
-    await delay(50)
-  }
-  throw new Error('the old v2 cookie was not revoked after the mux closed')
 }
 
 await test('a real dsh web Host owns a private UDS endpoint with authenticated RPC', { timeout: 180_000 }, async () => {
@@ -326,17 +306,29 @@ await test('a concurrent plugin cannot interrupt the live endpoint or survive a 
 
 await test('force-closing the mux re-exchanges the credential and keeps ping working', { timeout: 180_000 }, async () => {
   let fixture: HostFixture | undefined
+  let evidenceRoot: string | undefined
   try {
-    fixture = await startHost({ label: 'reconnect', extraPlugins: [dropUpgradesFixture] })
+    evidenceRoot = await mkdtemp(join(tmpdir(), 'liaison-observe-'))
+    const evidencePath = join(evidenceRoot, 'mux-evidence.json')
+    fixture = await startHost({
+      label: 'reconnect',
+      extraPlugins: [{ name: muxObserverFixture, config: { evidencePath } }],
+    })
     const online = await waitForHealth(fixture.env, item => item.loopback.connected)
     const beforePing = await runCli(['ping'], fixture.env)
     assert.equal(beforePing.code, 0, beforePing.stderr)
 
-    assert.equal(await exchangeAndDropForeignMux(fixture.host.launchUrl), 401)
-
     const pid = fixture.host.pid
     assert.ok(pid !== undefined)
     process.kill(pid, 'SIGUSR2')
+
+    const evidence = await waitForEvidence(evidencePath, 30_000)
+    assert.deepEqual(evidence.before, { status: 101, authorized: true })
+    assert.equal(evidence.oldCookieStatus, 401)
+    assert.deepEqual(evidence.fresh, { status: 101, authorized: true })
+    assert.equal(evidence.cookieRotated, true)
+    assert.equal(evidence.mux409Count, 0)
+
     const reconnected = await waitForHealth(fixture.env, item =>
       item.loopback.connected && item.loopback.reauthentications >= 1, 30_000)
     assert.ok((reconnected.loopback.generation ?? 0) >= (online.loopback.generation ?? 0))
@@ -351,5 +343,6 @@ await test('force-closing the mux re-exchanges the credential and keeps ping wor
   } finally {
     await fixture?.host.stop().catch(() => undefined)
     if (fixture !== undefined) await rm(fixture.root, { recursive: true, force: true })
+    if (evidenceRoot !== undefined) await rm(evidenceRoot, { recursive: true, force: true })
   }
 })
