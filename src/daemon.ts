@@ -17,7 +17,7 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
   const paths = statePaths(options.stateDir)
   const daemonLock = await acquireLock(paths.daemonLock, { waitMs: 0 })
   if (daemonLock === undefined) return 0
-  let manager = new HostManager(options)
+  const manager = new HostManager(options)
   const done = Promise.withResolvers<void>()
   const runtime: { server?: IpcServer } = {}
   const mutations = createMutationGate()
@@ -54,13 +54,10 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
       // queued start observes the stop fence when it actually runs.
       const summary = await mutations.run(async () => {
         if (closing) throw new LiaisonError('DAEMON_STOPPING', 'the daemon is stopping')
-        // A daemon may have been started earlier by ping/status with launch
-        // defaults. Honor the normal start invocation when no Host exists yet.
-        if ((await manager.status(false)).state === 'absent') {
-          await manager.close()
-          manager = new HostManager({ ...options, ...launchOptionsOf(request.params, options) })
-        }
-        return await manager.start()
+        // The same manager/operator handles the start. Launch overrides apply
+        // only at the launch decision inside HostManager; a live attach keeps
+        // the existing Host's cwd, port, and patches.
+        return await manager.start(launchOptionsOf(request.params, options))
       })
       return { ...summary, daemonPid: process.pid }
     }

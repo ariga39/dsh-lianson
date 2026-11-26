@@ -15,8 +15,15 @@ import { redactSecrets, redactValue } from './redaction.ts'
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const binPath = fileURLToPath(new URL('../bin/dsh-liaison.ts', import.meta.url))
 const DAEMON_BOOT_TIMEOUT_MS = 20_000
-const START_CALL_TIMEOUT_MS = 150_000
-const STOP_CALL_TIMEOUT_MS = 30_000
+/** Bound on one active `host.start`, including its Host readiness deadline. */
+export const START_CALL_TIMEOUT_MS = 150_000
+/**
+ * A stop may queue behind an active start, then wait for host.lock, SIGTERM
+ * grace, and SIGKILL escalation. The reply deadline must cover that whole
+ * sequence; a shorter client timeout would report failure and still let the
+ * daemon stop the Host later.
+ */
+export const STOP_CALL_TIMEOUT_MS = START_CALL_TIMEOUT_MS + 60_000
 const PING_CALL_TIMEOUT_MS = 30_000
 
 interface HostStartOptions {

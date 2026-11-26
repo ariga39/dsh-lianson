@@ -9,6 +9,8 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import type { ChildProcess } from 'node:child_process'
+import { LiaisonError } from '../src/errors.ts'
+import { HostManager } from '../src/host-manager.ts'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const binPath = join(projectRoot, 'bin', 'dsh-liaison.ts')
@@ -229,6 +231,122 @@ await test('lifecycle: attach, status, ping, stop, keep-host, daemon loss, and c
     for (const pid of cleanupPids) {
       try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
     }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('relaunch applies this start overrides; a live attach keeps the existing Host options', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-overrides-'))
+  const workspaceA = join(root, 'workspace-a')
+  const workspaceB = join(root, 'workspace-b')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const cleanupPids = new Set<number>()
+  try {
+    await mkdir(workspaceA, { recursive: true })
+    await mkdir(workspaceB, { recursive: true })
+    const first = startHost(env, workspaceA)
+    cleanupPids.add(first.daemonPid)
+    cleanupPids.add(first.hostPid)
+    process.kill(first.hostPid, 'SIGKILL')
+    await assertGone(first.hostPid)
+    cleanupPids.delete(first.hostPid)
+    assert.notEqual(await procState(first.daemonPid), undefined, 'the daemon must survive Host loss')
+    assert.notEqual(await procState(first.daemonPid), 'Z')
+
+    const portB = await freePort()
+    const patchB = await writePatch(root)
+    const relaunchRun = runCli(env, workspaceB, [
+      'host', 'start', '--port', String(portB), '--patch', patchB,
+    ])
+    assert.equal(relaunchRun.status, 0, relaunchRun.stderr)
+    const relaunch = startedHost(relaunchRun.json)
+    cleanupPids.add(relaunch.hostPid)
+    cleanupPids.add(relaunch.daemonPid)
+    assert.equal(relaunch.daemonPid, first.daemonPid, 'the existing daemon must perform the relaunch')
+    assert.notEqual(relaunch.hostPid, first.hostPid)
+
+    const relaunchedRecord = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(relaunchedRecord.cwd, workspaceB)
+    assert.equal(relaunchedRecord.port, portB)
+    const cmdline = relaunchedRecord.expectedCmdline
+    assert.ok(Array.isArray(cmdline))
+    assert.ok(cmdline.includes(patchB), 'the relaunch command must carry this invocation patch')
+    assert.ok(cmdline.includes(String(portB)), 'the relaunch command must carry this invocation port')
+
+    const ping = runCli(env, workspaceB, ['host', 'ping'])
+    assert.equal(ping.status, 0, ping.stderr)
+    assert.equal(objectOf(ping.json).hostPid, relaunch.hostPid)
+
+    const portC = await freePort()
+    const attachRun = runCli(env, workspaceA, ['host', 'start', '--port', String(portC)])
+    assert.equal(attachRun.status, 0, attachRun.stderr)
+    const attached = startedHost(attachRun.json)
+    assert.equal(attached.hostPid, relaunch.hostPid, 'a live attach must not relaunch')
+    assert.equal(attached.daemonPid, first.daemonPid)
+    const attachedRecord = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    assert.equal(attachedRecord.cwd, workspaceB, 'live attach must not rewrite cwd')
+    assert.equal(attachedRecord.port, portB, 'live attach must not rewrite port')
+    assert.deepEqual(attachedRecord.expectedCmdline, relaunchedRecord.expectedCmdline)
+
+    const stopped = runCli(env, workspaceA, ['host', 'stop'])
+    assert.equal(stopped.status, 0, stopped.stderr)
+    await assertGone(relaunch.hostPid)
+    await assertGone(relaunch.daemonPid)
+    cleanupPids.delete(relaunch.hostPid)
+    cleanupPids.delete(relaunch.daemonPid)
+  } finally {
+    runCli(env, workspaceA, ['host', 'stop'])
+    for (const pid of cleanupPids) {
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('keep-host fences a delayed operator attach', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-keep-fence-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const hostPid = record.hostPid
+    assert.equal(typeof hostPid, 'number')
+    const kept = await manager.stop({ keepHost: true })
+    assert.equal(kept.stopReason, 'kept')
+    assert.equal(kept.stoppedHost, false)
+    assert.doesNotThrow(() => { process.kill(hostPid as number, 0) }, 'keep-host leaves the Host alive')
+    assert.equal(existsSync(join(stateDir, 'host.json')), true)
+
+    await assert.rejects(manager.ping(), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'OPERATOR_UNAVAILABLE')
+      return true
+    })
+    assert.doesNotThrow(() => { process.kill(hostPid as number, 0) }, 'the fenced ping must not stop the Host')
+
+    const stopped = await manager.stop()
+    assert.equal(stopped.stoppedHost, true)
+    await assertGone(hostPid as number)
+    assert.equal(existsSync(join(stateDir, 'host.json')), false)
+  } finally {
+    await manager.close().catch(() => undefined)
+    await manager.stop().catch(() => undefined)
     await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
   }
 })

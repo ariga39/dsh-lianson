@@ -7,6 +7,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
+import { START_CALL_TIMEOUT_MS, STOP_CALL_TIMEOUT_MS } from '../src/cli.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { HostManager, normalizeLoopbackOrigin } from '../src/host-manager.ts'
 import { scanHostProcesses } from '../src/proc-identity.ts'
@@ -21,6 +22,52 @@ await test('default ports round-trip and foreign or credential origins are refus
   assert.throws(() => normalizeLoopbackOrigin('http://example.com/'), /loopback/)
   assert.throws(() => normalizeLoopbackOrigin('http://user:pass@127.0.0.1/'), /credentials/)
   assert.throws(() => normalizeLoopbackOrigin('http://127.0.0.1/not-root'), /bare root/)
+})
+
+await test('stop timeout covers a queued start plus lock and signal bounds', () => {
+  assert.ok(
+    STOP_CALL_TIMEOUT_MS >= START_CALL_TIMEOUT_MS + 30_000,
+    'the stop reply deadline must cover a queued start plus lock and kill bounds',
+  )
+})
+
+await test('a failed probe of a verified live Host returns HOST_UNREACHABLE and keeps ownership', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-probe-'))
+  try {
+    const stateDir = join(root, 'state')
+    const record = readyRecord({ hostPid: process.pid, hostStartTime: '1', origin: 'http://127.0.0.1:9', port: 9 })
+    await writeState(stateDir, record)
+    const before = await readFile(join(stateDir, 'host.json'), 'utf8')
+    const procRoot = join(root, 'proc')
+    const procDir = join(procRoot, String(process.pid))
+    await mkdir(join(procRoot, 'self'), { recursive: true })
+    await writeFile(join(procRoot, 'self', 'stat'), '1 (node) S 0')
+    await writeFile(join(procRoot, 'self', 'environ'), '')
+    await writeFile(join(procRoot, 'self', 'cmdline'), '')
+    await mkdir(procDir, { recursive: true })
+    await writeProc(procDir, 'S', '1', record)
+    const signals: string[] = []
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      procRoot,
+      startTimeoutMs: 5_000,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      signalProcess: (_pid, signal) => { signals.push(signal) },
+    })
+    await assert.rejects(manager.start(), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'HOST_UNREACHABLE')
+      return true
+    })
+    assert.equal(signals.length, 0, 'a failed probe must never signal the verified Host')
+    assert.equal(await readFile(join(stateDir, 'host.json'), 'utf8'), before, 'ownership must be retained unchanged')
+    assert.doesNotThrow(() => { process.kill(process.pid, 0) })
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
 })
 
 await test('start refuses unsupported procfs before creating state or spawning', async () => {

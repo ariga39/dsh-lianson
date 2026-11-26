@@ -106,6 +106,19 @@ export interface PingOutcome {
   readonly latencyMs: number
 }
 
+/** Per-start launch overrides, ignored when an existing live Host is attached. */
+export interface HostLaunchOverrides {
+  readonly cwd?: string
+  readonly port?: number
+  readonly extraPatchPaths?: readonly string[]
+}
+
+interface EffectiveLaunchOptions {
+  readonly cwd: string
+  readonly port: number
+  readonly extraPatchPaths: readonly string[]
+}
+
 /** Host manager construction inputs. */
 export interface HostManagerOptions {
   readonly stateDir: string
@@ -149,6 +162,7 @@ export class HostManager {
   private readonly signalProcess: (pid: number, signal: NodeJS.Signals) => void
   private readonly spawnProcess: typeof spawn
   private operator: OperatorConnection | undefined
+  private attachmentClosed = false
 
   /**
    * @param options - state directory, launch context, timeouts, and test seams.
@@ -161,18 +175,22 @@ export class HostManager {
     this.spawnProcess = options.spawnProcess ?? spawn
   }
 
-  /** Launch or attach to the one managed Host. */
-  async start(): Promise<HostSummary> {
+  /**
+   * Launch or attach to the one managed Host.
+   * @param overrides - launch cwd/port/patches used only if this call actually launches.
+   */
+  async start(overrides: HostLaunchOverrides = {}): Promise<HostSummary> {
     await assertProcfsSupported(this.procRoot)
     await ensurePrivateDirectory(this.paths.stateDir)
+    const launch = this.effectiveLaunchOptions(overrides)
     const lock = await acquireLock(this.paths.hostLock, { waitMs: this.startTimeoutMs() })
     if (lock === undefined) throw new LiaisonError('HOST_START_TIMEOUT', 'host lifecycle lock was not acquired')
     try {
       const record = await this.readRecord()
-      if (record === undefined) return await this.launchAndAttach()
+      if (record === undefined) return await this.launchAndAttach(launch)
       if (record.state === 'launching') {
         await this.recoverLaunching(record)
-        return await this.launchAndAttach()
+        return await this.launchAndAttach(launch)
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
       if (identity.kind === 'unverified') {
@@ -182,12 +200,14 @@ export class HostManager {
       }
       if (identity.kind === 'dead-or-reused') {
         await this.cleanupFiles()
-        return await this.launchAndAttach()
+        return await this.launchAndAttach(launch)
       }
       if (!await probeLoopback(record.origin)) {
-        await this.terminateVerified(record)
-        await this.cleanupFiles()
-        return await this.launchAndAttach()
+        // A verified live Host whose endpoint is momentarily slow stays the
+        // owner. Never signal it or tear down its sessions because a probe failed.
+        throw new LiaisonError('HOST_UNREACHABLE', 'the verified Host is not reachable on its loopback origin', {
+          details: { hostPid: record.hostPid, origin: record.origin },
+        })
       }
       await this.attachOperator(record)
       return summaryOf(record)
@@ -272,6 +292,10 @@ export class HostManager {
    * @returns a truthful stop outcome.
    */
   async stop(options: { readonly keepHost?: boolean } = {}): Promise<StopOutcome> {
+    // Fence attachment before waiting for the lifecycle lock: a ping that
+    // already passed its read checks must not create a fresh reconnect loop
+    // after keep-host shutdown begins.
+    this.attachmentClosed = true
     const lock = await acquireLock(this.paths.hostLock, {
       waitMs: this.stopGraceMs() + this.killGraceMs() + 5_000,
     })
@@ -326,13 +350,14 @@ export class HostManager {
     }
   }
 
-  /** Close only this manager's operator connection. */
+  /** Close only this manager's operator connection and fence later attachment. */
   async close(): Promise<void> {
+    this.attachmentClosed = true
     await this.closeOperator()
   }
 
-  private async launchAndAttach(): Promise<HostSummary> {
-    const record = await this.launch()
+  private async launchAndAttach(launch: EffectiveLaunchOptions): Promise<HostSummary> {
+    const record = await this.launch(launch)
     // Readiness is committed: operator attachment is recoverable background
     // work, never physical launch rollback. A temporary /connect outage must
     // leave the verified Host and its ready record intact.
@@ -340,13 +365,13 @@ export class HostManager {
     return summaryOf(record)
   }
 
-  private async launch(): Promise<ReadyHostRecord> {
+  private async launch(launch: EffectiveLaunchOptions): Promise<ReadyHostRecord> {
     await ensurePrivateDirectory(this.paths.stateDir)
     await removeIfExists(this.paths.readyFile)
     const launchId = `launch-${randomUUID()}`
     const observerPatchPath = this.paths.observerPatch
     const readyFile = this.paths.readyFile
-    const args = this.launchArguments(observerPatchPath)
+    const args = this.launchArguments(observerPatchPath, launch)
     const expectedCmdline = [process.execPath, ...args]
     const patch = [{
       insert: [{
@@ -371,7 +396,7 @@ export class HostManager {
     let spawnError: Error | undefined
     try {
       child = this.spawnProcess(process.execPath, args, {
-        cwd: this.options.cwd,
+        cwd: launch.cwd,
         env: this.hostEnvironment(launchId),
         detached: true,
         stdio: 'ignore',
@@ -415,7 +440,7 @@ export class HostManager {
         port: origin.port,
         launchToken: ready.launchToken,
         dshHome: this.dshHome(),
-        cwd: this.options.cwd,
+        cwd: launch.cwd,
         startedAt: launching.startedAt,
       }
       await writePrivateFile(this.paths.hostRecord, JSON.stringify(record))
@@ -677,16 +702,24 @@ export class HostManager {
     return false
   }
 
-  private launchArguments(observerPatchPath: string): string[] {
+  private launchArguments(observerPatchPath: string, launch: EffectiveLaunchOptions): string[] {
     const upstreamRoot = join(this.options.projectRoot, 'deepseek-harness')
     const args = [
       join(upstreamRoot, 'apps', 'cli', 'lib', 'bin.js'),
       '--profile', 'web',
       '--patch', observerPatchPath,
     ]
-    for (const patch of this.options.extraPatchPaths ?? []) args.push('--patch', patch)
-    args.push('--no-open', '--host', '127.0.0.1', '--port', String(this.options.port ?? 0))
+    for (const patch of launch.extraPatchPaths) args.push('--patch', patch)
+    args.push('--no-open', '--host', '127.0.0.1', '--port', String(launch.port))
     return args
+  }
+
+  private effectiveLaunchOptions(overrides: HostLaunchOverrides): EffectiveLaunchOptions {
+    return {
+      cwd: overrides.cwd ?? this.options.cwd,
+      port: overrides.port ?? this.options.port ?? 0,
+      extraPatchPaths: overrides.extraPatchPaths ?? this.options.extraPatchPaths ?? [],
+    }
   }
 
   private hostEnvironment(launchId: string): NodeJS.ProcessEnv {
@@ -708,6 +741,9 @@ export class HostManager {
   }
 
   private async attachOperator(record: ReadyHostRecord): Promise<void> {
+    if (this.attachmentClosed) {
+      throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator attachment is closed for this lifecycle')
+    }
     const target: OperatorTarget = { origin: record.origin, launchToken: record.launchToken }
     const timeoutMs = this.options.operatorReadyTimeoutMs ?? 20_000
     if (this.operator === undefined) this.operator = new OperatorConnection(this.options.operator)
