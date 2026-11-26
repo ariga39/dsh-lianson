@@ -1,9 +1,9 @@
 /** Shared bootstrap readiness: resolvable inventory plus fresh-process import verification. */
 
 import { spawnSync } from 'node:child_process'
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { join } from 'node:path'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { UPSTREAM_ENTRIES } from '../src/upstream-inventory.mjs'
 
 const STATIC_ARTIFACTS = [
@@ -31,6 +31,40 @@ function hasNamedFile(path, name) {
   return false
 }
 
+/** Check local assets referenced by the built Vite index; external and inline references are not files. */
+export function missingWebAssets(root) {
+  const distDir = join(root, 'apps/web/dist')
+  const indexPath = join(distDir, 'index.html')
+  if (!existsSync(indexPath)) return []
+  let html
+  try {
+    html = readFileSync(indexPath, 'utf8')
+  } catch (error) {
+    return [`apps/web/dist/index.html (unreadable: ${error instanceof Error ? error.message : String(error)})`]
+  }
+  const missing = []
+  for (const match of html.matchAll(/\b(?:src|href)\s*=\s*["']([^"']+)["']/giu)) {
+    const reference = match[1].trim()
+    if (reference === '' || reference.startsWith('#') || reference.startsWith('//')) continue
+    if (/^[a-z][a-z0-9+.-]*:/iu.test(reference)) continue
+    const pathname = reference.split(/[?#]/u, 1)[0]
+    if (pathname === '' || pathname.endsWith('/')) continue
+    const assetPath = pathname.startsWith('/')
+      ? resolve(distDir, `.${pathname}`)
+      : resolve(distDir, pathname)
+    const inside = relative(distDir, assetPath)
+    if (inside === '') continue
+    if (inside.startsWith('..') || isAbsolute(inside)) {
+      missing.push(`apps/web/dist/index.html references outside dist: ${reference}`)
+      continue
+    }
+    if (!existsSync(assetPath) || !statSync(assetPath).isFile()) {
+      missing.push(`apps/web/dist/${inside.split(sep).join('/')} (referenced by index.html)`)
+    }
+  }
+  return missing
+}
+
 export function missingArtifacts(root, { platform = process.platform, arch = process.arch } = {}) {
   const missing = []
   for (const entry of UPSTREAM_ENTRIES) {
@@ -44,6 +78,7 @@ export function missingArtifacts(root, { platform = process.platform, arch = pro
   for (const path of STATIC_ARTIFACTS) {
     if (!existsSync(join(root, path))) missing.push(path)
   }
+  missing.push(...missingWebAssets(root))
   if (requiresNativeSystem(platform, arch)) {
     const platformPackage = join(root, 'native/system/packages', `${platform}-${arch}`)
     if (!hasNamedFile(platformPackage, 'system.node')) {

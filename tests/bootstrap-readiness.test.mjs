@@ -39,8 +39,18 @@ async function createFakeUpstream() {
   }
   await mkdir(join(root, 'apps/cli/lib'), { recursive: true })
   await writeFile(join(root, 'apps/cli/lib/bin.js'), '#!/usr/bin/env node\n')
-  await mkdir(join(root, 'apps/web/dist'), { recursive: true })
-  await writeFile(join(root, 'apps/web/dist/index.html'), '<!doctype html>\n')
+  await mkdir(join(root, 'apps/web/dist/assets'), { recursive: true })
+  await writeFile(join(root, 'apps/web/dist/assets/app.js'), 'export const app = true\n')
+  await writeFile(join(root, 'apps/web/dist/assets/app.css'), 'body{}\n')
+  await writeFile(join(root, 'apps/web/dist/index.html'), [
+    '<!doctype html>',
+    '<link rel="icon" href="https://example.invalid/icon.svg">',
+    '<link rel="stylesheet" href="./assets/app.css">',
+    '<script type="module" src="./assets/app.js"></script>',
+    '<a href="#main">main</a>',
+    '<script>globalThis.inline = true</script>',
+    '',
+  ].join('\n'))
   await mkdir(join(root, 'native/system/packages', `${process.platform}-${process.arch}/bin`), { recursive: true })
   await writeFile(join(root, 'native/system/packages', `${process.platform}-${process.arch}/bin/system.node`), '')
   return { root, files }
@@ -111,6 +121,32 @@ test('bootstrap readiness rejects missing Web output after its single rebuild', 
       /apps\/web\/dist\/index\.html/u,
     )
     assert.equal(builds, 1, 'readiness must not double-build')
+  } finally {
+    await rm(fixture.root, { recursive: true, force: true })
+  }
+})
+
+test('bootstrap readiness detects a missing local Vite asset referenced by index.html', async () => {
+  const fixture = await createFakeUpstream()
+  try {
+    const asset = join(fixture.root, 'apps/web/dist/assets/app.js')
+    await rm(asset)
+    assert.ok(
+      missingArtifacts(fixture.root).some(item => item.includes('apps/web/dist/assets/app.js')),
+      'missing HTML-linked asset must be reported precisely',
+    )
+
+    let builds = 0
+    await ensureUpstreamReady({
+      root: fixture.root,
+      log: () => {},
+      build: async () => {
+        builds += 1
+        await writeFile(asset, 'export const repaired = true\n')
+      },
+    })
+    assert.equal(builds, 1)
+    assert.deepEqual(missingArtifacts(fixture.root), [])
   } finally {
     await rm(fixture.root, { recursive: true, force: true })
   }
