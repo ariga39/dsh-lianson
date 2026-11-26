@@ -7,6 +7,7 @@ import { join, resolve } from 'node:path'
 import { ensureUpstreamReady } from './upstream-readiness.mjs'
 import { pnpmInvocation } from './pnpm-invocation.mjs'
 import { checkoutDetachedWithoutHooks } from './git-checkout.mjs'
+import { probePlaywrightRuntime } from './playwright-runtime.mjs'
 
 const ROOT = resolve(import.meta.dirname, '..')
 const UPSTREAM = join(ROOT, 'deepseek-harness')
@@ -36,11 +37,6 @@ function pnpm(args, options = {}) {
 function pnpmOutput(args, options = {}) {
   const invocation = pnpmInvocation(args)
   return output(invocation.command, invocation.args, { cwd: ROOT, ...options })
-}
-
-function pnpmCapture(args) {
-  const invocation = pnpmInvocation(args)
-  return spawnSync(invocation.command, invocation.args, { cwd: UPSTREAM, encoding: 'utf8' })
 }
 
 function stageUpstream() {
@@ -90,18 +86,7 @@ const shellInstall = ['--filter', '@deepseek-ai/dsh-web-frontend', 'exec', 'play
 console.log('bootstrap: ensuring Playwright headless shell (default chromium.launch target)')
 pnpm(shellInstall)
 
-if (process.platform === 'linux') {
-  const deps = pnpmCapture([
-    '--filter', '@deepseek-ai/dsh-web-frontend',
-    'exec', 'playwright', 'install-deps', '--dry-run', 'chromium-headless-shell',
-  ])
-  if (deps.status !== 0) {
-    throw new Error([
-      'bootstrap: Playwright headless shell is missing required Linux system libraries.',
-      'Install them with your distribution package manager; bootstrap never runs sudo or mutates packages.',
-      (deps.stdout ?? '') + (deps.stderr ?? ''),
-    ].join('\n'))
-  }
-}
+console.log('bootstrap: probing pinned Chromium headless shell runtime')
+probePlaywrightRuntime(UPSTREAM)
 
 console.log(`bootstrap: ready at ${COMMIT}`)

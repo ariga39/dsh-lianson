@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 import { UPSTREAM_ENTRIES } from '../src/upstream-inventory.mjs'
 import { pnpmInvocation } from '../scripts/pnpm-invocation.mjs'
+import { probePlaywrightRuntime } from '../scripts/playwright-runtime.mjs'
 import {
   ensureUpstreamReady, missingArtifacts, requiresNativeSystem, verifyUpstreamImports,
 } from '../scripts/upstream-readiness.mjs'
@@ -191,8 +192,25 @@ test('npm lifecycle entrypoints fall back to pinned corepack or PNPM_HOME', asyn
   }
 })
 
-test('native system.node is required only on documented upstream platforms', async () => {
-  assert.equal(requiresNativeSystem('linux', 'x64'), true)
+test('Playwright runtime probe reports missing shared libraries without package-manager writes', () => {
+  assert.throws(
+    () => probePlaywrightRuntime('/unused', {
+      run: () => ({
+        status: 1,
+        stdout: '',
+        stderr: 'error while loading shared libraries: libnss3.so: cannot open shared object file',
+      }),
+    }),
+    error => {
+      assert.match(error.message, /libnss3\.so/u)
+      assert.match(error.message, /distribution package manager/u)
+      assert.match(error.message, /never runs sudo or modifies packages/u)
+      return true
+    },
+  )
+})
+
+test('native system.node is required only on documented upstream platforms', async () => {  assert.equal(requiresNativeSystem('linux', 'x64'), true)
   assert.equal(requiresNativeSystem('linux', 'arm64'), true)
   assert.equal(requiresNativeSystem('darwin', 'x64'), true)
   assert.equal(requiresNativeSystem('darwin', 'arm64'), true)
