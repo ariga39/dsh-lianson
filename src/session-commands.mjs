@@ -98,10 +98,11 @@ export class SessionCommands {
     }
     const expectedModel = normalizeModel(model)
     const canonicalCwd = await this.#canonicalDirectory(cwd)
-    await this.#assertIsolatableWorkspace(canonicalCwd, delegationId)
+    await this.#assertIsolatableWorkspace(canonicalCwd)
 
     const catalog = await this.#adapter.modelCatalog()
     this.#requireAdvertised(catalog, expectedModel)
+    await this.#assertUniqueHostTitle(canonicalCwd, normalizedTitle, delegationId)
 
     const workspace = await this.#adapter.ensureWorkspace(canonicalCwd)
     if (typeof workspace?.workspaceId !== 'string') {
@@ -199,8 +200,9 @@ export class SessionCommands {
    * @param {{ delegationId: string, content: string, requestId?: string }} request - target and prompt.
    * @returns acceptance evidence, never a completion claim.
    */
-  async submitPrompt({ delegationId, content, requestId }) {
+  async submitPrompt({ delegationId, content, requestId, ipcRequestId, ipcFingerprint }) {
     const record = await this.#requireReady(delegationId)
+    this.#registry.assertWritable()
     if (typeof content !== 'string' || content.trim() === '') throw new TypeError('content is required')
     const stableRequestId = requestId ?? `request-${randomUUID()}`
     const before = await this.#adapter.sessionState({ sessionId: record.sessionId })
@@ -217,7 +219,7 @@ export class SessionCommands {
         { delegationId, sessionId: record.sessionId, requestId: stableRequestId },
       )
     }
-    return {
+    const result = {
       delegationId,
       sessionId: record.sessionId,
       requestId: stableRequestId,
@@ -225,6 +227,10 @@ export class SessionCommands {
       beforeCursor: before.cursor,
       completed: false,
     }
+    if (ipcRequestId !== undefined && ipcFingerprint !== undefined) {
+      await this.#registry.recordPromptReplay(ipcRequestId, ipcFingerprint, result)
+    }
+    return result
   }
 
   /**
@@ -424,11 +430,10 @@ export class SessionCommands {
   }
 
   /**
-   * Reject an implicit shared-temp workspace or one nested with another active
-   * delegation. Multiple delegations may intentionally share the exact same
-   * workspace root; distinct overlapping roots would break write isolation.
+   * Reject an implicit shared-temp workspace before any Host or ledger side
+   * effect. Distinct-root overlap is enforced atomically in ledger insertion.
    */
-  async #assertIsolatableWorkspace(cwd, delegationId) {
+  async #assertIsolatableWorkspace(cwd) {
     for (const tempRoot of await hostTempWritableRoots()) {
       if (pathsOverlap(cwd, tempRoot)) {
         throw new LiaisonError(
@@ -438,17 +443,27 @@ export class SessionCommands {
         )
       }
     }
-    const records = await this.#registry.list()
-    for (const record of records) {
-      if (record.delegationId === delegationId || record.cwd === cwd) continue
-      if (record.state !== 'creating' && record.state !== 'ready') continue
-      if (pathsOverlap(cwd, record.cwd)) {
-        throw new LiaisonError(
-          'delegation/workspace-overlap',
-          `delegation working directory "${cwd}" overlaps active delegation "${record.delegationId}" at "${record.cwd}"`,
-          { cwd, conflictingDelegationId: record.delegationId, conflictingCwd: record.cwd },
-        )
-      }
+  }
+
+  /**
+   * Reserve a title against every live Host session, not only ledger records.
+   * The stable session of a recovering delegation is excluded so replaying the
+   * same create does not conflict with the title it already owns.
+   */
+  async #assertUniqueHostTitle(cwd, title, delegationId) {
+    const existing = await this.#registry.get(delegationId)
+    const ownSessionId = existing?.sessionId
+    const sessions = await this.#adapter.listSessions()
+    const collision = (sessions?.items ?? []).find(item =>
+      item.sessionId !== ownSessionId
+      && item.cwd === cwd
+      && item.projections?.values?.title === title)
+    if (collision !== undefined) {
+      throw new LiaisonError(
+        'delegation/title-conflict',
+        `workspace already has a session titled "${title}"`,
+        { delegationId, title, sessionId: collision.sessionId, cwd },
+      )
     }
   }
 

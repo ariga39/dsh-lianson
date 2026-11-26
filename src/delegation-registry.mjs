@@ -5,8 +5,10 @@ import { chmod, mkdir, open, readFile, rename, unlink } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import { LiaisonError } from './errors.mjs'
 import { createLock } from './host-manager.mjs'
+import { pathsOverlap } from './host-writable-roots.mjs'
 
 const ACTIVE_STATES = new Set(['creating', 'ready'])
+const RESERVED_TITLE_STATES = new Set(['creating', 'ready', 'conflict', 'attach-failed'])
 const MAX_CREATE_REPLAYS = 4_096
 
 function clone(value) {
@@ -32,7 +34,7 @@ function sameModel(left, right) {
 }
 
 function emptyLedger() {
-  return { version: 1, delegations: [], createReplays: [] }
+  return { version: 1, delegations: [], createReplays: [], promptReplays: [] }
 }
 
 /**
@@ -46,6 +48,7 @@ export class DelegationRegistry {
   #filePath
   #records = new Map()
   #createReplays = new Map()
+  #promptReplays = new Map()
   #loadPromise
   #tail = Promise.resolve()
   #readOnly = false
@@ -99,6 +102,11 @@ export class DelegationRegistry {
     const release = this.#writerLock
     this.#writerLock = null
     await release?.()
+  }
+
+  /** Fail if this process does not own the durable ledger writer lock. */
+  assertWritable() {
+    this.#assertWritable()
   }
 
   /** @param {string} delegationId - delegation identity. @returns a copy or undefined. */
@@ -195,12 +203,31 @@ export class DelegationRegistry {
       const titleConflict = [...draft.records.values()].find(candidate =>
         candidate.workspaceId === input.workspaceId
         && candidate.title === input.title
-        && ACTIVE_STATES.has(candidate.state))
+        && RESERVED_TITLE_STATES.has(candidate.state))
       if (titleConflict !== undefined) {
         throw new LiaisonError(
           'delegation/title-conflict',
           `workspace already has an active delegation titled "${input.title}"`,
           { delegationId: input.delegationId, conflictingDelegationId: titleConflict.delegationId },
+        )
+      }
+
+      const workspaceOverlap = [...draft.records.values()].find(candidate =>
+        candidate.delegationId !== input.delegationId
+        && ACTIVE_STATES.has(candidate.state)
+        && candidate.cwd !== input.cwd
+        && pathsOverlap(candidate.cwd, input.cwd))
+      if (workspaceOverlap !== undefined) {
+        throw new LiaisonError(
+          'delegation/workspace-overlap',
+          `delegation working directory "${input.cwd}" overlaps active delegation `
+            + `"${workspaceOverlap.delegationId}" at "${workspaceOverlap.cwd}"`,
+          {
+            delegationId: input.delegationId,
+            cwd: input.cwd,
+            conflictingDelegationId: workspaceOverlap.delegationId,
+            conflictingCwd: workspaceOverlap.cwd,
+          },
         )
       }
 
@@ -352,6 +379,42 @@ export class DelegationRegistry {
   }
 
   /**
+   * Read one durable prompt acceptance by caller IPC request id.
+   * @param {string} requestId - the original IPC request id.
+   * @returns `{ requestId, fingerprint, response }` or undefined.
+   */
+  async getPromptReplay(requestId) {
+    await this.#load()
+    const entry = this.#promptReplays.get(requestId)
+    return entry === undefined ? undefined : clone(entry)
+  }
+
+  /**
+   * Persist one accepted prompt result so a daemon restart can return its
+   * original beforeCursor instead of a post-turn cursor.
+   * @param {string} requestId - caller IPC request id.
+   * @param {string} fingerprint - canonical request fingerprint.
+   * @param {object} response - accepted prompt result.
+   */
+  async recordPromptReplay(requestId, fingerprint, response) {
+    return this.#enqueue(async () => {
+      await this.#load()
+      this.#assertWritable()
+      const draft = this.#draft()
+      draft.promptReplays.set(requestId, {
+        requestId,
+        fingerprint,
+        response: clone(response),
+      })
+      while (draft.promptReplays.size > 4_096) {
+        draft.promptReplays.delete(draft.promptReplays.keys().next().value)
+      }
+      await this.#commit(draft)
+      return clone(response)
+    })
+  }
+
+  /**
    * Persist the model proven by a request header.
    * @param {string} delegationId - delegation identity.
    * @param {{ provider: string, model: string, reasoningEffort?: string }} model - verified route.
@@ -374,6 +437,7 @@ export class DelegationRegistry {
     return {
       records: cloneMap(this.#records),
       createReplays: cloneMap(this.#createReplays),
+      promptReplays: cloneMap(this.#promptReplays),
     }
   }
 
@@ -388,9 +452,10 @@ export class DelegationRegistry {
 
   async #commit(draft) {
     this.#assertWritable()
-    await this.#persist(draft.records, draft.createReplays)
+    await this.#persist(draft.records, draft.createReplays, draft.promptReplays)
     this.#records = draft.records
     this.#createReplays = draft.createReplays
+    this.#promptReplays = draft.promptReplays
   }
 
   #pruneCreateReplays(replays) {
@@ -462,6 +527,7 @@ export class DelegationRegistry {
   async #readInto() {
     const records = new Map()
     const createReplays = new Map()
+    const promptReplays = new Map()
     let text
     try {
       text = await readFile(this.#filePath, 'utf8')
@@ -469,6 +535,7 @@ export class DelegationRegistry {
       if (error?.code !== 'ENOENT') throw error
       this.#records = records
       this.#createReplays = createReplays
+      this.#promptReplays = promptReplays
       return
     }
     if (text.trim() !== '') {
@@ -497,12 +564,20 @@ export class DelegationRegistry {
           createReplays.set(entry.requestId, entry)
         }
       }
+      if (Array.isArray(parsed.promptReplays)) {
+        for (const entry of parsed.promptReplays) {
+          if (typeof entry?.requestId !== 'string' || typeof entry?.fingerprint !== 'string') continue
+          if (entry.response === null || typeof entry.response !== 'object') continue
+          promptReplays.set(entry.requestId, entry)
+        }
+      }
     }
     this.#records = records
     this.#createReplays = createReplays
+    this.#promptReplays = promptReplays
   }
 
-  async #persist(records, createReplays) {
+  async #persist(records, createReplays, promptReplays) {
     const directory = dirname(this.#filePath)
     await mkdir(directory, { recursive: true, mode: 0o700 })
     const temporary = `${this.#filePath}.${process.pid}.${randomUUID()}.tmp`
@@ -510,6 +585,7 @@ export class DelegationRegistry {
       ...emptyLedger(),
       delegations: [...records.values()],
       createReplays: [...createReplays.values()],
+      promptReplays: [...promptReplays.values()],
     }, null, 2)}\n`
     let handle
     try {

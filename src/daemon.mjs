@@ -26,6 +26,8 @@ let server
 let shuttingDown = false
 let closing = false
 let gate = Promise.resolve()
+let resolveInitialized
+const initialized = new Promise(resolve => { resolveInitialized = resolve })
 
 function assertOpen() {
   if (closing) throw new LiaisonError('DAEMON_CLOSING', 'Daemon is closing')
@@ -125,6 +127,7 @@ async function dispatch(request) {
   }
 
   try {
+    if (key.startsWith('delegation.')) await initialized
     if (key === 'host.start') {
       return await exclusive(async () => {
         assertOpen()
@@ -189,10 +192,20 @@ async function dispatch(request) {
       return { envelope: success(command, await delegations.list(), id) }
     }
     if (key === 'delegation.prompt') {
+      const ipcRequestId = typeof id === 'string' && id !== '' ? id : undefined
+      const ipcFingerprint = requestFingerprint(command, params)
+      if (ipcRequestId !== undefined) {
+        const replay = await delegations.promptReplay(ipcRequestId, ipcFingerprint)
+        if (replay !== undefined) return { envelope: success(command, replay, id) }
+      }
       await requireDelegationHost()
       const requestId = stablePromptRequestId(params.requestId, id)
       const promptParams = requestId === undefined ? params : { ...params, requestId }
-      return { envelope: success(command, await delegations.prompt(promptParams), id) }
+      const result = await delegations.prompt({
+        ...promptParams,
+        ...(ipcRequestId === undefined ? {} : { ipcRequestId, ipcFingerprint }),
+      })
+      return { envelope: success(command, result, id) }
     }
     if (key === 'delegation.verifyModel') {
       await requireDelegationHost()
@@ -269,7 +282,6 @@ async function shutdown(code = 0) {
 }
 
 async function main() {
-  await delegationRegistry.acquireWriter()
   server = await startIpcServer({
     stateDir,
     socketPath,
@@ -279,6 +291,11 @@ async function main() {
   if (server.reused === true) {
     process.exit(0)
     return
+  }
+  try {
+    await delegationRegistry.acquireWriter()
+  } finally {
+    resolveInitialized()
   }
 
   process.on('SIGTERM', () => { void shutdown(0) })

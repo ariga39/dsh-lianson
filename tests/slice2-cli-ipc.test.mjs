@@ -314,7 +314,16 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     assert.equal(firstPrompt.ok, true, JSON.stringify(firstPrompt))
     const derivedRequestId = 'request-restart-prompt-ipc'
     assert.equal(firstPrompt.data.requestId, derivedRequestId)
+    const originalBeforeCursor = firstPrompt.data.beforeCursor
     await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
+    const originalEvents = eventsOf(await adapter.sessionEvents({
+      address: { kind: 'session', sessionId: promptDelegation.data.sessionId },
+      maxMessages: 500,
+    }))
+    const originalUser = originalEvents.find(event =>
+      event.type === 'user/message' && event.data.source?.rpcId === derivedRequestId)
+    assert.ok(originalUser !== undefined && originalBeforeCursor < originalUser.seq,
+      'the original beforeCursor is anchored before the user request')
 
     const restartedStatus = await cli(['host', 'status'])
     process.kill(restartedStatus.data.daemonPid, 'SIGKILL')
@@ -325,6 +334,8 @@ test('slice2 integration: normal CLI and IPC through a real daemon with same-id 
     assert.equal(secondPrompt.ok, true, JSON.stringify(secondPrompt))
     assert.equal(secondPrompt.data.requestId, derivedRequestId,
       'a missing prompt requestId derives stably from the IPC id')
+    assert.equal(secondPrompt.data.beforeCursor, originalBeforeCursor,
+      'restart replay must not advance beforeCursor past the original request')
     await waitForRequest(adapter, promptDelegation.data.sessionId, derivedRequestId)
     const events = eventsOf(await adapter.sessionEvents({
       address: { kind: 'session', sessionId: promptDelegation.data.sessionId },

@@ -383,6 +383,10 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     assert.equal(record.returnedSessionId, substitutedSessionId)
 
     await assert.rejects(commands.createDelegation(params), errorCode('delegation/conflict'))
+    await assert.rejects(
+      commands.createDelegation(input('attach-substituted-title', { title: params.title })),
+      errorCode('delegation/title-conflict'),
+    )
   })
 
   await t.test('advertised model checks and request-window header proof isolate each session', async () => {
@@ -490,6 +494,55 @@ test('slice2: delegation ledger, conflict-safe creation, per-session models, ide
     })
     assert.deepEqual({ provider: firstAgain.provider, model: firstAgain.model }, modelOne)
     assert.deepEqual({ provider: secondAgain.provider, model: secondAgain.model }, modelOne)
+  })
+
+  await t.test('live Host titles and stable-session recovery are respected', async () => {
+    const { registry, commands } = newCommands('title-rematch')
+    const webTitle = `web title ${randomUUID()}`
+    const workspace = await adapter.ensureWorkspace(canonicalWorkspace)
+    const webSessionId = `session-${randomUUID()}`
+    await adapter.createSession({ workspaceId: workspace.workspaceId, sessionId: webSessionId })
+    await adapter.renameSession({ sessionId: webSessionId, title: webTitle })
+
+    const colliding = input('web-title', { title: webTitle })
+    await assert.rejects(commands.createDelegation(colliding), error => {
+      assert.equal(error?.code, 'delegation/title-conflict')
+      assert.equal(error.details.sessionId, webSessionId)
+      return true
+    })
+    assert.equal(await registry.get(colliding.delegationId), undefined,
+      'a live Host title conflict must fail before ledger or session creation')
+
+    const unavailable = input('web-title-model', {
+      title: webTitle,
+      model: { provider: modelOne.provider, model: `not-advertised-${randomUUID()}` },
+    })
+    await assert.rejects(commands.createDelegation(unavailable), errorCode('delegation/model-unavailable'),
+      'advertised model checks must run before title uniqueness')
+
+    const params = input('stable-recovery')
+    const faultedAdapter = createRemoteAdapter(operator.ctx.remote)
+    const realSelect = faultedAdapter.selectModel
+    let dropped = false
+    faultedAdapter.selectModel = async request => {
+      const selected = await realSelect(request)
+      if (dropped) return selected
+      dropped = true
+      const error = new Error('socket hang up after rename')
+      error.code = 'ECONNRESET'
+      error.transient = true
+      throw error
+    }
+    const faulted = new SessionCommands({ registry, adapter: faultedAdapter })
+    await assert.rejects(faulted.createDelegation(params), errorCode('delegation/model-selection-failed'))
+    const pending = await registry.get(params.delegationId)
+    assert.equal(pending.state, 'creating')
+    assert.equal(pending.title, params.title)
+
+    const recovered = await commands.createDelegation(params)
+    assert.equal(recovered.sessionId, pending.sessionId,
+      'recovery must rematch the same stable session and its existing title')
+    assert.equal(recovered.state, 'ready')
   })
 
   await t.test('repeated prompt requestId is accepted once and persists one user message', async () => {
