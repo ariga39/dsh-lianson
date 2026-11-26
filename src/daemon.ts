@@ -86,30 +86,23 @@ export async function runDaemon(options: HostManagerOptions): Promise<number> {
     }
     const deadline = requestDeadline(request)
     assertRequestLive(deadline)
-    let acted = false
+    let committed = false
     try {
       const keepHost = request.params.keepHost === true
       const outcome = await mutations.run(async () => {
         // Expiry before this point must not set the permanent closing fence
         // or withdraw the daemon; it is a pre-admission failure.
         assertRequestLive(deadline)
-        try {
-          const result = await manager.stop({ keepHost }, deadline)
+        return await manager.stop({ keepHost }, deadline, () => {
+          // Single daemon-shutdown commit decision, delivered by HostManager
+          // only after its own deadline and irreversible-action checks.
+          committed = true
           closing = true
-          acted = true
-          return result
-        } catch (error) {
-          // IPC_TIMEOUT before the lifecycle commit point leaves the daemon
-          // usable. Any other failure keeps the existing shutdown semantics.
-          if (error instanceof LiaisonError && error.code === 'IPC_TIMEOUT') throw error
-          closing = true
-          acted = true
-          throw error
-        }
+        })
       })
       return { ...outcome, daemonPid: process.pid }
     } finally {
-      if (acted) {
+      if (committed) {
         // Withdraw before the reply settles: an immediate next start must not
         // connect to a daemon that is already shutting down.
         await runtime.server?.withdraw().catch(() => undefined)

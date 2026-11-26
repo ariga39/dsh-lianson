@@ -297,6 +297,53 @@ await test('expired start and stop waiting on host.lock leave no action or fence
   }
 })
 
+await test('expired keep-host waiting on host.lock leaves daemon and attachment usable', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-keep-lock-expiry-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env = cliEnv(root, dshHome, stateDir)
+  const cleanupPids = new Set<number>()
+  let held: Awaited<ReturnType<typeof acquireLock>> | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    const first = startHost(env, workspace)
+    cleanupPids.add(first.daemonPid)
+    cleanupPids.add(first.hostPid)
+    held = await acquireLock(join(stateDir, 'host.lock'), { waitMs: 0 })
+    assert.ok(held !== undefined)
+    const socketPath = join(stateDir, 'daemon.sock')
+    const expiredKeep = callDaemon(socketPath, 'host.stop', { keepHost: true }, 250)
+    await assert.rejects(expiredKeep, (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'IPC_TIMEOUT')
+      return true
+    })
+    assert.notEqual(await procState(first.daemonPid), undefined)
+    assert.notEqual(await procState(first.daemonPid), 'Z')
+    assert.equal(existsSync(socketPath), true)
+
+    await held.release()
+    held = undefined
+    const fresh = startHost(env, workspace)
+    assert.equal(fresh.hostPid, first.hostPid, 'the expired keep-host must not fence or replace the Host')
+    assert.equal(fresh.daemonPid, first.daemonPid)
+    const stopped = runCli(env, workspace, ['host', 'stop'])
+    assert.equal(stopped.status, 0, stopped.stderr)
+    await assertGone(first.hostPid)
+    await assertGone(first.daemonPid)
+    cleanupPids.delete(first.hostPid)
+    cleanupPids.delete(first.daemonPid)
+  } finally {
+    await held?.release()
+    runCli(env, workspace, ['host', 'stop'])
+    for (const pid of cleanupPids) {
+      try { process.kill(pid, 'SIGKILL') } catch { /* already gone */ }
+    }
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
 await test('a spawn committed before expiry keeps its readiness and ownership', { timeout: 180_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-spawn-commit-'))
   const workspace = join(root, 'workspace')

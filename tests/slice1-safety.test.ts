@@ -468,6 +468,84 @@ await test('identity is re-verified before SIGKILL escalation', async () => {
   }
 })
 
+await test('ESRCH at SIGTERM reports already-exited instead of a signalled stop', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-esrch-'))
+  try {
+    const stateDir = join(root, 'state')
+    const record = readyRecord({ hostPid: process.pid, hostStartTime: '1' })
+    await writeState(stateDir, record)
+    const procRoot = join(root, 'proc')
+    const procDir = join(procRoot, String(process.pid))
+    await mkdir(join(procRoot, 'self'), { recursive: true })
+    await writeFile(join(procRoot, 'self', 'stat'), '1 (node) S 0')
+    await mkdir(procDir, { recursive: true })
+    await writeProc(procDir, 'S', '1', record)
+    const attempted: string[] = []
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      procRoot,
+      stopGraceMs: 100,
+      killGraceMs: 100,
+      signalProcess: (_pid, signal) => {
+        attempted.push(signal)
+        if (signal === 'SIGTERM') throw Object.assign(new Error('ESRCH: no such process'), { code: 'ESRCH' })
+      },
+    })
+    const started = Date.now()
+    const outcome = await manager.stop()
+    assert.equal(outcome.stoppedHost, false)
+    assert.equal(outcome.stopReason, 'already-exited')
+    assert.ok(Date.now() - started < 1_000, 'ESRCH must return promptly, not wait for grace')
+    assert.deepEqual(attempted, ['SIGTERM'])
+    assert.equal(existsSync(join(stateDir, 'host.json')), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('expiry at an already-exited commit decision does not commit daemon shutdown', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-dead-commit-'))
+  try {
+    const stateDir = join(root, 'state')
+    const record = readyRecord({ hostPid: process.pid, hostStartTime: '1' })
+    await writeState(stateDir, record)
+    const procRoot = join(root, 'proc')
+    await mkdir(join(procRoot, 'self'), { recursive: true })
+    await writeFile(join(procRoot, 'self', 'stat'), '1 (node) S 0')
+    let expiredCalls = 0
+    const deadline = {
+      end: 0,
+      remaining: () => 1_000,
+      expired: () => {
+        expiredCalls += 1
+        return expiredCalls >= 2
+      },
+    }
+    let commits = 0
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      procRoot,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      signalProcess: () => { throw new Error('a dead record must not be signalled') },
+    })
+    await assert.rejects(manager.stop({}, deadline, () => { commits += 1 }), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'IPC_TIMEOUT')
+      return true
+    })
+    assert.equal(commits, 0, 'expiry before the no-signal commit must not commit shutdown')
+    assert.ok(expiredCalls >= 2)
+    assert.equal(existsSync(join(stateDir, 'host.json')), false)
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 await test('a committed SIGTERM completes verified escalation after the caller budget expires', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-commit-escalate-'))
   try {

@@ -318,7 +318,17 @@ export class HostManager {
    * @param options - `keepHost` stops the daemon's connection but never the Host.
    * @returns a truthful stop outcome.
    */
-  async stop(options: { readonly keepHost?: boolean } = {}, deadline?: Deadline): Promise<StopOutcome> {
+  async stop(
+    options: { readonly keepHost?: boolean } = {},
+    deadline?: Deadline,
+    onCommit?: () => void,
+  ): Promise<StopOutcome> {
+    let committed = false
+    const commit = (): void => {
+      if (committed) return
+      committed = true
+      onCommit?.()
+    }
     const lock = await acquireLock(this.paths.hostLock, {
       waitMs: boundedWait(this.stopGraceMs() + this.killGraceMs() + 5_000, deadline),
     })
@@ -332,6 +342,7 @@ export class HostManager {
       if (record === undefined) {
         // Even an absent stop must not begin daemon shutdown after expiry.
         assertDeadlineLive(deadline)
+        commit()
         return { hostPid: null, stoppedHost: false, stopReason: 'absent' }
       }
       if (record.state === 'launching') {
@@ -350,17 +361,25 @@ export class HostManager {
           assertDeadlineLive(deadline)
           await this.closeOperator()
           await this.cleanupFiles()
+          assertDeadlineLive(deadline)
+          commit()
           return { hostPid: null, stoppedHost: false, stopReason: 'already-exited' }
         }
         if (options.keepHost === true) {
           assertDeadlineLive(deadline)
           throw new LiaisonError('HOST_LAUNCH_INCOMPLETE', 'an interrupted launch cannot be kept')
         }
-        await this.terminate(identity.pid, identity.startTime, record, deadline, () => {
+        const termination = await this.terminate(identity.pid, identity.startTime, record, deadline, () => {
           this.attachmentClosed = true
+          commit()
         })
         await this.closeOperator()
         await this.cleanupFiles()
+        if (!termination.signalled) {
+          assertDeadlineLive(deadline)
+          commit()
+          return { hostPid: identity.pid, stoppedHost: false, stopReason: 'already-exited' }
+        }
         return { hostPid: identity.pid, stoppedHost: true, stopReason: 'stopped' }
       }
       const identity = await verifyHostProcess(record.hostPid, record, this.procRoot)
@@ -373,6 +392,8 @@ export class HostManager {
         assertDeadlineLive(deadline)
         await this.closeOperator()
         await this.cleanupFiles()
+        assertDeadlineLive(deadline)
+        commit()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'already-exited' }
       }
       if (options.keepHost === true) {
@@ -380,14 +401,21 @@ export class HostManager {
         // record reports the truth instead of a false kept claim.
         assertDeadlineLive(deadline)
         this.attachmentClosed = true
+        commit()
         await this.closeOperator()
         return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'kept' }
       }
-      await this.terminate(record.hostPid, record.hostStartTime, record, deadline, () => {
+      const termination = await this.terminate(record.hostPid, record.hostStartTime, record, deadline, () => {
         this.attachmentClosed = true
+        commit()
       })
       await this.closeOperator()
       await this.cleanupFiles()
+      if (!termination.signalled) {
+        assertDeadlineLive(deadline)
+        commit()
+        return { hostPid: record.hostPid, stoppedHost: false, stopReason: 'already-exited' }
+      }
       return { hostPid: record.hostPid, stoppedHost: true, stopReason: 'stopped' }
     } finally {
       await lock.release()
@@ -723,7 +751,7 @@ export class HostManager {
     record: Pick<LaunchingHostRecord, 'launchId' | 'expectedCmdline'>,
     deadline?: Deadline,
     onCommitted?: () => void,
-  ): Promise<void> {
+  ): Promise<{ readonly signalled: boolean }> {
     const expectation: HostIdentityExpectation = {
       launchId: record.launchId,
       hostStartTime: startTime,
@@ -750,18 +778,18 @@ export class HostManager {
       }
     }
 
-    if (await verify() === 'gone') return
+    if (await verify() === 'gone') return { signalled: false }
     // Commit point: expiry before this check must not start a signal.
     assertDeadlineLive(deadline)
-    if (signal('SIGTERM') === 'gone') return
+    if (signal('SIGTERM') === 'gone') return { signalled: false }
     onCommitted?.()
-    if (await this.exitObserved(pid, this.stopGraceMs())) return
+    if (await this.exitObserved(pid, this.stopGraceMs())) return { signalled: true }
     // After a committed SIGTERM, verified escalation completes even if the
     // caller budget expired. Re-verify only to avoid signalling a reused PID.
-    if (await verify() === 'gone') return
-    if (signal('SIGKILL') === 'gone') return
-    if (await this.exitObserved(pid, this.killGraceMs())) return
-    if (await verify() === 'gone') return
+    if (await verify() === 'gone') return { signalled: true }
+    if (signal('SIGKILL') === 'gone') return { signalled: true }
+    if (await this.exitObserved(pid, this.killGraceMs())) return { signalled: true }
+    if (await verify() === 'gone') return { signalled: true }
     throw new LiaisonError('HOST_STOP_FAILED', 'the Host did not exit after SIGTERM and SIGKILL', {
       details: { hostPid: pid },
     })
