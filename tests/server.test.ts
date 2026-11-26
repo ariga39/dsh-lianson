@@ -1,7 +1,6 @@
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { sendCommand } from '../src/client.ts'
 import { LiaisonError } from '../src/errors.ts'
@@ -11,6 +10,7 @@ import type { DshRemote, RemoteEventPage, RemoteModelCatalog } from '../src/remo
 import { DelegationService } from '../src/service.ts'
 import { trustPolicyOf } from '../src/trust.ts'
 import type { LiaisonPaths } from '../src/paths.ts'
+import { makeTestRoot, removeTestRoot } from './support.ts'
 
 const CATALOG: RemoteModelCatalog = {
   default: { provider: 'fixture', model: 'model-a' },
@@ -27,7 +27,7 @@ describe('HTTP-over-UDS server', () => {
   let remote: StubRemote
 
   before(async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-liaison-server-'))
+    root = await makeTestRoot('server-')
     project = join(root, 'project')
     await mkdir(project, { recursive: true })
     paths = {
@@ -67,7 +67,7 @@ describe('HTTP-over-UDS server', () => {
   after(async () => {
     await server.stop()
     ledger.close()
-    await rm(root, { recursive: true, force: true })
+    await removeTestRoot(root)
   })
 
   it('reports plugin health, DSH_HOME, origin, and loopback state', async () => {
@@ -101,9 +101,11 @@ describe('HTTP-over-UDS server', () => {
     assert.equal(prompted.beforeCursor, 5)
     assert.equal(remote.prompts.length, 1)
 
-    remote.page = { cursor: 5, events: [
+    remote.page = { cursor: 6, events: [
+      { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
       { type: 'user/message', seq: 3, time: 3, data: { source: { rpcId: 'request-1' } } },
       { type: 'request/header', seq: 5, time: 5, data: { header: { config: { provider: 'fixture', model: 'model-a' } } } },
+      { type: 'turn/end', seq: 6, time: 6, data: { turn: 1, reason: { kind: 'completed' } } },
     ] }
     const verified = await sendCommand(paths.socketPath, '/verify-model', {
       delegationId: 'd1', requestId: 'request-1',

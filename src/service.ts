@@ -1,6 +1,7 @@
 /** Delegation, prompt, and model-verification business rules. */
 
 import { createHash, randomUUID } from 'node:crypto'
+import type { SessionWireEvent } from '@deepseek-ai/dsh-api-session-controller/types'
 import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title'
 import { LiaisonError } from './errors.ts'
 import type { DelegationRecord, Ledger, ModelVerification } from './ledger.ts'
@@ -25,6 +26,21 @@ export interface PromptResult {
   readonly accepted: true
 }
 
+/** Persisted events supporting one verification verdict. */
+export interface VerifyEvidence {
+  readonly turn?: number
+  readonly turnStartSeq?: number
+  readonly turnEndSeq?: number
+  readonly userSeq?: number
+  readonly headerSeq?: number
+  /** `turn` means the header was logged inside the target turn; `carried` means it predates it. */
+  readonly headerSource?: 'turn' | 'carried'
+  /** Assistant settlement proving the carried header's turn actually dispatched a request. */
+  readonly executionSeq?: number
+  /** Whether the selected header belongs to a fork-inherited prefix. */
+  readonly inherited?: boolean
+}
+
 /** One truthful model verification report. */
 export interface VerifyModelResult {
   readonly delegationId: string
@@ -32,7 +48,22 @@ export interface VerifyModelResult {
   readonly verification: ModelVerification
   readonly expected: { readonly provider: string; readonly model: string } | null
   readonly observed: { readonly provider: string; readonly model: string } | null
-  readonly evidence: { readonly userSeq?: number; readonly headerSeq?: number } | null
+  readonly evidence: VerifyEvidence | null
+}
+
+/** One open or closed turn window scoped by its durable turn number. */
+interface TurnWindow {
+  readonly turn: number
+  readonly startSeq: number
+  readonly endSeq?: number
+  readonly inherited: boolean
+}
+
+/** One selected request header and the execution proof required for carried headers. */
+interface HeaderChoice {
+  readonly header: SessionWireEvent
+  readonly source: 'turn' | 'carried'
+  readonly execution?: SessionWireEvent
 }
 
 /** Clock and identity seams kept explicit so unit tests stay deterministic. */
@@ -211,34 +242,59 @@ export class DelegationService {
     const page = await remote.readEvents(delegation.sessionId)
     const events = [...page.events].sort((left, right) => left.seq - right.seq)
     const expected = parseModel(delegation.model)
+    const inheritedCut = inheritedCutOf(events)
 
-    const user = input.requestId === undefined
-      ? undefined
-      : events.findLast(event => event.type === 'user/message' && requestIdOf(event.data) === input.requestId)
-    if (input.requestId !== undefined && user === undefined) {
-      return this.finishVerification(delegation, input.requestId ?? null, 'indeterminate', expected, null, null)
+    let user: SessionWireEvent | undefined
+    let turn: TurnWindow | undefined
+    if (input.requestId !== undefined) {
+      user = events.findLast(event => event.type === 'user/message' && requestIdOf(event.data) === input.requestId)
+      if (user === undefined) {
+        return this.finishVerification(delegation, input.requestId, 'indeterminate', expected, null, null)
+      }
+      turn = turnContaining(events, user.seq, inheritedCut)
+      if (turn === undefined) {
+        return this.finishVerification(delegation, input.requestId, 'indeterminate', expected, null, { userSeq: user.seq })
+      }
+    } else {
+      turn = latestTurn(events, inheritedCut)
+      if (turn === undefined) {
+        return this.finishVerification(delegation, null, 'indeterminate', expected, null, null)
+      }
+      user = lastUserInTurn(events, turn)
     }
-    const header = user === undefined
-      ? events.findLast(event => event.type === 'request/header')
-      : events.find(event => event.type === 'request/header' && event.seq > user.seq)
-    const observed = header === undefined ? null : modelOfHeader(header.data)
-    if (header === undefined || observed === null || expected === null) {
-      return this.finishVerification(
-        delegation,
-        input.requestId ?? null,
-        'indeterminate',
-        expected,
-        observed,
-        header === undefined ? null : { ...(user === undefined ? {} : { userSeq: user.seq }), headerSeq: header.seq },
-      )
+
+    const anchor = user?.seq ?? turn.startSeq
+    const base: VerifyEvidence = {
+      turn: turn.turn,
+      turnStartSeq: turn.startSeq,
+      ...(turn.endSeq === undefined ? {} : { turnEndSeq: turn.endSeq }),
+      ...(user === undefined ? {} : { userSeq: user.seq }),
+    }
+    const choice = headerChoiceFor(events, turn, anchor, user !== undefined)
+    if (choice === undefined) {
+      return this.finishVerification(delegation, input.requestId ?? null, 'indeterminate', expected, null, base)
+    }
+    const observed = modelOfHeader(choice.header.data)
+    const evidence: VerifyEvidence = {
+      ...base,
+      headerSeq: choice.header.seq,
+      headerSource: choice.source,
+      inherited: choice.header.seq < inheritedCut,
+      ...(choice.execution === undefined ? {} : { executionSeq: choice.execution.seq }),
+    }
+    // A carried header predates the target turn, and an inherited header was
+    // executed in the parent Session; both need an assistant settlement in
+    // this target step before the configuration proves anything here.
+    if ((choice.source === 'carried' || choice.header.seq < inheritedCut) && choice.execution === undefined) {
+      return this.finishVerification(delegation, input.requestId ?? null, 'indeterminate', expected, observed, evidence)
+    }
+    if (observed === null || expected === null) {
+      return this.finishVerification(delegation, input.requestId ?? null, 'indeterminate', expected, observed, evidence)
     }
     const verification: ModelVerification = observed.provider === expected.provider && observed.model === expected.model
       ? 'proven'
       : 'mismatch'
-    return this.finishVerification(delegation, input.requestId ?? null, verification, expected, observed, {
-      ...(user === undefined ? {} : { userSeq: user.seq }),
-      headerSeq: header.seq,
-    })
+    return this.finishVerification(delegation, input.requestId ?? null, verification, expected, observed, evidence)
   }
 
   private finishVerification(
@@ -247,7 +303,7 @@ export class DelegationService {
     verification: ModelVerification,
     expected: { provider: string; model: string } | null,
     observed: { provider: string; model: string } | null,
-    evidence: { userSeq?: number; headerSeq?: number } | null,
+    evidence: VerifyEvidence | null,
   ): VerifyModelResult {
     this.ledger.setModelVerification(delegation.delegationId, verification, this.now())
     return { delegationId: delegation.delegationId, requestId, verification, expected, observed, evidence }
@@ -277,6 +333,111 @@ export class DelegationService {
     if (title.length === 0) throw new LiaisonError('usage', 'title is empty after normalization')
     return title
   }
+}
+
+/** Last tagged fork marker: events before its seq are inherited from the parent. */
+function inheritedCutOf(events: readonly SessionWireEvent[]): number {
+  const marker = events.findLast(event => event.type === 'session/end-seed' && recordField(event.data, 'inherited') === true)
+  return marker?.seq ?? -1
+}
+
+/** The turn a user message was appended inside, plus that turn's end when committed. */
+function turnContaining(events: readonly SessionWireEvent[], userSeq: number, inheritedCut: number): TurnWindow | undefined {
+  let current: { turn: number; startSeq: number } | undefined
+  for (const event of events) {
+    if (event.seq > userSeq) break
+    if (event.type === 'turn/start') {
+      const turn = numberField(recordField(event.data, 'turn'))
+      if (turn !== undefined) current = { turn, startSeq: event.seq }
+    } else if (event.type === 'turn/end' && current !== undefined
+      && numberField(recordField(event.data, 'turn')) === current.turn) {
+      current = undefined
+    }
+  }
+  if (current === undefined) return undefined
+  const endSeq = events.find(event => event.seq > userSeq && event.type === 'turn/end'
+    && numberField(recordField(event.data, 'turn')) === current.turn)?.seq
+  return {
+    turn: current.turn,
+    startSeq: current.startSeq,
+    ...(endSeq === undefined ? {} : { endSeq }),
+    inherited: current.startSeq < inheritedCut,
+  }
+}
+
+/** The most recently opened turn, open or closed. */
+function latestTurn(events: readonly SessionWireEvent[], inheritedCut: number): TurnWindow | undefined {
+  const start = events.findLast(event => event.type === 'turn/start' && numberField(recordField(event.data, 'turn')) !== undefined)
+  if (start === undefined) return undefined
+  const turn = numberField(recordField(start.data, 'turn'))
+  /* v8 ignore next -- the predicate above already requires a numeric turn */
+  if (turn === undefined) return undefined
+  const endSeq = events.find(event => event.seq > start.seq && event.type === 'turn/end'
+    && numberField(recordField(event.data, 'turn')) === turn)?.seq
+  return {
+    turn,
+    startSeq: start.seq,
+    ...(endSeq === undefined ? {} : { endSeq }),
+    inherited: start.seq < inheritedCut,
+  }
+}
+
+/** Last user message in one turn window, used when no request id selects one. */
+function lastUserInTurn(events: readonly SessionWireEvent[], turn: TurnWindow): SessionWireEvent | undefined {
+  return events.findLast(event => event.type === 'user/message' && event.seq > turn.startSeq
+    && (turn.endSeq === undefined || event.seq < turn.endSeq))
+}
+
+/**
+ * Select the target step's header. A header logged after the anchoring user
+ * message and before the next step belongs to that message's step. Otherwise
+ * the step reused the previous header unchanged, and only an assistant
+ * settlement inside that step proves the reused configuration was dispatched.
+ */
+function headerChoiceFor(
+  events: readonly SessionWireEvent[],
+  turn: TurnWindow,
+  anchor: number,
+  hasAnchorUser: boolean,
+): HeaderChoice | undefined {
+  const step = hasAnchorUser ? stepContaining(events, turn, anchor) : undefined
+  const upperBound = step?.endSeq ?? turn.endSeq
+  const execution = events.find(event => (event.type === 'assistant/message' || event.type === 'assistant/attempt')
+    && event.seq > anchor
+    && numberField(recordField(event.data, 'turn')) === turn.turn
+    && (step === undefined || numberField(recordField(event.data, 'step')) === step.step)
+    && (upperBound === undefined || event.seq < upperBound))
+  const inStep = events.find(event => event.type === 'request/header' && event.seq > anchor
+    && (upperBound === undefined || event.seq < upperBound))
+  if (inStep !== undefined) {
+    return { header: inStep, source: 'turn', ...(execution === undefined ? {} : { execution }) }
+  }
+  const carried = events.findLast(event => event.type === 'request/header' && event.seq < anchor)
+  if (carried === undefined) return undefined
+  return { header: carried, source: 'carried', ...(execution === undefined ? {} : { execution }) }
+}
+
+/** The step a user message was appended inside, bounded by the next step or turn end. */
+function stepContaining(
+  events: readonly SessionWireEvent[],
+  turn: TurnWindow,
+  userSeq: number,
+): { step: number; endSeq?: number } | undefined {
+  const start = events.findLast(event => event.type === 'step/start'
+    && event.seq > turn.startSeq
+    && event.seq < userSeq
+    && numberField(recordField(event.data, 'turn')) === turn.turn)
+  if (start === undefined) return undefined
+  const step = numberField(recordField(start.data, 'step'))
+  if (step === undefined) return undefined
+  const next = events.find(event => event.seq > userSeq && (
+    (event.type === 'step/start' && numberField(recordField(event.data, 'turn')) === turn.turn)
+    || (event.type === 'turn/end' && numberField(recordField(event.data, 'turn')) === turn.turn)))
+  return { step, ...(next === undefined ? {} : { endSeq: next.seq }) }
+}
+
+function numberField(value: unknown): number | undefined {
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : undefined
 }
 
 /**

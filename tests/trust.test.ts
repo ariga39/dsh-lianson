@@ -5,16 +5,21 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LiaisonError } from '../src/errors.ts'
 import { trustPolicyOf, assertTrustedCwd } from '../src/trust.ts'
+import { makeTestRoot, removeTestRoot } from './support.ts'
 
 describe('trust boundaries', () => {
   let root: string
   let project: string
+  let siblingWorktree: string
   let policy: ReturnType<typeof trustPolicyOf>
 
   before(async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-liaison-trust-'))
-    project = join(root, 'project')
+    // Ordinary fixture root outside the platform temp areas upstream treats as shared.
+    root = await makeTestRoot('trust-')
+    project = join(root, 'repo')
+    siblingWorktree = join(root, 'repo-topic-worktree')
     await mkdir(project, { recursive: true })
+    await mkdir(siblingWorktree, { recursive: true })
     await mkdir(join(root, 'home', 'nested'), { recursive: true })
     await mkdir(join(root, 'run'), { recursive: true })
     await mkdir(join(root, 'data'), { recursive: true })
@@ -24,24 +29,77 @@ describe('trust boundaries', () => {
       socketPath: join(root, 'run', 's.sock'),
       lockPath: join(root, 'run', 's.sock.lock'),
       ledgerPath: join(root, 'data', 'ledger.sqlite3'),
-    }, undefined)
+    })
   })
 
   after(async () => {
-    await rm(root, { recursive: true, force: true })
+    await removeTestRoot(root)
   })
 
-  it('accepts an ordinary directory without a sandbox policy', () => {
+  it('allows an ordinary directory and a sibling worktree outside the Host cwd', () => {
     assert.equal(assertTrustedCwd(project, policy), project)
+    assert.equal(assertTrustedCwd(siblingWorktree, policy), siblingWorktree)
   })
 
-  it('rejects DSH_HOME, the runtime directory, and the ledger directory', () => {
-    for (const cwd of [join(root, 'home'), join(root, 'home', 'nested'), join(root, 'run'), join(root, 'data')]) {
+  it('keeps allowing ordinary worktrees when the deployment policy names another root', () => {
+    const deployment = trustPolicyOf({
+      dshHome: join(root, 'home'),
+      runtimeDir: join(root, 'run'),
+      socketPath: join(root, 'run', 's.sock'),
+      lockPath: join(root, 'run', 's.sock.lock'),
+      ledgerPath: join(root, 'data', 'ledger.sqlite3'),
+    }, { mode: 'workspace-write', workspaceRoot: join(root, 'host-cwd') })
+    assert.equal(assertTrustedCwd(siblingWorktree, deployment), siblingWorktree)
+  })
+
+  it('rejects protected state inside and above the protected paths', () => {
+    for (const cwd of [
+      join(root, 'home'),
+      join(root, 'home', 'nested'),
+      join(root, 'run'),
+      join(root, 'data'),
+      root,
+      '/',
+    ]) {
       assert.throws(
         () => assertTrustedCwd(cwd, policy),
         (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
         cwd,
       )
+    }
+  })
+
+
+  it('rejects a worktree inside a root shared by every deployment Session', async () => {
+    const shared = join(root, 'shared-grant')
+    await mkdir(join(shared, 'worktree'), { recursive: true })
+    const deployment = trustPolicyOf({
+      dshHome: join(root, 'home'),
+      runtimeDir: join(root, 'run'),
+      socketPath: join(root, 'run', 's.sock'),
+      lockPath: join(root, 'run', 's.sock.lock'),
+      ledgerPath: join(root, 'data', 'ledger.sqlite3'),
+    }, {
+      mode: 'workspace-write',
+      workspaceRoot: join(root, 'host-cwd'),
+      additionalWritableRoots: [shared],
+    })
+    assert.throws(
+      () => assertTrustedCwd(join(shared, 'worktree'), deployment),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
+    )
+    assert.equal(assertTrustedCwd(project, deployment), project)
+  })
+
+  it('rejects a worktree under the globally shared temp area', async () => {
+    const worktree = await mkdtemp(join(tmpdir(), 'dsh-liaison-worktree-'))
+    try {
+      assert.throws(
+        () => assertTrustedCwd(worktree, policy),
+        (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
+      )
+    } finally {
+      await rm(worktree, { recursive: true, force: true })
     }
   })
 
@@ -64,19 +122,9 @@ describe('trust boundaries', () => {
     }
   })
 
-  it('enforces configured writable roots when a sandbox policy exists', async () => {
-    const paths = {
-      dshHome: join(root, 'home'),
-      runtimeDir: join(root, 'run'),
-      socketPath: join(root, 'run', 's.sock'),
-      lockPath: join(root, 'run', 's.sock.lock'),
-      ledgerPath: join(root, 'data', 'ledger.sqlite3'),
-    }
-    const restricted = trustPolicyOf(paths, { mode: 'workspace-write', workspaceRoot: project })
-    assert.equal(assertTrustedCwd(project, restricted), project)
-    const readOnly = trustPolicyOf(paths, { mode: 'read-only', workspaceRoot: project })
+  it('rejects the filesystem root', () => {
     assert.throws(
-      () => assertTrustedCwd(project, readOnly),
+      () => assertTrustedCwd('/', policy),
       (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
     )
   })

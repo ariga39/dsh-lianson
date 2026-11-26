@@ -1,13 +1,16 @@
 import { after, before, beforeEach, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
+import { brandString } from '@deepseek-ai/dsh-brand'
+import type { SessionRequestId, SessionWireEvent } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { SessionEventMap } from '@deepseek-ai/dsh-session/types'
 import { LiaisonError } from '../src/errors.ts'
 import { Ledger } from '../src/ledger.ts'
 import type { DshRemote, RemoteEventPage, RemoteModelCatalog } from '../src/remote.ts'
 import { DelegationService } from '../src/service.ts'
 import { trustPolicyOf } from '../src/trust.ts'
+import { makeTestRoot, removeTestRoot } from './support.ts'
 
 const CATALOG: RemoteModelCatalog = {
   default: { provider: 'fixture', model: 'model-a' },
@@ -27,11 +30,11 @@ describe('delegation service', () => {
   let now: number
 
   before(async () => {
-    root = await mkdtemp(join(tmpdir(), 'dsh-liaison-service-'))
+    root = await makeTestRoot('service-')
   })
 
   after(async () => {
-    await rm(root, { recursive: true, force: true })
+    await removeTestRoot(root)
   })
 
   beforeEach(() => {
@@ -91,13 +94,14 @@ describe('delegation service', () => {
     const calls = remote.calls.length
     const replay = await service.create(input)
     assert.equal(replay.replayed, true)
+    await mkdir(join(root, 'other'), { recursive: true })
     assert.equal(remote.calls.length, calls)
     await assert.rejects(
       service.create({ ...input, title: 'Different title' }),
       (error: unknown) => error instanceof LiaisonError && error.code === 'conflict',
     )
     await assert.rejects(
-      service.create({ ...input, cwd: root }),
+      service.create({ ...input, cwd: join(root, 'other') }),
       (error: unknown) => error instanceof LiaisonError && error.code === 'conflict',
     )
   })
@@ -191,35 +195,205 @@ describe('delegation service', () => {
     assert.match(result.requestId, /^liaison-id-/)
   })
 
-  it('proves, contradicts, and honestly reports an unpersisted model', async () => {
+  it('attributes a header to the requested turn instead of a later turn', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
-
-    remote.page = { cursor: 5, events: [
-      event('user/message', 3, { source: { rpcId: 'request-1' } }),
-      event('request/header', 5, { header: { config: { provider: 'fixture', model: 'model-a' } } }),
+    remote.page = { cursor: 8, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+      turnStart(5, 2),
+      userMessage(6, 'request-2'),
+      header(7, 'model-b'),
+      turnEnd(8, 2),
     ] }
-    const proven = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
-    assert.equal(proven.verification, 'proven')
-    assert.deepEqual(proven.observed, { provider: 'fixture', model: 'model-a' })
-    assert.deepEqual(proven.evidence, { userSeq: 3, headerSeq: 5 })
+    const first = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(first.verification, 'proven')
+    assert.deepEqual(first.observed, { provider: 'fixture', model: 'model-a' })
+    assert.deepEqual(first.evidence, {
+      turn: 1, turnStartSeq: 1, turnEndSeq: 4, userSeq: 2, headerSeq: 3,
+      headerSource: 'turn', inherited: false,
+    })
     assert.equal(ledger.findDelegation('d1')?.modelVerification, 'proven')
 
-    remote.page = { cursor: 6, events: [
-      event('user/message', 4, { source: { rpcId: 'request-2' } }),
-      event('request/header', 6, { header: { config: { provider: 'fixture', model: 'model-b' } } }),
+    const second = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
+    assert.equal(second.verification, 'mismatch')
+    assert.deepEqual(second.observed, { provider: 'fixture', model: 'model-b' })
+  })
+
+  it('does not let a later turn prove an earlier turn with no header', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 7, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      turnEnd(3, 1),
+      turnStart(4, 2),
+      userMessage(5, 'request-2'),
+      header(6, 'model-a'),
+      turnEnd(7, 2),
     ] }
-    const mismatch = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
+    const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(result.verification, 'indeterminate')
+    assert.equal(result.observed, null)
+    assert.deepEqual(result.evidence, { turn: 1, turnStartSeq: 1, turnEndSeq: 3, userSeq: 2 })
+  })
+
+  it('uses a carried unchanged header only with execution evidence in that turn', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 8, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+      turnStart(5, 2),
+      userMessage(6, 'request-2'),
+      assistant(7, 2),
+      turnEnd(8, 2),
+    ] }
+    const proven = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
+    assert.equal(proven.verification, 'proven')
+    assert.deepEqual(proven.evidence, {
+      turn: 2, turnStartSeq: 5, turnEndSeq: 8, userSeq: 6,
+      headerSeq: 3, headerSource: 'carried', executionSeq: 7, inherited: false,
+    })
+
+    remote.page = { cursor: 8, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+      turnStart(5, 2),
+      userMessage(6, 'request-2'),
+      turnEnd(8, 2),
+    ] }
+    const unproven = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
+    assert.equal(unproven.verification, 'indeterminate')
+    assert.equal(unproven.observed?.model, 'model-a')
+    assert.equal(unproven.evidence?.executionSeq, undefined)
+  })
+
+  it('marks a carried header from the inherited prefix while proving live execution', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 9, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+      event('session/end-seed', 5, { inherited: true }),
+      turnStart(6, 2),
+      userMessage(7, 'request-2'),
+      assistant(8, 2),
+      turnEnd(9, 2),
+    ] }
+    const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
+    assert.equal(result.verification, 'proven')
+    assert.equal(result.evidence?.headerSource, 'carried')
+    assert.equal(result.evidence?.inherited, true)
+    assert.equal(result.evidence?.executionSeq, 8)
+  })
+
+
+  it('does not let a later step in the same turn prove an earlier prompt', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 8, events: [
+      turnStart(1, 1),
+      stepStart(2, 1, 1),
+      userMessage(3, 'request-1'),
+      stepStart(4, 1, 2),
+      userMessage(5, 'request-2'),
+      header(6, 'model-a'),
+      stepEnd(7, 1, 2),
+      turnEnd(8, 1),
+    ] }
+    const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(result.verification, 'indeterminate')
+    assert.equal(result.observed, null)
+  })
+
+  it('reports a mismatch and indeterminate cases truthfully', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 4, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-b'),
+      turnEnd(4, 1),
+    ] }
+    const mismatch = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
     assert.equal(mismatch.verification, 'mismatch')
     assert.deepEqual(mismatch.observed, { provider: 'fixture', model: 'model-b' })
 
-    remote.page = { cursor: 4, events: [event('user/message', 4, { source: { rpcId: 'request-2' } })] }
-    const unpersisted = await service.verifyModel({ delegationId: 'd1', requestId: 'request-2' })
-    assert.equal(unpersisted.verification, 'indeterminate')
-    assert.equal(unpersisted.observed, null)
+    remote.page = { cursor: 4, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      wireEvent('request/header', 3, { header: { config: { provider: 'fixture' } } }),
+      turnEnd(4, 1),
+    ] }
+    const malformed = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(malformed.verification, 'indeterminate')
+    assert.equal(malformed.observed, null)
 
     const unknown = await service.verifyModel({ delegationId: 'd1', requestId: 'missing' })
     assert.equal(unknown.verification, 'indeterminate')
+    assert.equal(unknown.evidence, null)
+  })
+
+
+  it('requires execution evidence for an inherited header inside an inherited turn', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    const inheritedTurn = [
+      turnStart(0, 1),
+      stepStart(1, 1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(5, 1),
+      event('session/end-seed', 6, { inherited: true }),
+      turnStart(7, 2),
+      stepStart(8, 2, 1),
+      userMessage(9, 'request-2'),
+      header(10, 'model-a'),
+      turnEnd(11, 2),
+    ]
+    remote.page = { cursor: 11, events: inheritedTurn }
+    const unproven = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(unproven.verification, 'indeterminate')
+    assert.equal(unproven.evidence?.inherited, true)
+
+    remote.page = { cursor: 11, events: [
+      ...inheritedTurn.slice(0, 4),
+      assistant(4, 1),
+      ...inheritedTurn.slice(4),
+    ] }
+    const proven = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(proven.verification, 'proven')
+    assert.equal(proven.evidence?.inherited, true)
+    assert.equal(proven.evidence?.executionSeq, 4)
+  })
+
+  it('uses the latest turn when no request id is supplied', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 8, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+      turnStart(5, 2),
+      userMessage(6, 'request-2'),
+      assistant(7, 2),
+      turnEnd(8, 2),
+    ] }
+    const result = await service.verifyModel({ delegationId: 'd1' })
+    assert.equal(result.requestId, null)
+    assert.equal(result.verification, 'proven')
+    assert.equal(result.evidence?.turn, 2)
+    assert.equal(result.evidence?.headerSource, 'carried')
   })
 
   it('rejects an unsafe working directory before any remote call', async () => {
@@ -296,6 +470,44 @@ class FakeRemote implements DshRemote {
   async dispose(): Promise<void> {}
 }
 
-function event(type: string, seq: number, data: unknown) {
-  return { type, seq, time: seq, data } as never
+function event<K extends keyof SessionEventMap>(type: K, seq: number, data: SessionEventMap[K]): SessionWireEvent {
+  return wireEvent(type, seq, data)
+}
+
+/** Deliberately malformed wire data for indeterminate-verdict coverage. */
+function wireEvent(type: string, seq: number, data: unknown): SessionWireEvent {
+  return { type, seq, time: seq, data: data as SessionWireEvent['data'] }
+}
+
+function userMessage(seq: number, requestId: string): SessionWireEvent {
+  return event('user/message', seq, {
+    id: brandString<SessionEventMap['user/message']['id']>(`message-${String(seq)}`),
+    role: 'user',
+    content: [],
+    source: { kind: 'user', rpcId: brandString<SessionRequestId>(requestId) },
+  })
+}
+
+function turnStart(seq: number, turn: number): SessionWireEvent {
+  return event('turn/start', seq, { turn })
+}
+
+function turnEnd(seq: number, turn: number): SessionWireEvent {
+  return event('turn/end', seq, { turn, reason: { kind: 'completed' } })
+}
+
+function header(seq: number, model: string): SessionWireEvent {
+  return event('request/header', seq, { header: { config: { provider: 'fixture', model } }, reason: 'initial' })
+}
+
+function assistant(seq: number, turn: number): SessionWireEvent {
+  return event('assistant/attempt', seq, { turn, step: 1, stream: [] })
+}
+
+function stepStart(seq: number, turn: number, step: number): SessionWireEvent {
+  return event('step/start', seq, { turn, step })
+}
+
+function stepEnd(seq: number, turn: number, step: number): SessionWireEvent {
+  return event('step/end', seq, { turn, step })
 }

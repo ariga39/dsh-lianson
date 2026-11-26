@@ -7,36 +7,50 @@ import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { LiaisonError } from './errors.ts'
 import type { LiaisonPaths } from './paths.ts'
 
-/** Directories a delegation may never use, plus the writable allow-list. */
+/** A directory a delegation Session must not own, plus shared writable areas. */
 export interface TrustPolicy {
-  readonly dshHome: string
-  readonly runtimeDir: string
-  readonly ledgerDirectory: string
-  /** Canonical writable roots from the deployment sandbox, or undefined without a policy. */
-  readonly writableRoots: readonly string[] | undefined
+  /** Harness state; cwd must be neither inside nor an ancestor of any entry. */
+  readonly protectedRoots: readonly string[]
+  /** Global temp areas upstream adds to every `workspace-write` root set. */
+  readonly globalWritableRoots: readonly string[]
 }
 
 /**
- * Build the trust policy from resolved paths and an optional sandbox policy.
- * `writableRoots()` is only consulted when the deployment exposes
- * `ctx.sandboxPolicy`; without it, protected roots still apply.
- * @param paths - resolved liaison paths.
- * @param policy - resolved sandbox execution policy, when the Host mounts one.
- * @returns the policy used by `create`.
+ * Neutral workspace root used only to ask upstream which additions are global.
+ * It never exists, so it cannot collide with the platform temp areas.
  */
-export function trustPolicyOf(paths: LiaisonPaths, policy: SandboxExecutionPolicy | undefined): TrustPolicy {
+const NEUTRAL_WORKSPACE_ROOT = '/__dsh_liaison_neutral_workspace__'
+
+/**
+ * Build the trust policy from resolved paths and the deployment sandbox
+ * policy. Upstream derives a Session's `workspace-write` boundary from that
+ * Session's own cwd, so the deployment's agentless `resolve()` workspace root
+ * is not an allow-list for new delegations. The only roots a new Session must
+ * not own are protected Harness state and the shared temp areas that upstream
+ * adds to every `workspace-write` policy.
+ * @param paths - resolved liaison paths.
+ * @param policy - deployment policy whose extra roots are shared by every
+ * Session; such roots are not isolated enough to become a new workspace.
+ * @returns the protected and globally shared roots.
+ */
+export function trustPolicyOf(paths: LiaisonPaths, policy?: SandboxExecutionPolicy): TrustPolicy {
+  const neutral = { mode: 'workspace-write' as const, workspaceRoot: NEUTRAL_WORKSPACE_ROOT }
+  const shared = (policy?.additionalWritableRoots ?? []).map(canonical)
   return {
-    dshHome: canonical(paths.dshHome),
-    runtimeDir: canonical(paths.runtimeDir),
-    ledgerDirectory: canonical(dirname(paths.ledgerPath)),
-    writableRoots: policy === undefined ? undefined : writableRoots(policy).map(canonical),
+    protectedRoots: [paths.dshHome, paths.runtimeDir, dirname(paths.ledgerPath)].map(canonical),
+    globalWritableRoots: [...new Set([
+      ...writableRoots(neutral)
+        .filter(root => root !== NEUTRAL_WORKSPACE_ROOT)
+        .map(canonical),
+      ...shared,
+    ])],
   }
 }
 
 /**
  * Validate and canonicalize a delegation working directory.
  * @param cwd - caller-supplied directory.
- * @param policy - protected roots and optional writable allow-list.
+ * @param policy - protected and globally shared roots.
  * @returns the physical directory path stored in the ledger.
  * @throws {LiaisonError} `invalid-cwd` or `unsafe-cwd`.
  */
@@ -54,21 +68,18 @@ export function assertTrustedCwd(cwd: string, policy: TrustPolicy): string {
     if (error instanceof LiaisonError) throw error
     throw new LiaisonError('invalid-cwd', `cwd cannot be read: ${cwd}`, { cwd })
   }
-  for (const [root, label] of [
-    [policy.dshHome, 'DSH_HOME'],
-    [policy.runtimeDir, 'runtime directory'],
-    [policy.ledgerDirectory, 'ledger directory'],
-  ] as const) {
-    if (isInside(root, physical)) {
-      throw new LiaisonError('unsafe-cwd', `cwd must not be inside the ${label}`, { cwd: physical, root })
+  // A Session rooted above Harness state could write that state, so ancestors
+  // count too. A Session rooted above a shared temp area is harmless; only a
+  // workspace inside the shared area is writable by unrelated processes.
+  for (const root of policy.protectedRoots) {
+    if (overlaps(root, physical)) {
+      throw new LiaisonError('unsafe-cwd', 'cwd must not overlap protected Harness state', { cwd: physical, root })
     }
   }
-  if (policy.writableRoots !== undefined
-    && !policy.writableRoots.some(root => isInside(root, physical))) {
-    throw new LiaisonError('unsafe-cwd', 'cwd is outside every writable root configured for this deployment', {
-      cwd: physical,
-      writableRoots: [...policy.writableRoots],
-    })
+  for (const root of policy.globalWritableRoots) {
+    if (isInside(root, physical)) {
+      throw new LiaisonError('unsafe-cwd', 'cwd must not be inside a globally shared writable root', { cwd: physical, root })
+    }
   }
   return physical
 }
@@ -79,6 +90,11 @@ function canonical(path: string): string {
   } catch {
     return resolve(path)
   }
+}
+
+/** Whether either path is inside the other, so ancestors and descendants both count. */
+function overlaps(left: string, right: string): boolean {
+  return isInside(left, right) || isInside(right, left)
 }
 
 function isInside(root: string, candidate: string): boolean {

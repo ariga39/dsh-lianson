@@ -38,4 +38,6 @@ dsh-liaison prompt --delegation-id task-1 --file instruction.md
 dsh-liaison verify-model --delegation-id task-1 --request-id review-1
 ```
 
+`--cwd` must be an ordinary isolated directory. Harness state and the shared temp areas (including ancestors of Harness state) are rejected; ordinary sibling worktrees are accepted.
+
 `create` and `prompt` persist their business key before the remote call. Repeating `--delegation-id` reuses the stored session when parameters match, and repeating `--request-id` reuses the original pre-prompt cursor when content matches. A different value under the same key is reported as a conflict. `verify-model` reports `proven`, `mismatch`, or `indeterminate` from the persisted `request/header`, never from intent.
