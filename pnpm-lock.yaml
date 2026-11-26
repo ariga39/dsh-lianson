@@ -35,6 +35,9 @@ importers:
       '@deepseek-ai/dsh-commands':
         specifier: link:./deepseek-harness/packages/interaction/commands
         version: link:deepseek-harness/packages/interaction/commands
+      '@deepseek-ai/dsh-home-paths':
+        specifier: link:./deepseek-harness/packages/util/home-paths
+        version: link:deepseek-harness/packages/util/home-paths
       '@deepseek-ai/dsh-host-webserver':
         specifier: link:./deepseek-harness/packages/host/webserver
         version: link:deepseek-harness/packages/host/webserver
@@ -44,9 +47,15 @@ importers:
       '@deepseek-ai/dsh-permission-presets':
         specifier: link:./deepseek-harness/packages/interaction/permission-presets
         version: link:deepseek-harness/packages/interaction/permission-presets
+      '@deepseek-ai/dsh-sandbox':
+        specifier: link:./deepseek-harness/packages/sandbox/sandbox
+        version: link:deepseek-harness/packages/sandbox/sandbox
       '@deepseek-ai/dsh-session':
         specifier: link:./deepseek-harness/packages/core/session
         version: link:deepseek-harness/packages/core/session
+      '@deepseek-ai/dsh-session-title':
+        specifier: link:./deepseek-harness/packages/session/session-title
+        version: link:deepseek-harness/packages/session/session-title
       '@deepseek-ai/dsh-typert-protocol':
         specifier: link:./deepseek-harness/packages/typert/protocol
         version: link:deepseek-harness/packages/typert/protocol
