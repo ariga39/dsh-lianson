@@ -545,7 +545,9 @@ export class SessionCommands {
   private async findPromptBinding(ipcRequestId: string | undefined): Promise<PromptKeyBinding | undefined> {
     if (ipcRequestId === undefined) return undefined
     for (const record of await this.registry.list()) {
-      const binding = record.promptKeys?.[ipcRequestId]
+      const binding = record.promptKeys !== undefined && Object.hasOwn(record.promptKeys, ipcRequestId)
+        ? record.promptKeys[ipcRequestId]
+        : undefined
       if (binding !== undefined) return binding
     }
     return undefined

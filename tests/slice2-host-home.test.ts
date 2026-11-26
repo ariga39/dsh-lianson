@@ -45,11 +45,25 @@ await test('child DSH_HOME resolution follows relative cwd and pinned tilde rule
   )
 
   assert.equal(resolveRecordedDshHome('legacy-relative', '/launch/work'), resolve('/launch/work/legacy-relative'))
-  assert.equal(resolveRecordedDshHome('/absolute/legacy', '/launch/work'), resolve('/absolute/legacy'))
-  assert.throws(
-    () => resolveRecordedDshHome('~/legacy', '/launch/work'),
-    (error: unknown) => error instanceof LiaisonError && error.code === 'HOST_RECORD_INVALID',
+  assert.equal(
+    resolveRecordedDshHome('legacy-relative ', '/launch/work'),
+    resolve('/launch/work/legacy-relative '),
   )
+  assert.equal(resolveRecordedDshHome('/absolute/legacy', '/launch/work'), resolve('/absolute/legacy'))
+  assert.equal(
+    resolveRecordedDshHome('/absolute/legacy ', '/launch/work'),
+    resolve('/absolute/legacy '),
+  )
+  assert.equal(
+    resolveRecordedDshHome('~project/dsh', '/launch/work'),
+    resolve('/launch/work/~project/dsh'),
+  )
+  for (const expanded of ['~', '~/legacy', '~\\legacy']) {
+    assert.throws(
+      () => resolveRecordedDshHome(expanded, '/launch/work'),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'HOST_RECORD_INVALID',
+    )
+  }
   assert.throws(
     () => resolveRecordedDshHome('legacy-relative', 'relative-cwd'),
     (error: unknown) => error instanceof LiaisonError && error.code === 'HOST_RECORD_INVALID',
@@ -127,8 +141,10 @@ await test('relative and tilde DSH_HOME reattach from a different cwd and HOME a
       assert.equal(reattached.hostPid, started.hostPid)
       assert.equal((await second.hostContext()).dshHome, expected)
 
-      await writeFile(join(stateDir, 'host.json'), JSON.stringify({ ...record, dshHome: 'legacy-relative' }))
-      assert.equal((await second.hostContext()).dshHome, resolve(workspaceA, 'legacy-relative'))
+      await writeFile(join(stateDir, 'host.json'), JSON.stringify({ ...record, dshHome: 'legacy-relative ' }))
+      assert.equal((await second.hostContext()).dshHome, resolve(workspaceA, 'legacy-relative '))
+      await writeFile(join(stateDir, 'host.json'), JSON.stringify({ ...record, dshHome: '~project/dsh' }))
+      assert.equal((await second.hostContext()).dshHome, resolve(workspaceA, '~project/dsh'))
       await writeFile(join(stateDir, 'host.json'), JSON.stringify({ ...record, dshHome: '~/legacy-tilde' }))
       await assert.rejects(second.hostContext(), (error: unknown) =>
         error instanceof LiaisonError && error.code === 'HOST_RECORD_INVALID')

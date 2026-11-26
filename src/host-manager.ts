@@ -986,14 +986,18 @@ export function resolveHostDshHome(env: NodeJS.ProcessEnv, launchCwd: string): s
  * @returns an absolute DSH_HOME for workspace policy.
  */
 export function resolveRecordedDshHome(dshHome: string, launchCwd: string): string {
-  const configured = dshHome.trim()
-  if (configured.startsWith('~')) {
+  if (dshHome.trim() === '') {
+    throw new LiaisonError('HOST_RECORD_INVALID', 'the recorded DSH_HOME is blank', {
+      details: { dshHome, cwd: launchCwd },
+    })
+  }
+  if (isHomeExpansion(dshHome)) {
     throw new LiaisonError('HOST_RECORD_INVALID', 'the recorded DSH_HOME uses unverifiable home expansion', {
       details: { dshHome },
     })
   }
-  if (isAbsolute(configured)) return resolve(configured)
-  if (configured !== '' && isAbsolute(launchCwd)) return resolve(launchCwd, configured)
+  if (isAbsolute(dshHome)) return resolve(dshHome)
+  if (isAbsolute(launchCwd)) return resolve(launchCwd, dshHome)
   throw new LiaisonError('HOST_RECORD_INVALID', 'the recorded DSH_HOME cannot be resolved from its launch cwd', {
     details: { dshHome, cwd: launchCwd },
   })
@@ -1003,6 +1007,10 @@ function expandChildHomePath(path: string, home: string): string {
   if (path === '~') return home
   if (path.startsWith('~/') || path.startsWith('~\\')) return join(home, path.slice(2))
   return path
+}
+
+function isHomeExpansion(path: string): boolean {
+  return path === '~' || path.startsWith('~/') || path.startsWith('~\\')
 }
 
 /**

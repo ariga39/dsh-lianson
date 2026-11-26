@@ -404,7 +404,7 @@ export class DelegationRegistry {
       if (bound !== undefined) {
         assertPromptKeyBinding(bound, ipcRequestId ?? '', delegationId, requestId, contentHash)
       }
-      const existing = record.prompts?.[requestId]
+      const existing = ownEntry(record.prompts, requestId)
       if (existing !== undefined) {
         if (existing.contentHash !== contentHash) {
           throw new DelegationRegistryError(
@@ -492,7 +492,7 @@ export class DelegationRegistry {
    */
   async promptReceipt(delegationId: string, requestId: string): Promise<PromptReceipt | undefined> {
     const record = await this.get(delegationId)
-    const receipt = record.prompts?.[requestId]
+    const receipt = ownEntry(record.prompts, requestId)
     return receipt === undefined ? undefined : structuredClone(receipt)
   }
 
@@ -778,12 +778,17 @@ function invalidLedger(ledgerFile: string, reason: string): DelegationRegistryEr
   })
 }
 
+function ownEntry<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
+  if (record === undefined || !Object.hasOwn(record, key)) return undefined
+  return record[key]
+}
+
 function findPromptKeyBinding(
   records: Map<string, DelegationRecord>,
   ipcRequestId: string,
 ): PromptKeyBinding | undefined {
   for (const record of records.values()) {
-    const binding = record.promptKeys?.[ipcRequestId]
+    const binding = ownEntry(record.promptKeys, ipcRequestId)
     if (binding !== undefined) return binding
   }
   return undefined
@@ -824,7 +829,7 @@ function requireRecord(draft: Map<string, DelegationRecord>, delegationId: strin
 }
 
 function requireReceipt(record: DelegationRecord, delegationId: string, requestId: string): PromptReceipt {
-  const receipt = record.prompts?.[requestId]
+  const receipt = ownEntry(record.prompts, requestId)
   if (receipt === undefined) {
     throw new DelegationRegistryError('DELEGATION_NOT_FOUND', `request ${requestId} is not in the ledger`, {
       delegationId,

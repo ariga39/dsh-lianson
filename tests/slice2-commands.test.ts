@@ -1,6 +1,6 @@
 import { strict as assert } from 'node:assert'
 import { createHash, randomUUID } from 'node:crypto'
-import { mkdir, mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
@@ -856,6 +856,100 @@ await test('prompt key bindings persist across restart and reject changed identi
       requestId: fresh.requestId,
       contentHash: contentHash('fresh keyed content'),
     })
+  } finally {
+    await restarted?.close()
+    await cleanup(item)
+  }
+})
+
+await test('prompt dictionaries treat inherited Object names as literal caller keys', async () => {
+  const item = await fixture('prompt-object-names')
+  let restarted: DelegationRegistry | undefined
+  try {
+    await item.commands.create(createCommand(item))
+    const normal = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'normal-request',
+      content: 'ordinary',
+    })
+    assert.equal(normal.replayed, false)
+    assert.equal(item.host.promptCalls, 1)
+
+    const literal = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'toString',
+      content: 'literal toString',
+    })
+    assert.equal(literal.replayed, false)
+    assert.equal(item.host.promptCalls, 2)
+
+    const bound = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'toString',
+      content: 'literal toString',
+      ipcRequestId: 'toString',
+    })
+    assert.equal(bound.replayed, true)
+    assert.equal(item.host.promptCalls, 2)
+
+    const constructorKey = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'hasOwnProperty',
+      content: 'literal constructor key',
+      ipcRequestId: 'constructor',
+    })
+    assert.equal(constructorKey.replayed, false)
+    assert.equal(item.host.promptCalls, 3)
+
+    const text = await readFile(item.ledgerFile, 'utf8')
+    const parsed = JSON.parse(text) as {
+      readonly delegations: Record<string, {
+        readonly prompts: Record<string, { readonly requestId: string }>
+        readonly promptKeys: Record<string, { readonly requestId: string }>
+      }>
+    }
+    const persisted = parsed.delegations['del-1']
+    assert.ok(persisted !== undefined)
+    assert.ok(Object.hasOwn(persisted.prompts, 'toString'))
+    assert.equal(persisted.prompts['toString']?.requestId, 'toString')
+    assert.ok(Object.hasOwn(persisted.prompts, 'hasOwnProperty'))
+    assert.ok(Object.hasOwn(persisted.promptKeys, 'toString'))
+    assert.equal(persisted.promptKeys['toString']?.requestId, 'toString')
+    assert.ok(Object.hasOwn(persisted.promptKeys, 'constructor'))
+    assert.equal(persisted.promptKeys['constructor']?.requestId, 'hasOwnProperty')
+
+    await item.registry.close()
+    restarted = new DelegationRegistry({ ledgerFile: item.ledgerFile, lockWaitMs: 0 })
+    const commands = new SessionCommands({
+      registry: restarted,
+      access: accessFor(item.host, item.context),
+      ledgerDir: join(item.root, 'ledger'),
+    })
+    const replay = await commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'toString',
+      content: 'literal toString',
+      ipcRequestId: 'toString',
+    })
+    assert.equal(replay.replayed, true)
+    assert.equal(item.host.promptCalls, 3)
+    const keyedReplay = await commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'hasOwnProperty',
+      content: 'literal constructor key',
+      ipcRequestId: 'constructor',
+    })
+    assert.equal(keyedReplay.replayed, true)
+    assert.equal(item.host.promptCalls, 3)
+    await expectCode(
+      commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'toString',
+        content: 'changed toString',
+        ipcRequestId: 'toString',
+      }),
+      'DELEGATION_PROMPT_CONFLICT',
+    )
   } finally {
     await restarted?.close()
     await cleanup(item)
