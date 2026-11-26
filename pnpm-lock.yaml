@@ -29,9 +29,15 @@ importers:
       '@deepseek-ai/dsh-client-connection':
         specifier: link:./deepseek-harness/packages/client/connection
         version: link:deepseek-harness/packages/client/connection
+      '@deepseek-ai/dsh-cmdline':
+        specifier: link:./deepseek-harness/packages/boot/cmdline
+        version: link:deepseek-harness/packages/boot/cmdline
       '@deepseek-ai/dsh-commands':
         specifier: link:./deepseek-harness/packages/interaction/commands
         version: link:deepseek-harness/packages/interaction/commands
+      '@deepseek-ai/dsh-host-webserver':
+        specifier: link:./deepseek-harness/packages/host/webserver
+        version: link:deepseek-harness/packages/host/webserver
       '@deepseek-ai/dsh-llm':
         specifier: link:./deepseek-harness/packages/llm/llm
         version: link:deepseek-harness/packages/llm/llm
@@ -50,6 +56,9 @@ importers:
       '@deepseek-ai/dsh-user-questions':
         specifier: link:./deepseek-harness/packages/interaction/user-questions
         version: link:deepseek-harness/packages/interaction/user-questions
+      '@deepseek-ai/node-addon-system':
+        specifier: link:./deepseek-harness/native/system/packages/entry
+        version: link:deepseek-harness/native/system/packages/entry
       '@types/node':
         specifier: 22.20.1
         version: 22.20.1
