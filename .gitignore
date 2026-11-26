@@ -1,1 +1,4 @@
 /deepseek-harness/
+/node_modules/
+/.cache/
+/.deepseek-harness.staging-*/
