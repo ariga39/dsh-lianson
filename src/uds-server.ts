@@ -97,12 +97,20 @@ export class UdsServer {
       this.server = listening
       this.started = true
     } catch (error) {
-      if (server !== undefined) {
-        server.closeAllConnections()
-        await new Promise<void>((resolve) => { server?.close(() => { resolve() }) })
+      try {
+        if (server !== undefined) {
+          try {
+            server.closeAllConnections()
+            // A listener that bound unlinks its own socket; one that never
+            // listened owns no path and must not touch a pre-existing entry.
+            await closeIfListening(server)
+          } catch {
+            // Startup already failed; preserve that failure instead of a cleanup error.
+          }
+        }
+      } finally {
+        await this.releaseLock().catch(() => undefined)
       }
-      await rm(this.socketPath, { force: true })
-      await this.releaseLock()
       throw error
     }
   }
@@ -122,14 +130,16 @@ export class UdsServer {
     const server = this.server
     this.server = undefined
     this.started = false
-    if (server !== undefined) {
-      server.closeAllConnections()
-      await new Promise<void>((resolve) => {
-        server.close(() => { resolve() })
-      })
+    try {
+      if (server !== undefined) {
+        server.closeAllConnections()
+        // Node unlinks the bound Unix socket when its listener closes. Doing
+        // another unlink here could delete a replacement we never owned.
+        await closeIfListening(server)
+      }
+    } finally {
+      await this.releaseLock().catch(() => undefined)
     }
-    await rm(this.socketPath, { force: true })
-    await this.releaseLock()
   }
 
   private async releaseLock(): Promise<void> {
@@ -202,6 +212,12 @@ export async function inspectPrivateRuntimeDirectory(directory: string): Promise
     })
   }
   return { dev: info.dev, ino: info.ino }
+}
+
+/** Close a listening server and wait for its path cleanup; a non-listening server owns no path. */
+function closeIfListening(server: Server): Promise<void> {
+  if (!server.listening) return Promise.resolve()
+  return new Promise<void>((resolve) => { server.close(() => { resolve() }) })
 }
 
 /** Whether a `tryLockExclusive` failure means another descriptor owns the lock. */

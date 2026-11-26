@@ -1,7 +1,8 @@
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
-import { chmod, mkdir, mkdtemp, rm, stat, symlink, writeFile } from 'node:fs/promises'
+import { chmod, lstat, mkdir, mkdtemp, readFile, rm, stat, symlink, writeFile } from 'node:fs/promises'
 import { request } from 'node:http'
+import { createServer as createNetServer } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { LiaisonError } from '../src/errors.ts'
@@ -124,15 +125,62 @@ describe('Unix-domain socket ownership', () => {
       (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-runtime-dir',
     )
   })
-  it('refuses to replace a regular file at the socket path', async () => {
+  it('preserves a regular file at the socket path and releases the lock', async () => {
     const socketPath = join(root, 'occupied')
     const lockPath = join(root, 'occupied.lock')
+    await writeFile(socketPath, 'keep these bytes')
     const server = new UdsServer(socketPath, lockPath, async () => {})
-    await writeFile(socketPath, 'not a socket')
     await assert.rejects(
       server.start(),
       (error: unknown) => error instanceof LiaisonError && error.code === 'socket-in-use',
     )
+    assert.equal(await readFile(socketPath, 'utf8'), 'keep these bytes')
+
+    await rm(socketPath)
+    const retry = new UdsServer(socketPath, lockPath, async () => {})
+    await retry.start()
+    await retry.stop()
+  })
+
+  it('preserves a directory at the socket path and releases the lock', async () => {
+    const socketPath = join(root, 'occupied-directory')
+    const lockPath = join(root, 'occupied-directory.lock')
+    await mkdir(socketPath)
+    const server = new UdsServer(socketPath, lockPath, async () => {})
+    await assert.rejects(
+      server.start(),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'socket-in-use',
+    )
+    assert.equal((await stat(socketPath)).isDirectory(), true)
+
+    await rm(socketPath, { recursive: true })
+    const retry = new UdsServer(socketPath, lockPath, async () => {})
+    await retry.start()
+    await retry.stop()
+  })
+
+
+  it('does not unlink another owner socket when stopped before binding', async () => {
+    const socketPath = join(root, 'owned-by-another')
+    const owner = createNetServer(() => {})
+    await new Promise<void>((resolve, reject) => {
+      owner.once('error', reject)
+      owner.listen(socketPath, () => { resolve() })
+    })
+    try {
+      const stranger = new UdsServer(socketPath, `${socketPath}.lock`, async () => {})
+      await stranger.stop()
+      assert.equal((await lstat(socketPath)).isSocket(), true)
+    } finally {
+      await new Promise<void>((resolve) => { owner.close(() => { resolve() }) })
+    }
+  })
+  it('does not unlink an unowned path when stopped before binding', async () => {
+    const socketPath = join(root, 'never-bound')
+    await writeFile(socketPath, 'still here')
+    const server = new UdsServer(socketPath, `${socketPath}.lock`, async () => {})
+    await server.stop()
+    assert.equal(await readFile(socketPath, 'utf8'), 'still here')
   })
 })
 
