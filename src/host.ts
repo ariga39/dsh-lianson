@@ -1,5 +1,4 @@
 import { spawn, type ChildProcess } from 'node:child_process'
-import { once } from 'node:events'
 import { join } from 'node:path'
 import { setTimeout as delay } from 'node:timers/promises'
 import { createLaunchLineCollector, findLaunchUrl, redact } from './launch-lines.ts'
@@ -77,6 +76,7 @@ export async function startAnnouncedProcess(options: AnnouncedProcessOptions): P
     env: options.env,
     stdio: ['ignore', 'pipe', 'pipe'],
   })
+  const closed = closePromise(child)
 
   const stdoutLines: string[] = []
   const stdoutChunks: string[] = []
@@ -109,7 +109,7 @@ export async function startAnnouncedProcess(options: AnnouncedProcessOptions): P
     )
     coldStartMs = Date.now() - startedAt
   } catch (error) {
-    await stopChild(child)
+    await stopChild(child, closed)
     const diagnostics = [
       `stdout:\n${stdoutChunks.join('')}`,
       `stderr:\n${stderrChunks.join('')}`,
@@ -131,7 +131,7 @@ export async function startAnnouncedProcess(options: AnnouncedProcessOptions): P
       // Flush any unterminated tail before the streams close permanently.
       stdoutLines.push(...stdoutRemainder.finish())
       stderrRemainder.finish()
-      await stopChild(child)
+      await stopChild(child, closed)
     },
   }
 }
@@ -204,17 +204,51 @@ async function waitForLaunchUrl(
   })
 }
 
-async function stopChild(child: ChildProcess): Promise<void> {
-  if (child.exitCode !== null || child.signalCode !== null) return
-  const closed = once(child, 'close').then(() => undefined)
-  child.kill('SIGTERM')
-  const forced = setTimeout(() => {
-    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
-  }, STOP_GRACE_MS)
-  forced.unref()
+/**
+ * Resolve when the ChildProcess and every inherited stdio stream have closed.
+ * A spawn failure resolves immediately because no process owns the pipes.
+ * @param child - spawned child process.
+ * @returns a promise resolved once `close` arrives, or after a spawn error.
+ */
+function closePromise(child: ChildProcess): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false
+    const finish = (): void => {
+      if (settled) return
+      settled = true
+      resolve()
+    }
+    child.once('close', finish)
+    child.once('error', () => {
+      if (child.pid === undefined) finish()
+    })
+  })
+}
+
+/**
+ * Signal only a live root, then always await final stream close within a deadline.
+ * @param child - spawned child process.
+ * @param closed - close promise captured at spawn time.
+ */
+async function stopChild(child: ChildProcess, closed: Promise<void>): Promise<void> {
+  const live = child.pid !== undefined && child.exitCode === null && child.signalCode === null
+  let forced: NodeJS.Timeout | undefined
+  if (live) {
+    child.kill('SIGTERM')
+    forced = setTimeout(() => {
+      if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL')
+    }, STOP_GRACE_MS)
+    forced.unref()
+  }
+  const deadline = new AbortController()
   try {
-    await Promise.race([closed, delay(STOP_GRACE_MS + 2_000)])
+    await Promise.race([
+      closed,
+      delay(STOP_GRACE_MS + 2_000, undefined, { signal: deadline.signal }),
+    ])
   } finally {
-    clearTimeout(forced)
+    // Cancel the losing deadline timer and release the escalation timer on success.
+    deadline.abort()
+    if (forced !== undefined) clearTimeout(forced)
   }
 }

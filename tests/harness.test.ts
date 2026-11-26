@@ -4,6 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { test } from 'node:test'
+import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
 import { createLaunchLineCollector } from '../src/launch-lines.ts'
 import { startAnnouncedProcess } from '../src/host.ts'
@@ -13,7 +14,22 @@ import { stageUpstream } from '../scripts/upstream.ts'
 
 const projectRoot = fileURLToPath(new URL('..', import.meta.url))
 const upstreamRoot = join(projectRoot, 'deepseek-harness')
+
+async function waitForProcessGone(pid: number, timeoutMs: number): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    try {
+      process.kill(pid, 0)
+    } catch (error) {
+      if (typeof error === 'object' && error !== null && 'code' in error && error.code === 'ESRCH') return
+      throw error
+    }
+    await delay(5)
+  }
+  throw new Error(`process ${String(pid)} did not exit within ${String(timeoutMs)}ms`)
+}
 const announceFixture = fileURLToPath(new URL('./fixtures/announce.ts', import.meta.url))
+const exitGapFixture = fileURLToPath(new URL('./fixtures/exit-gap.ts', import.meta.url))
 
 await test('announcement survives chunk and CRLF splits', async () => {
   const collector = createLaunchLineCollector()
@@ -82,6 +98,29 @@ await test('missing Web assets and a consumed upstream declaration are detected'
   assert.ok(consumed, 'the consumed Remote declaration must be a tracked requirement')
   const missing = missingRequirements(requirements, path => path !== consumed.path && existsSync(path))
   assert.ok(missing.includes(`${consumed.label}: ${consumed.path}`))
+})
+
+await test('stop awaits inherited stderr after the announced root exits', async () => {
+  const running = await startAnnouncedProcess({
+    command: process.execPath,
+    args: [exitGapFixture],
+    cwd: projectRoot,
+    env: process.env,
+    timeoutMs: 10_000,
+    label: 'exit gap fixture',
+  })
+  try {
+    const pid = running.pid
+    assert.ok(pid !== undefined, 'the announced fixture must expose its root pid')
+    await waitForProcessGone(pid, 5_000)
+    await running.stop()
+    assert.match(running.stderr(), /EXIT_GAP_FINAL_STDERR/u, 'the inherited stderr tail must be complete on return')
+    const repeated = Date.now()
+    await running.stop()
+    assert.ok(Date.now() - repeated < 1_000, 'a repeated stop after close must be prompt')
+  } finally {
+    await running.stop()
+  }
 })
 
 await test('staging ignores a failing user hook', async () => {
