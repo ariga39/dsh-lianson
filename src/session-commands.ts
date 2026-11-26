@@ -190,7 +190,10 @@ export class SessionCommands {
       const existing = await this.lookupCreate(requestedId, command.delegationId, fingerprint, command.ipcRequestId)
       if (existing !== undefined && existing.state === 'ready') {
         await this.assertRecordedWorkspace(existing, command.deadline)
-        return { delegation: existing, replayed: true }
+        const delegation = command.ipcRequestId === undefined
+          ? existing
+          : await this.registry.bindCreateIpcId(existing.delegationId, command.ipcRequestId)
+        return { delegation, replayed: true }
       }
 
       assertDeadlineLive(command.deadline)
@@ -647,6 +650,16 @@ export class SessionCommands {
     const byIpc = ipcRequestId === undefined
       ? undefined
       : records.find(record => record.createIpcId === ipcRequestId)
+    if (byId !== undefined
+      && ipcRequestId !== undefined
+      && byId.createIpcId !== undefined
+      && byId.createIpcId !== ipcRequestId) {
+      throw new DelegationRegistryError(
+        'DELEGATION_REPLAY_CONFLICT',
+        `delegation ${byId.delegationId} is already bound to create key ${byId.createIpcId}`,
+        { delegationId: byId.delegationId, boundCreateIpcId: byId.createIpcId, createIpcId: ipcRequestId },
+      )
+    }
     if (explicitDelegationId !== undefined
       && byIpc !== undefined
       && byIpc.delegationId !== explicitDelegationId) {

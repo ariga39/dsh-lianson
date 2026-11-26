@@ -320,6 +320,28 @@ export class DelegationRegistry {
         if (existing.state === 'conflict' || existing.state === 'attach-failed') {
           throw alreadyExists(delegationId, existing.state)
         }
+        if (input.createIpcId !== undefined) {
+          const bound = findCreateIpcId(draft, input.createIpcId)
+          if (bound !== undefined && bound.delegationId !== delegationId) {
+            throw new DelegationRegistryError(
+              'DELEGATION_REPLAY_CONFLICT',
+              `create key ${input.createIpcId} is already bound to ${bound.delegationId}`,
+              { delegationId, boundDelegationId: bound.delegationId, createIpcId: input.createIpcId },
+            )
+          }
+          if (existing.createIpcId !== undefined && existing.createIpcId !== input.createIpcId) {
+            throw new DelegationRegistryError(
+              'DELEGATION_REPLAY_CONFLICT',
+              `delegation ${delegationId} is already bound to create key ${existing.createIpcId}`,
+              { delegationId, boundCreateIpcId: existing.createIpcId, createIpcId: input.createIpcId },
+            )
+          }
+          if (existing.createIpcId === undefined) {
+            const next: DelegationRecord = { ...existing, createIpcId: input.createIpcId }
+            draft.set(delegationId, next)
+            return { value: { record: structuredClone(next), replayed: true }, changed: true }
+          }
+        }
         return { value: { record: structuredClone(existing), replayed: true }, changed: false }
       }
 
@@ -356,6 +378,38 @@ export class DelegationRegistry {
       }
       draft.set(delegationId, record)
       return { value: { record: structuredClone(record), replayed: false }, changed: true }
+    })
+  }
+
+  /**
+   * Bind one explicit create key to an existing unbound delegation.
+   * @param delegationId - existing durable delegation.
+   * @param ipcRequestId - caller's explicit create key.
+   * @returns the durable record carrying the binding.
+   */
+  async bindCreateIpcId(delegationId: string, ipcRequestId: string): Promise<DelegationRecord> {
+    const key = requireText(ipcRequestId, 'ipcRequestId')
+    return await this.mutate((draft) => {
+      const record = requireRecord(draft, delegationId)
+      const bound = findCreateIpcId(draft, key)
+      if (bound !== undefined && bound.delegationId !== delegationId) {
+        throw new DelegationRegistryError(
+          'DELEGATION_REPLAY_CONFLICT',
+          `create key ${key} is already bound to ${bound.delegationId}`,
+          { delegationId, boundDelegationId: bound.delegationId, createIpcId: key },
+        )
+      }
+      if (record.createIpcId !== undefined) {
+        if (record.createIpcId === key) return { value: structuredClone(record), changed: false }
+        throw new DelegationRegistryError(
+          'DELEGATION_REPLAY_CONFLICT',
+          `delegation ${delegationId} is already bound to create key ${record.createIpcId}`,
+          { delegationId, boundCreateIpcId: record.createIpcId, createIpcId: key },
+        )
+      }
+      const next: DelegationRecord = { ...record, createIpcId: key }
+      draft.set(delegationId, next)
+      return { value: structuredClone(next), changed: true }
     })
   }
 
@@ -781,6 +835,16 @@ function invalidLedger(ledgerFile: string, reason: string): DelegationRegistryEr
 function ownEntry<T>(record: Readonly<Record<string, T>> | undefined, key: string): T | undefined {
   if (record === undefined || !Object.hasOwn(record, key)) return undefined
   return record[key]
+}
+
+function findCreateIpcId(
+  records: Map<string, DelegationRecord>,
+  ipcRequestId: string,
+): DelegationRecord | undefined {
+  for (const record of records.values()) {
+    if (record.createIpcId === ipcRequestId) return record
+  }
+  return undefined
 }
 
 function findPromptKeyBinding(

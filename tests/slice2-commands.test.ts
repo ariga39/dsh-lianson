@@ -103,6 +103,8 @@ interface FakeHost {
   eventsThrows: Error | undefined
   promptThrowsAfterCommit: boolean
   promptCalls: number
+  renameCalls: number
+  selectModelCalls: number
   readonly promptRequestIds: string[]
   readonly events: Map<string, SessionWireEvent[]>
   readonly queues: Map<string, readonly SessionQueuedItem[]>
@@ -127,6 +129,8 @@ function fakeHost(): FakeHost {
     eventsThrows: undefined,
     promptThrowsAfterCommit: false,
     promptCalls: 0,
+    renameCalls: 0,
+    selectModelCalls: 0,
     promptRequestIds,
     events,
     queues,
@@ -203,9 +207,11 @@ function fakeHost(): FakeHost {
         return { ok: true, value: { sessionId: sessionIdOf(requested) } }
       },
       async rename(request) {
+        state.renameCalls += 1
         return { ok: true, value: { title: request.title, seq: 0 } }
       },
       async selectModel(request) {
+        state.selectModelCalls += 1
         return {
           ok: true,
           value: {
@@ -1257,6 +1263,70 @@ await test('a failed requested-range read is uncertain and never resends', async
     assert.equal(item.host.promptCalls, 0)
     assert.equal((await item.registry.promptReceipt('del-1', 'request-range-failure'))?.accepted, false)
   } finally {
+    await cleanup(item)
+  }
+})
+
+
+await test('ready create replay binds one new caller key without session or model mutation', async () => {
+  const item = await fixture('create-key-binding')
+  let restarted: DelegationRegistry | undefined
+  try {
+    const created = await item.commands.create(createCommand(item, { delegationId: 'del-1', title: 'Alpha' }))
+    assert.equal(item.host.requestedSessionIds.length, 1)
+    assert.equal(item.host.renameCalls, 1)
+    assert.equal(item.host.selectModelCalls, 1)
+    const original = await item.registry.get('del-1')
+    assert.equal(original.cwd, item.work)
+    assert.deepEqual(original.expectedModel, { provider: 'provider-a', model: 'model-a' })
+
+    const bound = await item.commands.create(createCommand(item, {
+      delegationId: 'del-1',
+      title: 'Alpha',
+      ipcRequestId: 'late-create-key',
+    }))
+    assert.equal(bound.replayed, true)
+    assert.equal(bound.delegation.sessionId, created.delegation.sessionId)
+    assert.equal((await item.registry.get('del-1')).createIpcId, 'late-create-key')
+    assert.equal(item.host.requestedSessionIds.length, 1)
+    assert.equal(item.host.renameCalls, 1)
+    assert.equal(item.host.selectModelCalls, 1)
+
+    await expectCode(
+      item.commands.create(createCommand(item, {
+        delegationId: 'del-1',
+        title: 'Alpha',
+        ipcRequestId: 'different-create-key',
+      })),
+      'DELEGATION_REPLAY_CONFLICT',
+    )
+    assert.equal((await item.registry.get('del-1')).createIpcId, 'late-create-key')
+    assert.equal(item.host.requestedSessionIds.length, 1)
+
+    await item.registry.close()
+    restarted = new DelegationRegistry({ ledgerFile: item.ledgerFile, lockWaitMs: 0 })
+    const commands = new SessionCommands({
+      registry: restarted,
+      access: accessFor(item.host, item.context),
+      ledgerDir: join(item.root, 'ledger'),
+    })
+    const recovered = await commands.create({
+      title: 'Alpha',
+      provider: 'provider-a',
+      model: 'model-a',
+      cwd: item.work,
+      ipcRequestId: 'late-create-key',
+    })
+    assert.equal(recovered.replayed, true)
+    assert.equal(recovered.delegation.delegationId, 'del-1')
+    assert.equal(recovered.delegation.sessionId, created.delegation.sessionId)
+    assert.equal(recovered.delegation.cwd, item.work)
+    assert.deepEqual(recovered.delegation.expectedModel, { provider: 'provider-a', model: 'model-a' })
+    assert.equal(item.host.requestedSessionIds.length, 1)
+    assert.equal(item.host.renameCalls, 1)
+    assert.equal(item.host.selectModelCalls, 1)
+  } finally {
+    await restarted?.close()
     await cleanup(item)
   }
 })

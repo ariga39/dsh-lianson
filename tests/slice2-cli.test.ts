@@ -462,8 +462,10 @@ await test('normal delegation CLI: two models, worktree isolation, replay, verif
 
     const delegationA = `delegation-a-${nonce}`
     const delegationB = `delegation-b-${nonce}`
+    const titleA = `Delegation Alpha ${nonce}`
+    const createKey = `create-key-${nonce}`
     const createdA = await delegationCreate(env, worktreeA, [
-      '--title', `Delegation Alpha ${nonce}`,
+      '--title', titleA,
       '--provider', TWO_MODEL_PROVIDER,
       '--model', TWO_MODEL_A,
       '--cwd', worktreeA,
@@ -483,6 +485,17 @@ await test('normal delegation CLI: two models, worktree isolation, replay, verif
     const sessionA = stringField(recordA, 'sessionId')
     const sessionB = stringField(recordB, 'sessionId')
     assert.notEqual(sessionA, sessionB)
+
+    const boundReplay = await delegationCreate(env, worktreeA, [
+      '--title', titleA,
+      '--provider', TWO_MODEL_PROVIDER,
+      '--model', TWO_MODEL_A,
+      '--cwd', worktreeA,
+      '--delegation-id', delegationA,
+      '--id', createKey,
+    ])
+    assert.equal(boundReplay.result.replayed, true)
+    assert.equal(stringField(objectOf(boundReplay.result.delegation), 'sessionId'), sessionA)
 
     const getById = await runCli(env, worktreeA, ['delegation', 'get', '--delegation-id', delegationA])
     assert.equal(stringField(objectOf(okResult(getById).delegation), 'sessionId'), sessionA)
@@ -589,6 +602,18 @@ await test('normal delegation CLI: two models, worktree isolation, replay, verif
     const restarted = await startHost(env, worktreeA, patchPath)
     daemonPid = restarted.daemonPid
     assert.equal(restarted.hostPid, started.hostPid, 'the kept Host must be reattached')
+    const recoveredByKey = await delegationCreate(env, worktreeA, [
+      '--title', titleA,
+      '--provider', TWO_MODEL_PROVIDER,
+      '--model', TWO_MODEL_A,
+      '--cwd', worktreeA,
+      '--id', createKey,
+    ])
+    assert.equal(recoveredByKey.result.replayed, true)
+    assert.equal(stringField(objectOf(recoveredByKey.result.delegation), 'delegationId'), delegationA)
+    assert.equal(stringField(objectOf(recoveredByKey.result.delegation), 'sessionId'), sessionA)
+    const listAfterKeyReplay = await runCli(env, worktreeA, ['delegation', 'list'])
+    assert.equal((okResult(listAfterKeyReplay).delegations as readonly unknown[]).length, 2)
     const delegationC = `delegation-c-${nonce}`
     await delegationCreate(env, worktreeA, [
       '--title', `Delegation Gamma ${nonce}`,
