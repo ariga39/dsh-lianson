@@ -99,6 +99,8 @@ interface FakeHost {
   sessionCreateFailure: ((requestedSessionId: string) => RemoteFailure) | undefined
   stateFailure: RemoteFailure | undefined
   stateThrows: Error | undefined
+  eventsFailure: RemoteFailure | undefined
+  eventsThrows: Error | undefined
   promptThrowsAfterCommit: boolean
   promptCalls: number
   readonly promptRequestIds: string[]
@@ -121,6 +123,8 @@ function fakeHost(): FakeHost {
     sessionCreateFailure: undefined,
     stateFailure: undefined,
     stateThrows: undefined,
+    eventsFailure: undefined,
+    eventsThrows: undefined,
     promptThrowsAfterCommit: false,
     promptCalls: 0,
     promptRequestIds,
@@ -227,6 +231,8 @@ function fakeHost(): FakeHost {
         return { ok: true, value: stateOf(String(request.sessionId)) }
       },
       async events(request): Promise<RemoteResult<SessionEventsPage>> {
+        if (state.eventsThrows !== undefined) throw state.eventsThrows
+        if (state.eventsFailure !== undefined) return { ok: false, error: state.eventsFailure }
         const address = request.address
         if (address.kind !== 'session') return { ok: false, error: remoteFailure('session/not-found', 'not a session') }
         const all = eventsOf(String(address.sessionId))
@@ -1144,6 +1150,112 @@ await test('verify-model resolves a persisted prompt key before explicit request
     })
     assert.equal(legacy.requestId, legacyRequestId)
     assert.deepEqual(legacy.observedModel, { provider: 'provider-a', model: 'model-a' })
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('pending recovery rejects a within-page sequence gap instead of resending', async () => {
+  const item = await fixture('prompt-page-gap')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'assistant/message', { content: [{ type: 'text', text: 'zero' }] }),
+      wireEvent(2, 'assistant/message', { content: [{ type: 'text', text: 'two' }] }),
+    ])
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-gap',
+      contentHash: contentHash('gap'),
+      beforeCursor: 0,
+    })
+    await expectCode(
+      item.commands.prompt({ delegationId: 'del-1', requestId: 'request-gap', content: 'gap' }),
+      'DELEGATION_REQUEST_ID_UNCERTAIN',
+    )
+    assert.equal(item.host.promptCalls, 0)
+    assert.equal((await item.registry.promptReceipt('del-1', 'request-gap'))?.accepted, false)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('a recent pending window completes without scanning older unrelated history', async () => {
+  const item = await fixture('prompt-recent-window')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    const total = 32 * 400 + 500
+    const events: SessionWireEvent[] = []
+    for (let index = 0; index < total; index += 1) {
+      events.push(wireEvent(index, 'assistant/message', { content: [{ type: 'text', text: 'filler' }] }))
+    }
+    item.host.events.set(created.delegation.sessionId, events)
+    const beforeCursor = total - 101
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-recent',
+      contentHash: contentHash('recent'),
+      beforeCursor,
+    })
+    const accepted = await item.commands.prompt({
+      delegationId: 'del-1',
+      requestId: 'request-recent',
+      content: 'recent',
+    })
+    assert.equal(accepted.replayed, true)
+    assert.equal(accepted.beforeCursor, beforeCursor)
+    assert.equal(item.host.promptCalls, 1)
+  } finally {
+    await cleanup(item)
+  }
+})
+
+await test('verify-model treats an internal page gap as incomplete turn evidence', async () => {
+  const item = await fixture('verify-internal-gap')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      userMessage(1, 'request-before-gap'),
+      wireEvent(2, 'assistant/message', { content: [{ type: 'text', text: 'before gap' }] }),
+      requestHeader(3, 'provider-a', 'model-a'),
+      requestHeader(5, 'provider-b', 'model-b'),
+      userMessage(6, 'request-after-gap'),
+      wireEvent(7, 'assistant/message', { content: [{ type: 'text', text: 'after gap' }] }),
+      wireEvent(8, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+    await expectCode(
+      item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-after-gap' }),
+      'DELEGATION_MODEL_EVIDENCE_MISSING',
+    )
+  } finally {
+    await cleanup(item)
+  }
+})
+
+
+await test('a failed requested-range read is uncertain and never resends', async () => {
+  const item = await fixture('prompt-range-failure')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'assistant/message', { content: [{ type: 'text', text: 'zero' }] }),
+      wireEvent(1, 'assistant/message', { content: [{ type: 'text', text: 'one' }] }),
+    ])
+    await item.registry.beginPrompt('del-1', {
+      requestId: 'request-range-failure',
+      contentHash: contentHash('range failure'),
+      beforeCursor: 0,
+    })
+    item.host.eventsFailure = remoteFailure('session/not-found', 'history unavailable')
+    await expectCode(
+      item.commands.prompt({
+        delegationId: 'del-1',
+        requestId: 'request-range-failure',
+        content: 'range failure',
+      }),
+      'DELEGATION_REQUEST_ID_UNCERTAIN',
+    )
+    assert.equal(item.host.promptCalls, 0)
+    assert.equal((await item.registry.promptReceipt('del-1', 'request-range-failure'))?.accepted, false)
   } finally {
     await cleanup(item)
   }

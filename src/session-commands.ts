@@ -129,8 +129,7 @@ export interface SessionCommandsOptions {
 
 interface EventScan {
   readonly events: readonly SessionWireEvent[]
-  readonly complete: boolean
-  readonly earliestSeq: number | undefined
+  readonly coveredFrom: number
   readonly accepted: boolean
 }
 
@@ -440,7 +439,7 @@ export class SessionCommands {
       command.deadline,
     )
     const scan = await this.scanEvents(record, state.cursor, command.deadline)
-    const events = scan.events
+    const events = scan.events.filter(event => event.seq >= scan.coveredFrom)
     const target = locateTarget(events, requestId)
     if (target === undefined) {
       throw new DelegationError(
@@ -453,7 +452,7 @@ export class SessionCommands {
     }
 
     const turnStart = [...events].reverse().find(event => event.type === 'turn/start' && event.seq <= target.seq)
-    if (turnStart === undefined && !scan.complete) {
+    if (turnStart === undefined && scan.coveredFrom > 0) {
       throw new DelegationError(
         'DELEGATION_MODEL_EVIDENCE_MISSING',
         `delegation ${record.delegationId} turn history is incomplete`,
@@ -808,19 +807,29 @@ export class SessionCommands {
       )
     }
     if (state.cursor > receipt.beforeCursor) {
-      const scan = await this.scanEvents(
-        record,
-        state.cursor,
-        deadline,
-        page => page.some(event => event.seq > receipt.beforeCursor
-          && event.seq <= state.cursor
-          && requestIdOf(event) === requestId),
-      )
+      let scan: EventScan
+      try {
+        scan = await this.scanEvents(
+          record,
+          state.cursor,
+          deadline,
+          page => page.some(event => event.seq > receipt.beforeCursor
+            && event.seq <= state.cursor
+            && requestIdOf(event) === requestId),
+          receipt.beforeCursor + 1,
+        )
+      } catch {
+        throw new DelegationError(
+          'DELEGATION_REQUEST_ID_UNCERTAIN',
+          `cannot read the requested Host range for ${requestId}`,
+          { delegationId: record.delegationId, requestId },
+        )
+      }
       if (scan.accepted) {
         const accepted = await this.registry.acceptPrompt(record.delegationId, requestId)
         return promptResult(record, accepted, true)
       }
-      if (!scan.complete) {
+      if (scan.coveredFrom > receipt.beforeCursor + 1) {
         throw new DelegationError(
           'DELEGATION_REQUEST_ID_UNCERTAIN',
           `cannot prove contiguous coverage for ${requestId}`,
@@ -858,10 +867,11 @@ export class SessionCommands {
     throughSeq: number,
     deadline?: Deadline,
     accept?: (page: readonly SessionWireEvent[]) => boolean,
+    requiredFrom?: number,
   ): Promise<EventScan> {
     const collected = new Map<number, SessionWireEvent>()
+    let coveredFrom = throughSeq + 1
     let before: number | undefined
-    let complete = throughSeq < 0
     for (let page = 0; page < MAX_EVENT_PAGES; page += 1) {
       assertDeadlineLive(deadline)
       const value = await this.callRemote(
@@ -875,41 +885,33 @@ export class SessionCommands {
         deadline,
       )
       const pageEvents = value.records.map(entry => entry.event)
-      if (pageEvents.length === 0) {
-        complete = throughSeq < 0
-        break
-      }
-      const first = pageEvents[0]?.seq
+      if (pageEvents.length === 0) break
       const last = pageEvents.at(-1)?.seq
-      if (first === undefined || last === undefined) break
-      if (before === undefined) {
-        if (last !== throughSeq) break
-      } else if (last !== before - 1 || first >= before) {
-        break
-      }
+      const expectedEnd = before ?? throughSeq + 1
+      if (last !== expectedEnd - 1) break
       for (const event of pageEvents) collected.set(event.seq, event)
       if (accept?.(pageEvents) === true) {
-        return {
-          events: sortedEvents(collected),
-          complete: false,
-          earliestSeq: first,
-          accepted: true,
-        }
+        return { events: sortedEvents(collected), coveredFrom, accepted: true }
       }
-      if (first <= 0) {
-        complete = true
-        break
+      let expected = last
+      let index = pageEvents.length - 1
+      let lowest = last
+      while (index >= 0 && pageEvents[index]?.seq === expected) {
+        lowest = expected
+        expected -= 1
+        index -= 1
+      }
+      coveredFrom = lowest
+      if (requiredFrom !== undefined && coveredFrom <= requiredFrom) {
+        return { events: sortedEvents(collected), coveredFrom, accepted: false }
+      }
+      if (coveredFrom <= 0) {
+        return { events: sortedEvents(collected), coveredFrom, accepted: false }
       }
       if (!value.hasMore) break
-      before = first
+      before = coveredFrom
     }
-    const events = sortedEvents(collected)
-    return {
-      events,
-      complete,
-      earliestSeq: events[0]?.seq,
-      accepted: false,
-    }
+    return { events: sortedEvents(collected), coveredFrom, accepted: false }
   }
 
   private async callRemote<T>(
