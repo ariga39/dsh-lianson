@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { createDeadline, type Deadline } from './deadline.ts'
 import { LiaisonError } from './errors.ts'
 import { acquireLock } from './flock.ts'
 import { ensurePrivateDirectory, isMissing, readOptionalFile, removeIfExists, writePrivateFile } from './fs-safe.ts'
@@ -132,6 +133,8 @@ export interface HostManagerOptions {
   readonly killGraceMs?: number
   /** Foreground deadline for the initial operator attach, default 20s. */
   readonly operatorReadyTimeoutMs?: number
+  /** Complete foreground budget for one `host ping`, default 30s. */
+  readonly pingTimeoutMs?: number
   readonly procRoot?: string
   readonly signalProcess?: (pid: number, signal: NodeJS.Signals) => void
   readonly spawnProcess?: typeof spawn
@@ -149,6 +152,8 @@ const DEFAULT_START_TIMEOUT_MS = 120_000
 const DEFAULT_STOP_GRACE_MS = 10_000
 const DEFAULT_KILL_GRACE_MS = 2_000
 const READY_POLL_MS = 25
+/** One complete public `host ping`: probe, attach/replacement, readiness, and RPC. */
+export const HOST_PING_DEADLINE_MS = 30_000
 const OBSERVER_MODULE = fileURLToPath(new URL('./host-observer.ts', import.meta.url))
 
 /**
@@ -251,6 +256,8 @@ export class HostManager {
 
   /** Read-only authenticated RPC used as the liveness proof. */
   async ping(): Promise<PingOutcome> {
+    // One absolute budget covers probe, attach/replacement, readiness, and RPC.
+    const deadline = createDeadline(this.pingTimeoutMs())
     const record = await this.readRecord()
     if (record === undefined || record.state !== 'ready') {
       throw new LiaisonError('HOST_NOT_RUNNING', 'no managed Host is recorded')
@@ -264,16 +271,18 @@ export class HostManager {
     if (identity.kind === 'dead-or-reused') {
       throw new LiaisonError('HOST_NOT_RUNNING', 'the recorded Host is not running')
     }
-    if (!await probeLoopback(record.origin)) {
+    const probeBudget = Math.min(3_000, deadline.remaining())
+    if (probeBudget <= 0) throw pingDeadlineFailure()
+    if (!await probeLoopback(record.origin, probeBudget)) {
       throw new LiaisonError('HOST_UNREACHABLE', 'the recorded Host is not reachable on its loopback origin')
     }
-    await this.attachOperator(record)
+    await this.attachOperator(record, deadline)
     const operator = this.operator
     if (operator === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'no operator connection is available')
     const startedAt = Date.now()
-    const result = await operator.withClient(
+    const result = await operator.withClientUntil(
       (remote, signal) => remote.session.list({}, signal),
-      15_000,
+      deadline,
     )
     const value = unwrap(result)
     return {
@@ -398,6 +407,7 @@ export class HostManager {
     let child: ChildProcess | undefined
     let activeRecord: LaunchingHostRecord | ReadyHostRecord = launching
     let spawnError: Error | undefined
+    let childExit: { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined
     try {
       child = this.spawnProcess(process.execPath, args, {
         cwd: launch.cwd,
@@ -406,6 +416,7 @@ export class HostManager {
         stdio: 'ignore',
       })
       child.once('error', (error) => { spawnError = error })
+      child.once('exit', (code, signal) => { childExit = { code, signal } })
       const pid = child.pid
       if (pid === undefined) {
         await sleep(100)
@@ -416,7 +427,13 @@ export class HostManager {
       const spawned: LaunchingHostRecord = { ...launching, hostPid: pid }
       activeRecord = spawned
       await writePrivateFile(this.paths.hostRecord, JSON.stringify(spawned))
-      const startTime = await this.waitForStartTime(pid, () => spawnError)
+      const exited = (): { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined => {
+        if (childExit !== undefined) return childExit
+        if (child === undefined) return undefined
+        if (child.exitCode === null && child.signalCode === null) return undefined
+        return { code: child.exitCode, signal: child.signalCode }
+      }
+      const startTime = await this.waitForStartTime(pid, () => spawnError, exited)
       if (startTime === undefined) {
         throw new LiaisonError('HOST_IDENTITY_UNVERIFIED', 'the spawned Host did not expose procfs identity')
       }
@@ -424,7 +441,7 @@ export class HostManager {
       activeRecord = launched
       await writePrivateFile(this.paths.hostRecord, JSON.stringify(launched))
       child.unref()
-      const ready = await this.waitForReady(child, readyFile, launchId, pid, () => spawnError)
+      const ready = await this.waitForReady(child, readyFile, launchId, pid, () => spawnError, exited)
       const origin = normalizeLoopbackOrigin(ready.origin)
       if (ready.port !== origin.port) {
         throw new LiaisonError('HOST_START_FAILED', 'the observer port does not match its origin')
@@ -553,6 +570,7 @@ export class HostManager {
     launchId: string,
     pid: number,
     spawnFailure: () => Error | undefined,
+    childExit: () => { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined,
   ): Promise<{ readonly origin: string; readonly port: number; readonly launchToken: string }> {
     return await new Promise((resolve, reject) => {
       let settled = false
@@ -583,6 +601,11 @@ export class HostManager {
           const failure = spawnFailure()
           if (failure !== undefined) {
             finish({ error: new LiaisonError('HOST_START_FAILED', 'the Host process failed to spawn', { cause: failure }) })
+            return
+          }
+          const earlyExit = childExit()
+          if (earlyExit !== undefined) {
+            onExit(earlyExit.code, earlyExit.signal)
             return
           }
           const text = await readOptionalFile(readyFile)
@@ -622,16 +645,30 @@ export class HostManager {
       }, this.startTimeoutMs())
       child.once('error', onError)
       child.once('exit', onExit)
-      void check()
+      // The child may already have exited before the listeners above existed.
+      const earlyExit = childExit()
+      if (earlyExit !== undefined) onExit(earlyExit.code, earlyExit.signal)
+      else void check()
     })
   }
 
-  private async waitForStartTime(pid: number, spawnFailure: () => Error | undefined): Promise<string | undefined> {
+  private async waitForStartTime(
+    pid: number,
+    spawnFailure: () => Error | undefined,
+    childExit: () => { readonly code: number | null; readonly signal: NodeJS.Signals | null } | undefined,
+  ): Promise<string | undefined> {
     const deadline = Date.now() + 5_000
     while (Date.now() < deadline) {
       const failure = spawnFailure()
       if (failure !== undefined) {
         throw new LiaisonError('HOST_START_FAILED', 'the Host process failed to spawn', { cause: failure })
+      }
+      const exit = childExit()
+      if (exit !== undefined) {
+        throw new LiaisonError(
+          'HOST_START_FAILED',
+          `the Host exited before readiness (code ${String(exit.code)}, signal ${String(exit.signal)})`,
+        )
       }
       const stat = await readProcStat(pid, this.procRoot).catch(() => undefined)
       if (stat !== undefined) return stat.startTime
@@ -748,13 +785,18 @@ export class HostManager {
     return join(env.HOME !== undefined && env.HOME.trim() !== '' ? env.HOME : homedir(), '.dsh')
   }
 
-  private async attachOperator(record: ReadyHostRecord): Promise<void> {
+  private async attachOperator(record: ReadyHostRecord, deadline?: Deadline): Promise<void> {
     if (this.attachmentClosed) {
       throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator attachment is closed for this lifecycle')
     }
     const target: OperatorTarget = { origin: record.origin, launchToken: record.launchToken }
-    const timeoutMs = this.options.operatorReadyTimeoutMs ?? 20_000
     if (this.operator === undefined) this.operator = new OperatorConnection(this.options.operator)
+    if (deadline !== undefined) {
+      if (this.operator.matches(target)) await this.operator.waitReadyUntil(deadline)
+      else await this.operator.setHostUntil(target, deadline)
+      return
+    }
+    const timeoutMs = this.options.operatorReadyTimeoutMs ?? 20_000
     if (this.operator.matches(target)) await this.operator.waitReady(timeoutMs)
     else await this.operator.setHost(target, timeoutMs)
   }
@@ -788,6 +830,10 @@ export class HostManager {
 
   private startTimeoutMs(): number {
     return this.options.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS
+  }
+
+  private pingTimeoutMs(): number {
+    return this.options.pingTimeoutMs ?? HOST_PING_DEADLINE_MS
   }
 
   private stopGraceMs(): number {
@@ -839,11 +885,12 @@ export function normalizeLoopbackOrigin(value: string): NormalizedOrigin {
 /**
  * Probe the loopback root without credentials.
  * @param origin - bare loopback origin.
+ * @param timeoutMs - probe deadline, default 3s.
  * @returns true only for HTTP 200 or 401.
  */
-async function probeLoopback(origin: string): Promise<boolean> {
+async function probeLoopback(origin: string, timeoutMs = 3_000): Promise<boolean> {
   const controller = new AbortController()
-  const timer = setTimeout(() => { controller.abort() }, 3_000)
+  const timer = setTimeout(() => { controller.abort() }, Math.max(1, timeoutMs))
   try {
     const response = await fetch(new URL('/', origin), { redirect: 'manual', signal: controller.signal })
     return response.status === 200 || response.status === 401
@@ -852,6 +899,10 @@ async function probeLoopback(origin: string): Promise<boolean> {
   } finally {
     clearTimeout(timer)
   }
+}
+
+function pingDeadlineFailure(): LiaisonError {
+  return new LiaisonError('OPERATOR_UNAVAILABLE', 'the host ping foreground deadline expired')
 }
 
 function summaryOf(record: ReadyHostRecord): HostSummary {

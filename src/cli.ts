@@ -6,7 +6,7 @@ import { runDaemon } from './daemon.ts'
 import { asLiaisonError, LiaisonError, wireErrorOf } from './errors.ts'
 import { acquireLock } from './flock.ts'
 import { removeIfExists } from './fs-safe.ts'
-import { HostManager, type HostManagerOptions, type StopOutcome } from './host-manager.ts'
+import { HOST_PING_DEADLINE_MS, HostManager, type HostManagerOptions, type StopOutcome } from './host-manager.ts'
 import { callDaemon, isDaemonUnavailable } from './ipc-client.ts'
 import type { IpcResultMap } from './ipc-protocol.ts'
 import { resolveStateDir, statePaths } from './paths.ts'
@@ -24,7 +24,8 @@ export const START_CALL_TIMEOUT_MS = 150_000
  * daemon stop the Host later.
  */
 export const STOP_CALL_TIMEOUT_MS = START_CALL_TIMEOUT_MS + 60_000
-const PING_CALL_TIMEOUT_MS = 30_000
+/** Host ping uses one complete foreground budget; the CLI adds IPC transit. */
+export const PING_CALL_TIMEOUT_MS = HOST_PING_DEADLINE_MS + 5_000
 
 interface HostStartOptions {
   readonly port: number

@@ -15,6 +15,7 @@ import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import userQuestionsRemote from '@deepseek-ai/dsh-user-questions/remote'
 import WebSocket from 'ws'
+import { createDeadline, type Deadline } from './deadline.ts'
 import { LiaisonError } from './errors.ts'
 
 /** One authenticated Host target. */
@@ -99,13 +100,42 @@ export class OperatorConnection {
    * @param timeoutMs - optional foreground readiness deadline.
    */
   async setHost(target: OperatorTarget, timeoutMs?: number): Promise<void> {
-    await this.serializeChange(async () => {
+    if (timeoutMs === undefined) {
+      await this.setHostUntil(target)
+      return
+    }
+    await this.setHostUntil(target, createDeadline(timeoutMs))
+  }
+
+  /**
+   * Replace the target under one absolute budget, including queued changes,
+   * detachment, and readiness. Background reconnect may outlive the caller.
+   * @param target - origin and launch token.
+   * @param deadline - optional single deadline for the complete replacement.
+   */
+  async setHostUntil(target: OperatorTarget, deadline?: Deadline): Promise<void> {
+    if (deadline?.expired() === true) throw deadlineFailure()
+    let cancelled = false
+    const change = this.serializeChange(async () => {
+      if (cancelled) throw deadlineFailure()
       if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
       await this.detach()
+      if (cancelled || deadline?.expired() === true) throw deadlineFailure()
       this.target = target
       this.startLoop()
-      if (timeoutMs !== undefined) await this.waitReady(timeoutMs)
+      if (deadline !== undefined) await this.waitReadyUntil(deadline)
     })
+    if (deadline === undefined) {
+      await change
+      return
+    }
+    try {
+      await raceDeadline(change, deadline)
+    } catch (error) {
+      // A queued replacement must not start after its foreground budget ended.
+      cancelled = true
+      throw error
+    }
   }
 
   /**
@@ -113,14 +143,26 @@ export class OperatorConnection {
    * @param timeoutMs - foreground deadline.
    */
   async waitReady(timeoutMs: number): Promise<void> {
+    await this.waitReadyUntil(createDeadline(timeoutMs))
+  }
+
+  /**
+   * Wait for an established generation under one absolute budget.
+   * @param deadline - complete foreground deadline.
+   */
+  async waitReadyUntil(deadline: Deadline): Promise<void> {
     if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
     if (this.current !== undefined) return
+    const remaining = deadline.remaining()
+    if (remaining <= 0) throw deadlineFailure()
     await new Promise<void>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.removeWaiter(waiter)
         const details = this.lastError === undefined ? {} : { lastError: this.lastError.message }
-        reject(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection did not become ready in time', { details }))
-      }, timeoutMs)
+        reject(new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection did not become ready in time', {
+          details: { ...details, remainingMs: 0 },
+        }))
+      }, remaining)
       const waiter: ReadyWaiter = { resolve, reject, timer }
       this.readyWaiters.push(waiter)
     })
@@ -134,18 +176,33 @@ export class OperatorConnection {
    * @returns the callback result.
    */
   async withClient<T>(operation: (remote: ClientRemote, signal: AbortSignal) => Promise<RemoteResult<T>>, timeoutMs: number): Promise<RemoteResult<T>> {
-    await this.waitReady(timeoutMs)
+    return await this.withClientUntil(operation, createDeadline(timeoutMs))
+  }
+
+  /**
+   * Run one foreground RPC under the same absolute budget used for readiness.
+   * @param operation - callback receiving the typed Remote surface and its abort signal.
+   * @param deadline - complete foreground deadline.
+   * @returns the callback result.
+   */
+  async withClientUntil<T>(
+    operation: (remote: ClientRemote, signal: AbortSignal) => Promise<RemoteResult<T>>,
+    deadline: Deadline,
+  ): Promise<RemoteResult<T>> {
+    await this.waitReadyUntil(deadline)
     if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
     const current = this.current
     if (current === undefined) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'the operator connection is not ready')
+    const remaining = deadline.remaining()
+    if (remaining <= 0) throw deadlineFailure()
     const controller = new AbortController()
     if (this.closing) throw new LiaisonError('OPERATOR_UNAVAILABLE', 'operator connection is closed')
     this.foreground.add(controller)
-    const timer = setTimeout(() => { controller.abort() }, timeoutMs)
+    const timer = setTimeout(() => { controller.abort(deadlineFailure()) }, remaining)
     try {
       return await Promise.race([
         operation(current.remote, controller.signal),
-        abortOutcome(controller.signal, timeoutMs),
+        abortOutcome(controller.signal, remaining),
       ])
     } finally {
       clearTimeout(timer)
@@ -451,6 +508,30 @@ async function disposeContext(ctx: Context): Promise<void> {
     void ctx.fiber.dispose().then(
       () => { clearTimeout(timer); resolve() },
       () => { clearTimeout(timer); resolve() },
+    )
+  })
+}
+
+function deadlineFailure(): LiaisonError {
+  return new LiaisonError('OPERATOR_UNAVAILABLE', 'the foreground operator deadline expired')
+}
+
+function raceDeadline<T>(promise: Promise<T>, deadline: Deadline): Promise<T> {
+  const remaining = deadline.remaining()
+  if (remaining <= 0) return Promise.reject(deadlineFailure())
+  return new Promise<T>((resolve, reject) => {
+    let settled = false
+    function finish(outcome: { readonly value: T } | { readonly error: Error }): void {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if ('value' in outcome) resolve(outcome.value)
+      else reject(outcome.error)
+    }
+    const timer = setTimeout(() => { finish({ error: deadlineFailure() }) }, remaining)
+    void promise.then(
+      (value) => { finish({ value }) },
+      (error: unknown) => { finish({ error: error instanceof Error ? error : new Error(String(error)) }) },
     )
   })
 }

@@ -5,6 +5,7 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import WebSocket from 'ws'
+import { createDeadline } from '../src/deadline.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { HostManager } from '../src/host-manager.ts'
 import { OperatorConnection, type OperatorTarget } from '../src/operator-connection.ts'
@@ -553,6 +554,158 @@ function requestMethodOf(init: RequestInit | undefined): string | undefined {
     return undefined
   }
 }
+
+await test('host ping uses one deadline across probe, attach, readiness, and RPC', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-ping-deadline-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  const realFetch = globalThis.fetch.bind(globalThis)
+  let connects = 0
+  let rpcCalls = 0
+  const fetchImpl: typeof fetch = async (input, init) => {
+    const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+    if (url.pathname === '/connect') {
+      connects += 1
+      if (connects === 1) await sleep(500)
+      return await realFetch(input, init)
+    }
+    if (url.pathname.startsWith('/api/')) {
+      rpcCalls += 1
+      return await new Promise<Response>(() => {})
+    }
+    return await realFetch(input, init)
+  }
+  const pingManager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    pingTimeoutMs: 1_500,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+    operator: {
+      fetch: fetchImpl,
+      connectTimeoutMs: 5_000,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 5_000,
+    },
+  })
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    const started = Date.now()
+    await assert.rejects(pingManager.ping(), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'OPERATOR_UNAVAILABLE')
+      return true
+    })
+    assert.ok(Date.now() - started < 3_000, 'ping must honor one complete foreground deadline')
+    assert.equal(rpcCalls, 1, 'the stalled RPC must not be retried')
+  } finally {
+    await pingManager.close().catch(() => undefined)
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
+
+await test('one deadline covers a queued setHost, readiness, and a stalled operation', { timeout: 180_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-queued-deadline-'))
+  const workspace = join(root, 'workspace')
+  const dshHome = join(root, 'dsh-home')
+  const stateDir = join(root, 'state')
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    HOME: root,
+    DSH_HOME: dshHome,
+    DSH_AGENTS_HOME: join(dshHome, 'agents'),
+    DSH_TELEMETRY_DISABLED: '1',
+  }
+  const manager = new HostManager({
+    stateDir,
+    projectRoot,
+    cwd: workspace,
+    env,
+    port: 0,
+    startTimeoutMs: 120_000,
+    stopGraceMs: 10_000,
+    killGraceMs: 2_000,
+  })
+  let operator: OperatorConnection | undefined
+  try {
+    await mkdir(workspace, { recursive: true })
+    await manager.start()
+    await manager.close()
+    const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8')) as Record<string, unknown>
+    const target: OperatorTarget = {
+      origin: stringField(record, 'origin'),
+      launchToken: stringField(record, 'launchToken'),
+    }
+    const realFetch = globalThis.fetch.bind(globalThis)
+    let connects = 0
+    let rpcCalls = 0
+    const fetchImpl: typeof fetch = async (input, init) => {
+      const url = input instanceof URL ? input : new URL(input instanceof Request ? input.url : input)
+      if (url.pathname === '/connect') {
+        connects += 1
+        if (connects === 1) await sleep(500)
+        return await realFetch(input, init)
+      }
+      if (url.pathname.startsWith('/api/')) {
+        rpcCalls += 1
+        return await new Promise<Response>(() => {})
+      }
+      return await realFetch(input, init)
+    }
+    operator = new OperatorConnection({
+      fetch: fetchImpl,
+      connectTimeoutMs: 5_000,
+      reconnectBaseMs: 20,
+      reconnectMaxMs: 60,
+      generationTimeoutMs: 5_000,
+    })
+    const deadline = createDeadline(2_000)
+    const started = Date.now()
+    const first = operator.setHostUntil(target, deadline)
+    const second = operator.setHostUntil(target, deadline)
+    const client = operator.withClientUntil(remote => remote.session.list({}), deadline)
+    const outcomes = await Promise.allSettled([first, second, client])
+    assert.ok(Date.now() - started < 3_500, 'the queued replacement and operation share one deadline')
+    assert.equal(outcomes[0]?.status, 'fulfilled')
+    assert.equal(outcomes[1]?.status, 'fulfilled')
+    assert.equal(outcomes[2]?.status, 'rejected')
+    if (outcomes[2]?.status === 'rejected') {
+      assert.ok(outcomes[2].reason instanceof LiaisonError)
+      assert.equal(outcomes[2].reason.code, 'OPERATOR_UNAVAILABLE')
+    }
+    assert.equal(rpcCalls, 1, 'the timed-out operation must not be retried')
+    await sleep(300)
+    assert.equal(rpcCalls, 1, 'background reconnect must not replay the operation')
+    assert.equal(operator.matches(target), true, 'background reconnect keeps the replacement target')
+  } finally {
+    await operator?.close()
+    await manager.stop()
+    await rm(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 })
+  }
+})
 
 async function sleep(ms: number): Promise<void> {
   await new Promise(resolve => setTimeout(resolve, ms))

@@ -8,9 +8,9 @@ import { join } from 'node:path'
 import { test } from 'node:test'
 import { setTimeout as delay } from 'node:timers/promises'
 import { fileURLToPath } from 'node:url'
-import { START_CALL_TIMEOUT_MS, STOP_CALL_TIMEOUT_MS } from '../src/cli.ts'
+import { PING_CALL_TIMEOUT_MS, START_CALL_TIMEOUT_MS, STOP_CALL_TIMEOUT_MS } from '../src/cli.ts'
 import { LiaisonError } from '../src/errors.ts'
-import { HostManager, normalizeLoopbackOrigin } from '../src/host-manager.ts'
+import { HOST_PING_DEADLINE_MS, HostManager, normalizeLoopbackOrigin } from '../src/host-manager.ts'
 import { statePaths } from '../src/paths.ts'
 import { scanHostProcesses } from '../src/proc-identity.ts'
 
@@ -30,6 +30,10 @@ await test('stop timeout covers a queued start plus lock and signal bounds', () 
   assert.ok(
     STOP_CALL_TIMEOUT_MS >= START_CALL_TIMEOUT_MS + 30_000,
     'the stop reply deadline must cover a queued start plus lock and kill bounds',
+  )
+  assert.ok(
+    PING_CALL_TIMEOUT_MS >= HOST_PING_DEADLINE_MS,
+    'the CLI ping deadline must cover the complete Host ping foreground budget',
   )
 })
 
@@ -418,6 +422,38 @@ await test('spawn failure is reported and leaves no launch ownership behind', as
     assert.equal(existsSync(join(stateDir, 'host.json')), false)
     assert.equal(existsSync(join(stateDir, 'host-observer.patch.json')), false)
   } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('a real child exiting before readiness fails promptly and cleans ownership', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-early-exit-'))
+  let child: ChildProcess | undefined
+  try {
+    const stateDir = join(root, 'state')
+    child = spawn(process.execPath, ['-e', 'process.exit(3)'], { stdio: 'ignore' })
+    const spawnProcess = (() => child) as unknown as typeof spawn
+    const manager = new HostManager({
+      stateDir,
+      projectRoot,
+      cwd: root,
+      startTimeoutMs: 10_000,
+      stopGraceMs: 10,
+      killGraceMs: 10,
+      spawnProcess,
+    })
+    const startedAt = Date.now()
+    await assert.rejects(manager.start(), (error: unknown) => {
+      assert.ok(error instanceof LiaisonError)
+      assert.equal(error.code, 'HOST_START_FAILED')
+      assert.match(error.message, /exited before readiness/u)
+      return true
+    })
+    assert.ok(Date.now() - startedAt < 2_000, 'an early child exit must not wait for the start timeout')
+    assert.equal(existsSync(join(stateDir, 'host.json')), false)
+    assert.equal(existsSync(join(stateDir, 'host-observer.patch.json')), false)
+  } finally {
+    try { child?.kill('SIGKILL') } catch { /* already gone */ }
     await rm(root, { recursive: true, force: true })
   }
 })
