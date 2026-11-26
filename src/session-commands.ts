@@ -420,6 +420,13 @@ export class SessionCommands {
     const inherited = inheritedIsEffective
       ? headers.filter(event => event.seq < windowStart).at(-1)
       : undefined
+    if (inheritedIsEffective && inherited === undefined) {
+      throw new DelegationError(
+        'DELEGATION_MODEL_EVIDENCE_MISSING',
+        `turn at ${String(windowStart)} has no effective request header`,
+        { delegationId: record.delegationId, turnSeq: windowStart, ...(requestId === undefined ? {} : { requestId }) },
+      )
+    }
     const applicable = inherited === undefined ? inTurn : [inherited, ...inTurn]
     const effective = applicable.map(headerConfig)
     if (effective.length === 0 || effective.some(config => config === undefined)) {

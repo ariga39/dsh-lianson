@@ -710,3 +710,24 @@ await test('verify-model checks a just-started divergent streaming header but ne
     await cleanup(item)
   }
 })
+
+await test('verify-model does not certify early evidence from a later header when no inherited header exists', async () => {
+  const item = await fixture('verify-unresolved-inherited')
+  try {
+    const created = await item.commands.create(createCommand(item))
+    item.host.events.set(created.delegation.sessionId, [
+      wireEvent(0, 'turn/start', { turn: 1 }),
+      userMessage(1, 'request-early-evidence'),
+      wireEvent(2, 'assistant/message', { content: [{ type: 'text', text: 'early without header' }] }),
+      requestHeader(3, 'provider-a', 'model-a'),
+      wireEvent(4, 'assistant/message', { content: [{ type: 'text', text: 'later matching attempt' }] }),
+      wireEvent(5, 'turn/end', { reason: { kind: 'completed' } }),
+    ])
+    await expectCode(
+      item.commands.verifyModel({ delegationId: 'del-1', requestId: 'request-early-evidence' }),
+      'DELEGATION_MODEL_EVIDENCE_MISSING',
+    )
+  } finally {
+    await cleanup(item)
+  }
+})
