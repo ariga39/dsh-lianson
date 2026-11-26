@@ -513,7 +513,10 @@ async function procState(pid: number): Promise<string | undefined> {
     if (close === -1) return '?'
     return text.slice(close + 1).trim().split(/\s+/u)[0]
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    const code = (error as NodeJS.ErrnoException).code
+    // /proc reads may observe ESRCH when the process exits between lookup and
+    // read; that is the same Linux contract as ENOENT for this check.
+    if (code === 'ENOENT' || code === 'ESRCH') return undefined
     throw error
   }
 }
