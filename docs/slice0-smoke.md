@@ -48,6 +48,9 @@ corepack pnpm run test           # node:test
 focused regressions for launch-line concatenation across chunk and CRLF
 boundaries, complete redacted stderr on early close, missing Web/declaration
 artifact detection, and isolation from a failing user Git hook.
+`tests/failure.test.ts` covers token-free failure reporting through a real
+`node:test` reporter, shutdown-only Host stderr after reaping, and preservation
+of the original failure when cleanup fails.
 
 ## What the test proves
 
@@ -68,5 +71,6 @@ artifact detection, and isolation from a failing user Git hook.
   `session/writer-held` appear.
 
 Temporary `DSH_HOME`, workspaces, and child processes are removed at the end.
-Launch tokens are redacted from failure diagnostics, which are limited to
-status and event-type summaries.
+A failure report is one fresh Error carrying the redacted primary message, a
+bounded status/event-type summary, and the final Host stderr after the Host is
+reaped. Untrusted nested causes and custom error fields are omitted.

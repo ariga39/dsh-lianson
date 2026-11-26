@@ -22,8 +22,8 @@ import {
   QUESTION_OPTION,
   READ_CALL_ID,
 } from './constants.ts'
+import { failureWithHostDiagnostics, launchTokenOf } from './failure.ts'
 import { startDshWeb, type RunningDshWeb } from './host.ts'
-import { redact } from './launch-lines.ts'
 import { connectOperator, type Operator } from './operator.ts'
 
 /** Evidence returned by the complete Slice 0 run. */
@@ -294,8 +294,17 @@ export async function runSlice0(): Promise<Slice0Report> {
     const stateDetails = operator !== undefined && sessionIdForDiagnostics !== undefined
       ? await describeState(operator, sessionIdForDiagnostics).catch(() => '')
       : ''
-    const diagnostics = host === undefined ? '' : `\nHost stderr:\n${redact(host.stderr())}`
-    throw new Error(`${error instanceof Error ? error.message : String(error)}${diagnostics}${stateDetails}`, { cause: error })
+    const secret = launchTokenOf(host?.launchUrl)
+    if (operator !== undefined) {
+      await operator.close().catch(() => undefined)
+      operator = undefined
+    }
+    throw await failureWithHostDiagnostics({
+      error,
+      ...host === undefined ? {} : { host },
+      ...secret === undefined ? {} : { secret },
+      ...stateDetails === '' ? {} : { extra: stateDetails },
+    })
   } finally {
     await operator?.close().catch(() => undefined)
     await host?.stop().catch(() => undefined)
