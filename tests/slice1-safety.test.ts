@@ -1,7 +1,7 @@
 import { strict as assert } from 'node:assert'
 import { spawn, type ChildProcess } from 'node:child_process'
 import { EventEmitter } from 'node:events'
-import { chmodSync, existsSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -214,7 +214,7 @@ await test('keep-host reports dead or unverified ownership truthfully and never 
 await test('ready record read failures finish as HOST_START_FAILED without an unhandled rejection', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-ready-read-'))
   try {
-    for (const mode of ['malformed', 'unreadable'] as const) {
+    for (const mode of ['malformed', 'read-error'] as const) {
       const stateDir = join(root, mode)
       const paths = statePaths(stateDir)
       const child = new EventEmitter() as EventEmitter & { pid: number; unref: () => void }
@@ -224,8 +224,9 @@ await test('ready record read failures finish as HOST_START_FAILED without an un
         if (mode === 'malformed') {
           writeFileSync(paths.readyFile, '{')
         } else {
-          writeFileSync(paths.readyFile, JSON.stringify({ ok: true, launchId: 'unreadable' }))
-          chmodSync(paths.readyFile, 0)
+          // A directory read fails deterministically even for root, unlike
+          // chmod(000) which root can still read.
+          mkdirSync(paths.readyFile)
         }
         return child as unknown as ChildProcess
       }) as unknown as typeof spawn
@@ -245,6 +246,7 @@ await test('ready record read failures finish as HOST_START_FAILED without an un
       })
       assert.equal(existsSync(join(stateDir, 'host.json')), false)
       assert.equal(existsSync(join(stateDir, 'host-observer.patch.json')), false)
+      assert.equal(existsSync(paths.readyFile), false)
     }
   } finally {
     await rm(root, { recursive: true, force: true })
@@ -277,6 +279,104 @@ await test('malformed and foreign ownership records are refused and retained', a
       })
       assert.equal(existsSync(recordPath), true, `${name} record must be retained`)
       assert.equal(await readFile(recordPath, 'utf8'), text)
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('ready and launching records reject a non-positive hostPid before any effect', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-pid-zero-'))
+  try {
+    const records: Record<string, Record<string, unknown>> = {
+      ready: readyRecord({ hostPid: 0 }),
+      launching: {
+        version: 1,
+        state: 'launching',
+        launchId: 'launch-zero',
+        observerPatchPath: '/tmp/observer.patch.json',
+        readyFile: '/tmp/ready.json',
+        expectedCmdline: [process.execPath, '/tmp/fake-host.js'],
+        startedAt: 1,
+        hostPid: 0,
+        hostStartTime: '1',
+      },
+    }
+    for (const [mode, record] of Object.entries(records)) {
+      const stateDir = join(root, mode)
+      await writeState(stateDir, record)
+      const recordPath = join(stateDir, 'host.json')
+      const before = await readFile(recordPath, 'utf8')
+      const signals: string[] = []
+      const manager = new HostManager({
+        stateDir,
+        projectRoot,
+        cwd: root,
+        stopGraceMs: 10,
+        killGraceMs: 10,
+        signalProcess: (_pid, signal) => { signals.push(signal) },
+      })
+      for (const operation of [
+        async (): Promise<void> => { await manager.start() },
+        async (): Promise<void> => { await manager.stop() },
+      ]) {
+        await assert.rejects(operation(), (error: unknown) => {
+          assert.ok(error instanceof LiaisonError)
+          assert.equal(error.code, 'HOST_RECORD_INVALID')
+          return true
+        })
+        assert.equal(await readFile(recordPath, 'utf8'), before, `${mode} record must be retained unchanged`)
+        assert.equal(signals.length, 0, `${mode} invalid pid must never be signalled or cleaned up`)
+      }
+    }
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
+await test('ready and launching records reject a malformed start time before any effect', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-liaison-start-time-'))
+  try {
+    const records: Record<string, Record<string, unknown>> = {
+      ready: readyRecord({ hostStartTime: 'bogus' }),
+      launching: {
+        version: 1,
+        state: 'launching',
+        launchId: 'launch-bogus',
+        observerPatchPath: '/tmp/observer.patch.json',
+        readyFile: '/tmp/ready.json',
+        expectedCmdline: [process.execPath, '/tmp/fake-host.js'],
+        startedAt: 1,
+        hostPid: process.pid,
+        hostStartTime: 'bogus',
+      },
+    }
+    for (const [mode, record] of Object.entries(records)) {
+      const stateDir = join(root, mode)
+      await writeState(stateDir, record)
+      const recordPath = join(stateDir, 'host.json')
+      const before = await readFile(recordPath, 'utf8')
+      const signals: string[] = []
+      const manager = new HostManager({
+        stateDir,
+        projectRoot,
+        cwd: root,
+        stopGraceMs: 10,
+        killGraceMs: 10,
+        signalProcess: (_pid, signal) => { signals.push(signal) },
+      })
+      for (const operation of [
+        async (): Promise<void> => { await manager.start() },
+        async (): Promise<void> => { await manager.stop() },
+      ]) {
+        await assert.rejects(operation(), (error: unknown) => {
+          assert.ok(error instanceof LiaisonError)
+          assert.equal(error.code, 'HOST_RECORD_INVALID')
+          return true
+        })
+        assert.equal(await readFile(recordPath, 'utf8'), before, `${mode} record must be retained unchanged`)
+        assert.equal(signals.length, 0, `${mode} malformed start time must never cause cleanup or signalling`)
+      }
     }
   } finally {
     await rm(root, { recursive: true, force: true })

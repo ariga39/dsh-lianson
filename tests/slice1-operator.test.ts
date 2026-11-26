@@ -1,4 +1,5 @@
 import { strict as assert } from 'node:assert'
+import { randomUUID } from 'node:crypto'
 import { mkdtemp, readFile, rm, mkdir } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -82,6 +83,11 @@ await test('operator recovery: WS drop re-exchanges /connect, rejects the old co
     assert.ok(firstCookie !== undefined && firstCookie !== '')
     const first = await operator.withClient(remote => remote.session.list({}), 10_000)
     assert.equal(first.ok, true)
+    assert.equal(
+      await authenticatedApiStatus(target.origin, firstCookie),
+      200,
+      'the original v2 cookie must authenticate a supported /api request while the peer is live',
+    )
 
     // An unsolicited transport loss disposes the old generation, revokes its
     // v2 cookie, and must perform a fresh /connect exchange. Six consecutive
@@ -102,11 +108,16 @@ await test('operator recovery: WS drop re-exchanges /connect, rejects the old co
     const afterRecovery = await operator.withClient(remote => remote.session.list({}), 10_000)
     assert.equal(afterRecovery.ok, true, 'the public RPC surface must recover after unsolicited transport loss')
 
-    const oldCookieResponse = await fetch(new URL('/', target.origin), {
-      redirect: 'manual',
-      headers: { cookie: firstCookie },
-    })
-    assert.equal(oldCookieResponse.status, 401, 'the old v2 cookie must be revoked after the transport closes')
+    assert.equal(
+      await authenticatedApiStatus(target.origin, firstCookie),
+      401,
+      'the old v2 cookie must be rejected by the same /api request after the transport closes',
+    )
+    assert.equal(
+      await authenticatedApiStatus(target.origin, secondCookie),
+      200,
+      'the freshly exchanged cookie must authenticate the same /api request',
+    )
 
     // Foreground waits stay bounded while the background loop keeps retrying.
     const secondAttempts = connectAttempts
@@ -715,6 +726,22 @@ function stringField(record: Record<string, unknown>, key: string): string {
   const value = record[key]
   assert.equal(typeof value, 'string')
   return value as string
+}
+
+async function authenticatedApiStatus(origin: string, cookie: string): Promise<number> {
+  const body = JSON.stringify({
+    type: 'client-request',
+    rpcId: randomUUID(),
+    method: 'settings/describe',
+    payload: { args: {} },
+  })
+  const response = await fetch(new URL('/api/settings/describe', origin), {
+    method: 'POST',
+    redirect: 'manual',
+    headers: { 'content-type': 'application/json', cookie },
+    body,
+  })
+  return response.status
 }
 
 function terminateAll(sockets: Array<{ readonly socket: WebSocket; readonly url: string }>): void {

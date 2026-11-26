@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
+import { rm } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -380,7 +381,9 @@ export class HostManager {
 
   private async launch(launch: EffectiveLaunchOptions): Promise<ReadyHostRecord> {
     await ensurePrivateDirectory(this.paths.stateDir)
-    await removeIfExists(this.paths.readyFile)
+    // The one-shot path can have been tampered into a directory; always remove
+    // whatever occupies it before the observer writes its real file.
+    await rm(this.paths.readyFile, { force: true, recursive: true })
     const launchId = `launch-${randomUUID()}`
     const observerPatchPath = this.paths.observerPatch
     const readyFile = this.paths.readyFile
@@ -823,7 +826,7 @@ export class HostManager {
   }
 
   private async cleanupFiles(): Promise<void> {
-    await removeIfExists(this.paths.readyFile)
+    await rm(this.paths.readyFile, { force: true, recursive: true })
     await removeIfExists(this.paths.hostRecord)
     await removeIfExists(this.paths.observerPatch)
   }
@@ -930,7 +933,7 @@ function parseHostRecord(value: unknown): HostRecord {
   if (record.state === 'launching') {
     const readyFile = requiredString(record, 'readyFile')
     const hostPid = optionalInteger(record, 'hostPid')
-    const hostStartTime = optionalString(record, 'hostStartTime')
+    const hostStartTime = optionalStartTime(record, 'hostStartTime')
     return {
       version: 1,
       state: 'launching',
@@ -943,8 +946,8 @@ function parseHostRecord(value: unknown): HostRecord {
       ...hostStartTime === undefined ? {} : { hostStartTime },
     }
   }
-  const hostPid = requiredInteger(record, 'hostPid')
-  const hostStartTime = requiredString(record, 'hostStartTime')
+  const hostPid = requiredPositiveInteger(record, 'hostPid')
+  const hostStartTime = requiredStartTime(record, 'hostStartTime')
   const origin = requiredString(record, 'origin')
   const port = requiredInteger(record, 'port')
   const launchToken = requiredString(record, 'launchToken')
@@ -1016,6 +1019,21 @@ function optionalString(record: Record<string, unknown>, key: string): string | 
   return value
 }
 
+const PROC_START_TIME_PATTERN = /^\d+$/u
+
+function requiredStartTime(record: Record<string, unknown>, key: string): string {
+  const value = requiredString(record, key)
+  if (!PROC_START_TIME_PATTERN.test(value)) throw new Error(`${key} must be decimal procfs ticks`)
+  return value
+}
+
+function optionalStartTime(record: Record<string, unknown>, key: string): string | undefined {
+  const value = optionalString(record, key)
+  if (value === undefined) return undefined
+  if (!PROC_START_TIME_PATTERN.test(value)) throw new Error(`${key} must be decimal procfs ticks`)
+  return value
+}
+
 function requiredInteger(record: Record<string, unknown>, key: string): number {
   const value = record[key]
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
@@ -1030,6 +1048,12 @@ function optionalInteger(record: Record<string, unknown>, key: string): number |
   if (typeof value !== 'number' || !Number.isSafeInteger(value) || value <= 0) {
     throw new Error(`${key} must be a positive integer`)
   }
+  return value
+}
+
+function requiredPositiveInteger(record: Record<string, unknown>, key: string): number {
+  const value = requiredInteger(record, key)
+  if (value <= 0) throw new Error(`${key} must be a positive integer`)
   return value
 }
 
