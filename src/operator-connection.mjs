@@ -59,7 +59,6 @@ export class OperatorConnection {
     upstream = null,
     createWebSocket,
     fetch: fetchImpl = globalThis.fetch,
-    reconnectAttempts = 5,
     reconnectDelayMs = 0,
     reconnectMaxDelayMs = 1_000,
     readyTimeoutMs = 30_000,
@@ -70,7 +69,6 @@ export class OperatorConnection {
     this.upstream = upstream
     this.createWebSocket = createWebSocket
     this.fetchImpl = fetchImpl
-    this.reconnectAttempts = reconnectAttempts
     this.reconnectDelayMs = reconnectDelayMs
     this.reconnectMaxDelayMs = reconnectMaxDelayMs
     this.readyTimeoutMs = readyTimeoutMs
@@ -228,10 +226,8 @@ export class OperatorConnection {
       await previous.ctx.fiber.dispose().catch(() => {})
     }
 
-    const persistent = previous !== undefined
     let attempt = 0
-    let delay = persistent ? Math.max(0, this.reconnectDelayMs) : 0
-    let lastError = reason
+    let delay = previous === undefined ? 0 : Math.max(0, this.reconnectDelayMs)
     while (true) {
       if (this.stopping || this.lifecycle.signal.aborted) {
         throw new LiaisonError('OPERATOR_STOPPED', 'Operator connection is closed')
@@ -249,23 +245,20 @@ export class OperatorConnection {
         this.generation = generation
         this.connectedGeneration += 1
         this.connectCount += 1
-        if (persistent || this.connectCount > 1) this.reconnectCount += 1
+        if (this.connectCount > 1) this.reconnectCount += 1
         this.lastError = undefined
         return
       } catch (error) {
-        lastError = error
         this.lastError = error
         const code = typeof error?.code === 'string' ? error.code : ''
         if (code === 'HOST_ORIGIN_CHANGED' || code === 'HOST_ORIGIN_UNSAFE'
           || code === 'OPERATOR_STOPPED') throw error
-        // Once a generation has been established, recovery stays active with a
-        // capped backoff until it succeeds or close() cancels it.
-        if (!persistent && attempt >= this.reconnectAttempts) break
+        // Recovery stays active in the background with a capped backoff until it
+        // succeeds or close() cancels it, including the first daemon attach.
         const base = Math.max(50, this.reconnectDelayMs)
         delay = Math.min(this.reconnectMaxDelayMs, base * 2 ** Math.min(attempt - 1, 10))
       }
     }
-    throw lastError
   }
 
   async #openGeneration(host) {

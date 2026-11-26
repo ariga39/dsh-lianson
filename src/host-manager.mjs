@@ -15,6 +15,8 @@ export const DSH_BIN = join(REPO_ROOT, 'deepseek-harness/apps/cli/lib/bin.js')
 const DRAIN_BIN = fileURLToPath(new URL('./host-drain.mjs', import.meta.url))
 const FLOCK_ANCHOR = join(REPO_ROOT, 'deepseek-harness/native/system/packages/entry/package.json')
 export const HOST_MARKER_ENV = 'DSH_LIAISON_HOST_MARKER'
+export const DRAIN_MARKER_ENV = 'DSH_LIAISON_DRAIN_MARKER'
+export const DRAIN_HOST_MARKER_ENV = 'DSH_LIAISON_DRAIN_HOST_MARKER'
 const RECORD_VERSION = 1
 const LOCK_VERSION = 1
 
@@ -24,6 +26,27 @@ function isRecord(value) {
 
 function sleep(ms) {
   return new Promise(resolvePromise => setTimeout(resolvePromise, ms))
+}
+
+/** Split stdout into complete newline-terminated lines and retain one bounded partial tail. */
+export function readCompleteLines(buffer, chunk, max = 65_536) {
+  const parts = `${buffer}${chunk}`.split('\n')
+  const tail = parts.pop() ?? ''
+  return {
+    lines: parts.map(line => line.endsWith('\r') ? line.slice(0, -1) : line),
+    buffer: tail.slice(-max),
+  }
+}
+
+/** The drainer's child pid line, complete only. */
+export function parseDrainPid(line) {
+  const match = /^DSH_DRAIN_PID (\d+)$/u.exec(line)
+  return match?.[1] === undefined ? undefined : Number(match[1])
+}
+
+/** The managed Host's complete readiness announcement line. */
+export function parseLaunchAnnouncement(line) {
+  return /^dsh web: (http:\/\/\S+)$/u.exec(line)?.[1]
 }
 
 /** State directory: explicit test override, XDG runtime, then the user's state home. */
@@ -67,6 +90,14 @@ export function assertLoopbackOrigin(origin) {
     throw new LiaisonError('HOST_ORIGIN_UNSAFE', 'Host origin must not contain a path or query')
   }
   return url.origin
+}
+
+export function hostStopSucceeded(outcome) {
+  if (outcome?.stopped === true) return true
+  return outcome?.reason === 'missing'
+    || outcome?.reason === 'dead'
+    || outcome?.reason === 'reused'
+    || outcome?.reason === 'kept'
 }
 
 /** Create the state directory and force user-only access regardless of umask. */
@@ -177,11 +208,25 @@ async function readProcessEnvironment(pid, procRoot = '/proc') {
   try { return await readFile(join(procRoot, String(pid), 'environ'), 'utf8') } catch { return undefined }
 }
 
+async function readProcessCommandLine(pid, procRoot = '/proc') {
+  try {
+    return (await readFile(join(procRoot, String(pid), 'cmdline'), 'utf8')).split('\0').filter(Boolean)
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Find live processes carrying one launch marker. Only used for a write-ahead
  * record whose pid update was lost; multiple matches are deliberately ambiguous.
+ * Command-line fragments let recovery distinguish the managed role from
+ * descendants that inherited the same environment marker.
  */
-async function findProcessesByMarker(marker, procRoot = '/proc') {
+export async function findProcessesByMarker(marker, {
+  procRoot = '/proc',
+  markerEnv = HOST_MARKER_ENV,
+  cmdlineIncludes = [],
+} = {}) {
   if (!await procfsAvailable(procRoot)) return { ok: false, reason: 'unsupported', matches: [] }
   let names
   try { names = await readdir(procRoot) } catch { return { ok: false, reason: 'unsupported', matches: [] } }
@@ -192,7 +237,11 @@ async function findProcessesByMarker(marker, procRoot = '/proc') {
     if (pid <= 0) continue
     const environment = await readProcessEnvironment(pid, procRoot)
     if (environment === undefined) continue
-    if (!environment.split('\0').includes(`${HOST_MARKER_ENV}=${marker}`)) continue
+    if (!environment.split('\0').includes(`${markerEnv}=${marker}`)) continue
+    if (cmdlineIncludes.length > 0) {
+      const commandLine = await readProcessCommandLine(pid, procRoot)
+      if (commandLine === undefined || !cmdlineIncludes.every(value => commandLine.includes(value))) continue
+    }
     const info = await readProcStat(pid, procRoot).catch(() => undefined)
     if (info === undefined || info.state === 'Z') continue
     matches.push({ pid, procStart: `${await bootId()}:${info.startTime}` })
@@ -209,7 +258,7 @@ async function findProcessesByMarker(marker, procRoot = '/proc') {
  * @param {{pid: number, marker?: string, procStart?: string}} record
  * @param {{procRoot?: string}} [options]
  */
-export async function inspectProcess(record, { procRoot = '/proc' } = {}) {
+export async function inspectProcess(record, { procRoot = '/proc', markerEnv = HOST_MARKER_ENV } = {}) {
   if (!Number.isInteger(record?.pid) || record.pid <= 0) {
     return { ok: false, alive: false, reason: 'dead' }
   }
@@ -241,7 +290,7 @@ export async function inspectProcess(record, { procRoot = '/proc' } = {}) {
   }
   const environment = await readProcessEnvironment(record.pid, procRoot)
   if (environment === undefined) return { ok: false, alive: true, reason: 'unverified' }
-  const expected = `${HOST_MARKER_ENV}=${record.marker}`
+  const expected = `${markerEnv}=${record.marker}`
   if (!environment.split('\0').includes(expected)) {
     return { ok: false, alive: true, reason: 'unverified' }
   }
@@ -272,6 +321,12 @@ function validateHostRecord(value) {
     startedAt: typeof value.startedAt === 'string' ? value.startedAt : new Date().toISOString(),
     pid: undefined,
     procStart: typeof value.procStart === 'string' ? value.procStart : undefined,
+    drainerMarker: typeof value.drainerMarker === 'string' ? value.drainerMarker : undefined,
+    drainerPid: Number.isInteger(value.drainerPid) ? value.drainerPid : undefined,
+    drainerProcStart: typeof value.drainerProcStart === 'string' ? value.drainerProcStart : undefined,
+  }
+  if (state !== 'ready' && record.drainerMarker === undefined) {
+    throw new LiaisonError('HOST_RECORD_INVALID', 'Launching Host record has no drainer marker')
   }
 
   if (state === 'launching') return record
@@ -447,8 +502,8 @@ export class HostManager {
     return this.lockPromise
   }
 
-  async #inspect(record) {
-    return inspectProcess(record, { procRoot: this.procRoot })
+  async #inspect(record, markerEnv = HOST_MARKER_ENV) {
+    return inspectProcess(record, { procRoot: this.procRoot, markerEnv })
   }
 
   async #removeRecordByMarker(marker) {
@@ -512,16 +567,48 @@ export class HostManager {
 
   async #resolveRecordPid(record) {
     if (Number.isInteger(record.pid) && record.pid > 0) return { ok: true, record }
-    const found = await findProcessesByMarker(record.marker, this.procRoot)
+    const found = await findProcessesByMarker(record.marker, {
+      procRoot: this.procRoot,
+      markerEnv: HOST_MARKER_ENV,
+      cmdlineIncludes: [this.binPath, 'web'],
+    })
     if (!found.ok) return { ok: false, reason: 'unverified' }
     if (found.matches.length === 0) return { ok: true, record: null, missing: true }
     if (found.matches.length > 1) return { ok: false, reason: 'unverified', ambiguous: true }
     return { ok: true, record: { ...record, state: 'starting', ...found.matches[0] } }
   }
 
-  async #terminateOutcome(record, verification, signal) {
+  async #resolveDrainer(record) {
+    if (Number.isInteger(record.drainerPid) && record.drainerPid > 0) {
+      return {
+        ok: true,
+        record: {
+          pid: record.drainerPid,
+          procStart: record.drainerProcStart,
+          marker: record.drainerMarker,
+        },
+      }
+    }
+    if (typeof record.drainerMarker !== 'string' || record.drainerMarker === '') {
+      return { ok: true, record: null, missing: true }
+    }
+    const found = await findProcessesByMarker(record.drainerMarker, {
+      procRoot: this.procRoot,
+      markerEnv: DRAIN_MARKER_ENV,
+      cmdlineIncludes: [DRAIN_BIN],
+    })
+    if (!found.ok) return { ok: false, reason: 'unverified' }
+    if (found.matches.length === 0) return { ok: true, record: null, missing: true }
+    if (found.matches.length > 1) return { ok: false, reason: 'unverified', ambiguous: true }
+    return {
+      ok: true,
+      record: { ...found.matches[0], marker: record.drainerMarker },
+    }
+  }
+
+  async #terminateOutcome(record, verification, signal, { markerEnv = HOST_MARKER_ENV, removeRecord = true } = {}) {
     if (verification.reason === 'dead' || verification.reason === 'reused') {
-      await this.#removeRecordByMarker(record.marker)
+      if (removeRecord) await this.#removeRecordByMarker(record.marker)
       return {
         stopped: true,
         reason: signal === 'SIGKILL' ? 'killed' : 'exited',
@@ -536,12 +623,19 @@ export class HostManager {
       pid: record.pid,
       ...signal === undefined ? {} : { signal },
       retained: true,
+      markerEnv,
     }
   }
 
-  async #terminateRecord(record, { timeoutMs = 10_000, killTimeoutMs = 2_000 }) {
-    const initial = await this.#inspect(record)
-    if (!initial.ok) return await this.#terminateOutcome(record, initial, undefined)
+  async #terminateRecord(record, {
+    timeoutMs = 10_000,
+    killTimeoutMs = 2_000,
+    markerEnv = HOST_MARKER_ENV,
+    removeRecord = true,
+  } = {}) {
+    const options = { markerEnv, removeRecord }
+    const initial = await this.#inspect(record, markerEnv)
+    if (!initial.ok) return await this.#terminateOutcome(record, initial, undefined, options)
 
     try { process.kill(record.pid, 'SIGTERM') } catch (error) {
       if (error?.code !== 'ESRCH') throw error
@@ -549,41 +643,43 @@ export class HostManager {
     const deadline = Date.now() + timeoutMs
     let unverifiedSince
     while (Date.now() < deadline) {
-      const current = await this.#inspect(record)
+      const current = await this.#inspect(record, markerEnv)
       if (!current.ok) {
         if (current.reason === 'dead' || current.reason === 'reused') {
-          return await this.#terminateOutcome(record, current, 'SIGTERM')
+          return await this.#terminateOutcome(record, current, 'SIGTERM', options)
         }
         if (current.reason === 'unverified') {
           if (await pidLiveness(record.pid) === 'dead') {
-            return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGTERM')
+            return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGTERM', options)
           }
           unverifiedSince ??= Date.now()
-          if (Date.now() - unverifiedSince >= 500) return await this.#terminateOutcome(record, current, 'SIGTERM')
+          if (Date.now() - unverifiedSince >= 500) {
+            return await this.#terminateOutcome(record, current, 'SIGTERM', options)
+          }
           await sleep(50)
           continue
         }
-        return await this.#terminateOutcome(record, current, 'SIGTERM')
+        return await this.#terminateOutcome(record, current, 'SIGTERM', options)
       }
       unverifiedSince = undefined
       await sleep(100)
     }
 
     // Re-verify immediately before escalation so a recycled pid cannot be hit.
-    const final = await this.#inspect(record)
-    if (!final.ok) return await this.#terminateOutcome(record, final, 'SIGTERM')
+    const final = await this.#inspect(record, markerEnv)
+    if (!final.ok) return await this.#terminateOutcome(record, final, 'SIGTERM', options)
     try { process.kill(record.pid, 'SIGKILL') } catch (error) {
       if (error?.code !== 'ESRCH') throw error
     }
     const killDeadline = Date.now() + killTimeoutMs
     while (Date.now() < killDeadline) {
-      const current = await this.#inspect(record)
+      const current = await this.#inspect(record, markerEnv)
       if (!current.ok) {
         if (current.reason === 'dead' || current.reason === 'reused') {
-          return await this.#terminateOutcome(record, current, 'SIGKILL')
+          return await this.#terminateOutcome(record, current, 'SIGKILL', options)
         }
         if (current.reason === 'unverified' && await pidLiveness(record.pid) === 'dead') {
-          return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGKILL')
+          return await this.#terminateOutcome(record, { ok: false, alive: false, reason: 'dead' }, 'SIGKILL', options)
         }
         // A dying process can briefly lose readable identity; give the kernel
         // signal time to complete before reporting the retained record.
@@ -592,11 +688,29 @@ export class HostManager {
       }
       await sleep(50)
     }
-    const last = await this.#inspect(record)
-    return await this.#terminateOutcome(record, last, 'SIGKILL')
+    const last = await this.#inspect(record, markerEnv)
+    return await this.#terminateOutcome(record, last, 'SIGKILL', options)
   }
 
   async #recoverStarting(record) {
+    const drainer = await this.#resolveDrainer(record)
+    if (!drainer.ok) {
+      throw new LiaisonError('HOST_RECORD_UNOWNED',
+        'A write-ahead drainer marker cannot be tied to a verified process')
+    }
+    if (drainer.record !== null) {
+      const stoppedDrainer = await this.#terminateRecord(drainer.record, {
+        markerEnv: DRAIN_MARKER_ENV,
+        removeRecord: false,
+        timeoutMs: 1_000,
+        killTimeoutMs: 500,
+      })
+      if (stoppedDrainer.retained === true) {
+        throw new LiaisonError('HOST_RECORD_UNOWNED',
+          `A write-ahead Host launcher is still ${stoppedDrainer.reason}; refusing to spawn a duplicate`)
+      }
+    }
+
     const resolved = await this.#resolveRecordPid(record)
     if (!resolved.ok) {
       throw new LiaisonError('HOST_RECORD_UNOWNED',
@@ -659,13 +773,13 @@ export class HostManager {
   async #assertProcessIdentitySupported() {
     if (!await procfsAvailable(this.procRoot)) {
       throw new LiaisonError('HOST_IDENTITY_UNSUPPORTED',
-        'Managed Host spawn requires readable procfs process identity support')
+        'Managed Host lifecycle requires Linux with readable procfs process identity')
     }
     const selfStart = await processStartToken(process.pid, this.procRoot)
     const selfEnvironment = await readProcessEnvironment(process.pid, this.procRoot)
     if (selfStart === undefined || selfEnvironment === undefined) {
       throw new LiaisonError('HOST_IDENTITY_UNSUPPORTED',
-        'Managed Host spawn cannot verify process start time and environment identity')
+        'Managed Host lifecycle cannot verify Linux procfs process identity')
     }
   }
 
@@ -680,10 +794,12 @@ export class HostManager {
     }
 
     const marker = randomUUID()
+    const drainerMarker = randomUUID()
     const launchRecord = {
       version: RECORD_VERSION,
       state: 'launching',
       marker,
+      drainerMarker,
       dshHome,
       cwd,
       requestedPort: port,
@@ -696,8 +812,10 @@ export class HostManager {
       ...this.env,
       ...options.env,
       DSH_HOME: dshHome,
-      [HOST_MARKER_ENV]: marker,
+      [DRAIN_MARKER_ENV]: drainerMarker,
+      [DRAIN_HOST_MARKER_ENV]: marker,
     }
+    delete env[HOST_MARKER_ENV]
     const args = [this.binPath, 'web']
     for (const patch of patches) args.push('--patch', patch)
     args.push('--no-open', '--host', '127.0.0.1', '--port', String(port))
@@ -716,14 +834,31 @@ export class HostManager {
     let spawnError
     drainer.once('error', error => { spawnError = error })
     drainer.unref()
+    if (drainer.pid !== undefined) {
+      const drainerProcStart = await processStartToken(drainer.pid, this.procRoot)
+      if (drainerProcStart !== undefined) {
+        launchRecord.drainerPid = drainer.pid
+        launchRecord.drainerProcStart = drainerProcStart
+        await writePrivateAtomic(this.recordPath, launchRecord)
+      }
+    }
 
     let output = ''
     let errorOutput = ''
+    let stdoutBuffer = ''
     let hostPid
     let launchUrl
     drainer.stdout.setEncoding('utf8')
     drainer.stderr.setEncoding('utf8')
-    drainer.stdout.on('data', chunk => { output = `${output}${chunk}`.slice(-100_000) })
+    drainer.stdout.on('data', chunk => {
+      output = `${output}${chunk}`.slice(-100_000)
+      const read = readCompleteLines(stdoutBuffer, chunk)
+      stdoutBuffer = read.buffer
+      for (const line of read.lines) {
+        if (hostPid === undefined) hostPid = parseDrainPid(line)
+        if (launchUrl === undefined) launchUrl = parseLaunchAnnouncement(line)
+      }
+    })
     drainer.stderr.on('data', chunk => { errorOutput = `${errorOutput}${chunk}`.slice(-100_000) })
     const started = Date.now()
     try {
@@ -731,10 +866,6 @@ export class HostManager {
         if (spawnError !== undefined) {
           throw new LiaisonError('HOST_SPAWN_FAILED',
             `Could not start dsh web: ${redactSecrets(spawnError.message)}`)
-        }
-        if (hostPid === undefined) {
-          const pidMatch = /DSH_DRAIN_PID (\d+)/u.exec(output)
-          if (pidMatch?.[1] !== undefined) hostPid = Number(pidMatch[1])
         }
         if (hostPid !== undefined && ownershipRecord === undefined) {
           const procStart = await processStartToken(hostPid, this.procRoot)
@@ -748,11 +879,7 @@ export class HostManager {
             await writePrivateAtomic(this.recordPath, ownershipRecord)
           }
         }
-        const match = /dsh web: (http:\/\/[^\s]+)/u.exec(`${output}${errorOutput}`)
-        if (match?.[1] !== undefined) {
-          launchUrl = match[1]
-          break
-        }
+        if (launchUrl !== undefined && hostPid !== undefined) break
         if (drainer.exitCode !== null) {
           throw new LiaisonError('HOST_SPAWN_FAILED',
             `dsh web exited before readiness (${String(drainer.exitCode)}): ${redactSecrets(`${output}${errorOutput}`)}`)
@@ -826,6 +953,33 @@ export class HostManager {
       if (loaded === null || loaded.invalid === true) {
         if (loaded?.invalid === true) await removeIfUnchanged(this.recordPath, loaded.raw)
         return { stopped: false, reason: 'missing', pid: null, retained: false }
+      }
+      if (loaded.record.state !== 'ready') {
+        const drainer = await this.#resolveDrainer(loaded.record)
+        if (!drainer.ok) {
+          return {
+            stopped: false,
+            reason: 'unverified',
+            pid: loaded.record.drainerPid ?? loaded.record.pid ?? null,
+            retained: true,
+          }
+        }
+        if (drainer.record !== null) {
+          const stoppedDrainer = await this.#terminateRecord(drainer.record, {
+            markerEnv: DRAIN_MARKER_ENV,
+            removeRecord: false,
+            timeoutMs: 1_000,
+            killTimeoutMs: 500,
+          })
+          if (stoppedDrainer.retained === true) {
+            return {
+              stopped: false,
+              reason: stoppedDrainer.reason,
+              pid: drainer.record.pid,
+              retained: true,
+            }
+          }
+        }
       }
       const resolved = await this.#resolveRecordPid(loaded.record)
       if (!resolved.ok) {

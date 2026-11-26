@@ -4,7 +4,7 @@ import { spawn } from 'node:child_process'
 import { stat } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import { parseArgs } from 'node:util'
-import { HostManager, createLock, resolveStateDir } from './host-manager.mjs'
+import { HostManager, createLock, hostStopSucceeded, resolveStateDir } from './host-manager.mjs'
 import { call, probe } from './ipc-client.mjs'
 import { failure } from './ipc-protocol.mjs'
 import { errorEnvelope, LiaisonError } from './errors.mjs'
@@ -34,13 +34,18 @@ Options:
   --ensure            with status, attach or spawn the Host first
   --keep-host         with stop, leave dsh web running
   -h, --help          show this help
+
+Runtime:
+  Managed Host lifecycle currently requires Linux with readable procfs process
+  identity. Other hosts fail before spawning; the upstream bootstrap artifact
+  matrix remains independent of this runtime boundary.
 `
 
 function sleep(ms) {
   return new Promise(resolvePromise => setTimeout(resolvePromise, ms))
 }
 
-async function waitForDaemon(socketPath, timeoutMs = 30_000) {
+async function waitForDaemon(socketPath, timeoutMs = 60_000) {
   const deadline = Date.now() + timeoutMs
   while (Date.now() < deadline) {
     if (await probe(socketPath, 750)) return
@@ -94,6 +99,13 @@ async function stopWithoutDaemon({ stateDir, keepHost }) {
     }
   }
   const stopped = await manager.stopHost()
+  if (!hostStopSucceeded(stopped)) {
+    throw new LiaisonError('HOST_STOP_INCOMPLETE', 'Host stop did not complete', {
+      pid: stopped.pid ?? null,
+      reason: stopped.reason,
+      retained: stopped.retained === true,
+    })
+  }
   return {
     daemonPid: null,
     hostPid: stopped.pid ?? null,

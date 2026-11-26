@@ -9,6 +9,7 @@ import { failure } from './ipc-protocol.mjs'
 import { redactSecrets } from './redaction.mjs'
 
 const MAX_REQUEST_BYTES = 1_000_000
+const DAEMON_LOCK_TIMEOUT_MS = 30_000
 
 function listen(server, socketPath) {
   return new Promise((resolve, reject) => {
@@ -36,7 +37,7 @@ export async function startIpcServer({
   try {
     // The winning daemon holds this lock for its whole lifetime. A second
     // daemon therefore cannot mistake a busy first socket for a stale one.
-    release = await lock.acquire({ timeoutMs: 5_000 })
+    release = await lock.acquire({ timeoutMs: DAEMON_LOCK_TIMEOUT_MS })
   } catch (error) {
     if (error?.code === 'HOST_LOCK_TIMEOUT' && await probe(socketPath, 2_000)) {
       return { reused: true, socketPath, close: async () => {} }

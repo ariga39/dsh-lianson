@@ -1,6 +1,6 @@
 /** User-only local daemon: one managed Host plus one answering operator. */
 
-import { HostManager, resolveStateDir } from './host-manager.mjs'
+import { HostManager, hostStopSucceeded, resolveStateDir } from './host-manager.mjs'
 import { OperatorConnection } from './operator-connection.mjs'
 import { startIpcServer } from './ipc-server.mjs'
 import { IPC_COMMANDS, failure, success } from './ipc-protocol.mjs'
@@ -159,6 +159,13 @@ async function dispatch(request) {
             retained: false,
           }))
           : await manager.stopHost()
+        if (!keep && !hostStopSucceeded(stopped)) {
+          throw new LiaisonError('HOST_STOP_INCOMPLETE', 'Host stop did not complete', {
+            pid: stopped.pid ?? previous?.pid ?? null,
+            reason: stopped.reason,
+            retained: stopped.retained === true,
+          })
+        }
         host = null
         return {
           envelope: success(command, {

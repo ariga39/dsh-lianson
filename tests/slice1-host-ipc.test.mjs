@@ -8,7 +8,20 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { test } from 'node:test'
 import { loadUpstream } from '../src/upstream.mjs'
-import { HostManager, createLock, inspectProcess, processStartToken } from '../src/host-manager.mjs'
+import {
+  DRAIN_HOST_MARKER_ENV,
+  DRAIN_MARKER_ENV,
+  DSH_BIN,
+  HOST_MARKER_ENV,
+  HostManager,
+  createLock,
+  findProcessesByMarker,
+  inspectProcess,
+  parseDrainPid,
+  parseLaunchAnnouncement,
+  processStartToken,
+  readCompleteLines,
+} from '../src/host-manager.mjs'
 import { startIpcServer } from '../src/ipc-server.mjs'
 import { OperatorConnection } from '../src/operator-connection.mjs'
 import { startScriptedMessagesServer } from './support/scripted-messages-server.mjs'
@@ -35,6 +48,25 @@ async function readModelCatalog(remote) {
   assert.equal(result.ok, true, JSON.stringify(result.error ?? {}))
   return result.value
 }
+
+test('slice1: readiness accepts only a complete announcement line across stdout chunks', () => {
+  let buffer = ''
+  const feed = chunk => {
+    const read = readCompleteLines(buffer, chunk)
+    buffer = read.buffer
+    return read.lines
+  }
+
+  assert.deepEqual(feed('DSH_DRAIN_PID 12'), [])
+  let lines = feed('34\n')
+  assert.deepEqual(lines.map(parseDrainPid), [1234])
+
+  assert.deepEqual(feed('dsh web: http://127.0.0.1:412'), [])
+  assert.deepEqual(feed('34/?token=abc'), [])
+  assert.deepEqual(feed('\n').map(parseLaunchAnnouncement), ['http://127.0.0.1:41234/?token=abc'])
+  assert.deepEqual(feed('prefix dsh web: http://127.0.0.1:1/?token=x\n').map(parseLaunchAnnouncement), [undefined])
+  assert.equal(parseLaunchAnnouncement('dsh web: http://127.0.0.1:1/?token=x'), 'http://127.0.0.1:1/?token=x')
+})
 
 test('slice1: forced mux drop revokes the old cookie and single-flight /connect re-exchanges it', { timeout: 180_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-reconnect-'))
@@ -419,6 +451,62 @@ test('slice1: reconnect keeps retrying past five failures and close cancels the 
   assert.equal(operator.snapshot().connected, false)
 })
 
+test('slice1: initial /connect outage keeps retrying after a bounded foreground wait', { timeout: 120_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-initial-retry-'))
+  const mock = await startScriptedMessagesServer()
+  const fixtureEnvironment = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
+  const stateDir = join(root, 'state')
+  const manager = new HostManager({
+    stateDir,
+    dshHome: fixtureEnvironment.dshHome,
+    cwd: fixtureEnvironment.cwd,
+    patches: [fixtureEnvironment.overlayPath],
+    port: 0,
+    env: fixtureEnvironment.env,
+  })
+  let operator
+  t.after(async () => {
+    await operator?.close().catch(() => {})
+    await manager.stopHost().catch(() => {})
+    await mock.close().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const host = await manager.ensureHost()
+  const upstream = await loadUpstream()
+  operator = new OperatorConnection({
+    hostManager: manager,
+    host,
+    upstream,
+    foregroundWaitMs: 100,
+    reconnectDelayMs: 10,
+    reconnectMaxDelayMs: 50,
+  })
+  const realFetch = operator.fetchImpl
+  let connectFailures = 0
+  operator.fetchImpl = (input, init) => {
+    if (String(input).includes('/connect') && connectFailures < 7) {
+      connectFailures += 1
+      return Promise.reject(new Error('simulated initial /connect outage'))
+    }
+    return realFetch(input, init)
+  }
+
+  const started = Date.now()
+  await assert.rejects(
+    () => operator.ensureConnected(),
+    error => error?.code === 'OPERATOR_RECONNECTING',
+  )
+  assert.ok(Date.now() - started < 2_000)
+  await waitFor(() => operator.snapshot().connected === true && connectFailures >= 7, {
+    timeoutMs: 30_000,
+    label: 'initial background reconnect to recover',
+  })
+  assert.equal(operator.snapshot().connectCount, 1)
+  assert.equal(operator.snapshot().reconnectCount, 0)
+  await readModelCatalog(await operator.withClient(remote => remote))
+})
+
 test('slice1: kernel flock enforces exclusive ownership and releases on process death', { timeout: 60_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-flock-'))
   const lockPath = join(root, 'shared.lock')
@@ -525,7 +613,7 @@ test('slice1: write-ahead launch marker terminates a verified orphan before spaw
   const stateDir = join(root, 'state')
   await mkdir(stateDir, { recursive: true, mode: 0o700 })
   const marker = randomUUID()
-  const orphan = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], {
+  const orphan = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)', DSH_BIN, 'web'], {
     env: { ...process.env, DSH_LIAISON_HOST_MARKER: marker },
     stdio: 'ignore',
   })
@@ -541,6 +629,7 @@ test('slice1: write-ahead launch marker terminates a verified orphan before spaw
     version: 1,
     state: 'launching',
     marker,
+    drainerMarker: randomUUID(),
     dshHome: fixtureEnvironment.dshHome,
     cwd: fixtureEnvironment.cwd,
     requestedPort: 0,
@@ -568,7 +657,7 @@ test('slice1: starting record with pid identity is terminated before replacement
   const stateDir = join(root, 'state')
   await mkdir(stateDir, { recursive: true, mode: 0o700 })
   const marker = randomUUID()
-  const orphan = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], {
+  const orphan = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)', DSH_BIN, 'web'], {
     env: { ...process.env, DSH_LIAISON_HOST_MARKER: marker },
     stdio: 'ignore',
   })
@@ -586,6 +675,7 @@ test('slice1: starting record with pid identity is terminated before replacement
     pid: orphan.pid,
     procStart: await processStartToken(orphan.pid),
     marker,
+    drainerMarker: randomUUID(),
     dshHome: fixtureEnvironment.dshHome,
     cwd: fixtureEnvironment.cwd,
     requestedPort: 0,
@@ -603,6 +693,85 @@ test('slice1: starting record with pid identity is terminated before replacement
   const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8'))
   assert.equal(record.state, 'ready')
   assert.equal(record.pid, host.pid)
+})
+
+test('slice1: real drainer and Host crash before pid recording stops the launcher first and replaces both', { timeout: 180_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-real-crash-'))
+  const mock = await startScriptedMessagesServer()
+  const fixtureEnvironment = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
+  const stateDir = join(root, 'state')
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
+  const marker = randomUUID()
+  const drainerMarker = randomUUID()
+  const args = [
+    DSH_BIN, 'web',
+    '--patch', fixtureEnvironment.overlayPath,
+    '--no-open', '--host', '127.0.0.1', '--port', '0',
+  ]
+  const drainerEnv = {
+    ...fixtureEnvironment.env,
+    DSH_LIAISON_DRAIN_ARGS: JSON.stringify(args),
+    DSH_LIAISON_DRAIN_CWD: fixtureEnvironment.cwd,
+    DSH_LIAISON_DRAIN_MARKER: drainerMarker,
+    DSH_LIAISON_DRAIN_HOST_MARKER: marker,
+  }
+  delete drainerEnv[HOST_MARKER_ENV]
+  await writeFile(join(stateDir, 'host.json'), JSON.stringify({
+    version: 1,
+    state: 'launching',
+    marker,
+    drainerMarker,
+    dshHome: fixtureEnvironment.dshHome,
+    cwd: fixtureEnvironment.cwd,
+    requestedPort: 0,
+    startedAt: new Date().toISOString(),
+  }), { mode: 0o600 })
+  const drainer = spawn(process.execPath, [DRAIN_BIN], {
+    cwd: fixtureEnvironment.cwd,
+    env: drainerEnv,
+    detached: true,
+    stdio: 'ignore',
+  })
+  const manager = new HostManager({ stateDir })
+  let hostPid
+  t.after(async () => {
+    if (hostPid !== undefined) {
+      try { process.kill(hostPid, 'SIGKILL') } catch {}
+    }
+    if (drainer.exitCode === null) drainer.kill('SIGKILL')
+    await manager.stopHost().catch(() => {})
+    await mock.close().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+
+  const hostMatches = await waitFor(async () => {
+    const found = await findProcessesByMarker(marker, {
+      markerEnv: HOST_MARKER_ENV,
+      cmdlineIncludes: [DSH_BIN, 'web'],
+    })
+    return found.matches.length === 1 ? found.matches : false
+  }, { timeoutMs: 30_000, label: 'real Host to spawn under the drainer' })
+  hostPid = hostMatches[0].pid
+  const drainerMatches = await findProcessesByMarker(drainerMarker, {
+    markerEnv: DRAIN_MARKER_ENV,
+    cmdlineIncludes: [DRAIN_BIN],
+  })
+  assert.equal(drainerMatches.matches.length, 1)
+  assert.equal(drainerMatches.matches[0].pid, drainer.pid)
+  assert.notEqual(hostPid, drainer.pid)
+
+  const replacement = await manager.ensureHost({
+    dshHome: fixtureEnvironment.dshHome,
+    cwd: fixtureEnvironment.cwd,
+    patches: [fixtureEnvironment.overlayPath],
+    env: fixtureEnvironment.env,
+  })
+  await waitForExit(drainer.pid)
+  await waitForExit(hostPid)
+  assert.notEqual(replacement.pid, hostPid)
+  const record = JSON.parse(await readFile(join(stateDir, 'host.json'), 'utf8'))
+  assert.equal(record.state, 'ready')
+  assert.equal(record.pid, replacement.pid)
 })
 
 test('slice1: spawn fails before side effects when process identity is unsupported', { timeout: 60_000 }, async (t) => {
@@ -734,6 +903,41 @@ test('slice1: fresh host stop without a state directory is truthful success', { 
   await assert.rejects(() => stat(stateDir), error => error?.code === 'ENOENT')
 })
 
+test('slice1: unverified stop is a nonzero failure with retained pid details', { timeout: 60_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-unverified-stop-'))
+  const stateDir = join(root, 'state')
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
+  const sleeper = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 60_000)'], { stdio: 'ignore' })
+  t.after(async () => {
+    if (sleeper.exitCode === null) sleeper.kill('SIGKILL')
+    await rm(root, { recursive: true, force: true })
+  })
+  await waitFor(() => sleeper.pid !== undefined && sleeper.exitCode === null, { label: 'sleeper start' })
+  const recordPath = join(stateDir, 'host.json')
+  await writeFile(recordPath, JSON.stringify({
+    version: 1,
+    state: 'ready',
+    pid: sleeper.pid,
+    marker: randomUUID(),
+    origin: 'http://127.0.0.1:9',
+    port: 9,
+    launchToken: 'not-a-real-token-but-long-enough',
+    dshHome: join(root, 'home'),
+    cwd: root,
+    startedAt: new Date().toISOString(),
+  }), { mode: 0o600 })
+  const env = { ...process.env, DSH_LIAISON_STATE_DIR: stateDir }
+  const stopped = await runCli(['host', 'stop'], { cwd: root, env })
+  assert.equal(stopped.code, 1)
+  assert.equal(stopped.envelope?.ok, false)
+  assert.equal(stopped.envelope.error.code, 'HOST_STOP_INCOMPLETE')
+  assert.equal(stopped.envelope.error.details.reason, 'unverified')
+  assert.equal(stopped.envelope.error.details.pid, sleeper.pid)
+  assert.equal(stopped.envelope.error.details.retained, true)
+  assert.equal((await stat(recordPath)).isFile(), true)
+  assert.equal(process.kill(sleeper.pid, 0), true)
+})
+
 test('slice1: failed stop after operator close exits safely and preserves Host ownership', { timeout: 120_000 }, async (t) => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-stop-fail-'))
   const mock = await startScriptedMessagesServer()
@@ -817,6 +1021,64 @@ test('slice1: a start racing stop cannot leave a Host after stop success', { tim
       throw error
     }
   }, { timeoutMs: 10_000, label: 'no Host record after stop success' })
+})
+
+test('slice1: start waits through a daemon-less stop ownership deadline', { timeout: 240_000 }, async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-slice1-start-during-stop-'))
+  const mock = await startScriptedMessagesServer()
+  const fixtureEnvironment = await createKeylessEnvironment({ root, mockBaseURL: mock.baseURL })
+  const stateDir = join(root, 'state')
+  await mkdir(stateDir, { recursive: true, mode: 0o700 })
+  const env = { ...fixtureEnvironment.env, DSH_LIAISON_STATE_DIR: stateDir }
+  const marker = randomUUID()
+  const readyPath = join(root, 'slow-stop.ready')
+  const stubborn = spawn(process.execPath, [
+    '-e',
+    `process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(${JSON.stringify(readyPath)}, 'ready'); setTimeout(() => {}, 60_000)`,
+  ], {
+    env: { ...process.env, DSH_LIAISON_HOST_MARKER: marker },
+    stdio: 'ignore',
+  })
+  t.after(async () => {
+    if (stubborn.exitCode === null) stubborn.kill('SIGKILL')
+    await new HostManager({ stateDir }).stopHost().catch(() => {})
+    await mock.close().catch(() => {})
+    await rm(root, { recursive: true, force: true })
+  })
+  await waitFor(async () => {
+    try { return (await stat(readyPath)).isFile() } catch { return false }
+  }, { label: 'slow stop child readiness' })
+  await writeFile(join(stateDir, 'host.json'), JSON.stringify({
+    version: 1,
+    state: 'ready',
+    pid: stubborn.pid,
+    procStart: await processStartToken(stubborn.pid),
+    marker,
+    origin: 'http://127.0.0.1:9',
+    port: 9,
+    launchToken: 'not-a-real-token-but-long-enough',
+    dshHome: fixtureEnvironment.dshHome,
+    cwd: fixtureEnvironment.cwd,
+    startedAt: new Date().toISOString(),
+  }), { mode: 0o600 })
+
+  const stopPromise = runCli(['host', 'stop'], { cwd: fixtureEnvironment.cwd, env })
+  await sleep(300)
+  const startPromise = runCli([
+    'host', 'start',
+    '--workspace', fixtureEnvironment.cwd,
+    '--dsh-home', fixtureEnvironment.dshHome,
+    '--patch', fixtureEnvironment.overlayPath,
+  ], { cwd: fixtureEnvironment.cwd, env })
+  const [stopped, started] = await Promise.all([stopPromise, startPromise])
+  assert.equal(stopped.code, 0, stopped.stderr)
+  assert.equal(stopped.envelope?.ok, true, stopped.stdout)
+  assert.equal(stopped.envelope.data.stoppedHost, true)
+  assert.equal(started.code, 0, started.stderr)
+  assert.equal(started.envelope?.ok, true, started.stdout)
+  assert.notEqual(started.envelope.data.hostPid, stubborn.pid)
+  await waitForExit(stubborn.pid)
+  await runCli(['host', 'stop'], { cwd: fixtureEnvironment.cwd, env })
 })
 
 test('slice1: stale unverified Host records are never signalled and foreign origins are rejected', { timeout: 60_000 }, async (t) => {
