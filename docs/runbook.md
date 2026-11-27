@@ -1,8 +1,11 @@
 # Operator runbook
 
-Verified against the pinned `deepseek-harness/` checkout with Node 24. Commands
-below were exercised by `test:integration` against a real `dsh web` Host, the
-ordinary `dsh-liaison` CLI, and Playwright.
+Verified against the pinned `deepseek-harness/` checkout with Node 24. The live
+`test:integration` run exercised the real Host boot, the
+`create`/`prompt`/`wait`/`events`/`verify-model` flow, two-worktree isolation,
+approval and question settlement through both the CLI and Web, steer, queue
+edit, stop, rework across an abrupt restart, and persistent installation.
+Commands outside that exercised surface are marked as such.
 
 ## Fast checks versus live integration
 
@@ -67,9 +70,11 @@ The socket is `$XDG_RUNTIME_DIR/dsh-liaison/dsh-liaison.sock` (or
 `0700`; the socket is `0600`. One plugin owns the socket at a time. After an
 abrupt Host exit, the next Host removes the stale socket and binds normally.
 
-The CLI now waits for the Host's asynchronous authentication handshake on the
-first command, so a command issued immediately after Host readiness does not
-fail with `dsh exposes no authenticated entry URL`.
+The CLI joins the Host's asynchronous authentication handshake on the first
+command, so a command issued immediately after Host readiness does not fail with
+`dsh exposes no authenticated entry URL`. `wait` and `stop` include that
+handshake inside their own command deadline, so a slow first connection does
+not extend either budget.
 
 ## Delegate work
 
@@ -91,9 +96,11 @@ session. Repeat `prompt` with the same request id and text to reuse its original
 cursor. Different content under the same key is reported as a conflict.
 
 Create independent delegations for independent worktrees. `workspace-write`
-keeps each Session inside its own workspace; writes outside it require an
+keeps each Session inside its own workspace except for globally shared platform
+temp areas and any deployment-configured additional writable roots; those roots
+are writable by every Session. Writes outside the effective root set require an
 approval. The integration suite verifies two sibling worktrees and an attempted
-cross-worktree write.
+cross-worktree write in a non-shared directory.
 
 ## Observe and answer
 
@@ -111,6 +118,9 @@ dsh-liaison interaction reject --interaction-id interaction-...
 dsh-liaison interaction answer --interaction-id interaction-... \
   --answers '[{"id":"q1","selected":["Yes"]}]'
 ```
+
+`interaction list`, `approve`, and `answer` were exercised live. `reject` is
+listed for operator completeness but was not part of the live suite.
 
 When both the CLI and a Web page have the same prompt, settling it from either
 side cancels the other side's pending prompt. The integration suite covers both

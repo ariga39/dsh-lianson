@@ -17,6 +17,7 @@ import type {
 } from '../src/remote.ts'
 import { DelegationService } from '../src/service.ts'
 import { trustPolicyOf } from '../src/trust.ts'
+import type { TrustPolicy } from '../src/trust.ts'
 import { makeTestRoot, removeTestRoot } from './support.ts'
 
 const CATALOG: RemoteModelCatalog = {
@@ -82,6 +83,7 @@ describe('session controls and observation', () => {
   let service: DelegationService
   let clock: number
   let interactions: InteractionBroker
+  let trust: TrustPolicy
 
   before(async () => {
     root = await makeTestRoot('controls-')
@@ -100,6 +102,13 @@ describe('session controls and observation', () => {
       now: () => 100,
       newId: () => 'fixed',
     })
+    trust = trustPolicyOf({
+      dshHome: join(root, 'home'),
+      runtimeDir: join(root, 'run'),
+      socketPath: join(root, 'run', 's.sock'),
+      lockPath: join(root, 'run', 's.sock.lock'),
+      ledgerPath: join(root, 'data', 'ledger.sqlite3'),
+    }, undefined)
     service = new DelegationService({
       ledger,
       remote: {
@@ -107,13 +116,7 @@ describe('session controls and observation', () => {
         requireRemote: async () => remote,
         dispose: async () => {},
       },
-      trust: trustPolicyOf({
-        dshHome: join(root, 'home'),
-        runtimeDir: join(root, 'run'),
-        socketPath: join(root, 'run', 's.sock'),
-        lockPath: join(root, 'run', 's.sock.lock'),
-        ledgerPath: join(root, 'data', 'ledger.sqlite3'),
-      }, undefined),
+      trust,
       now: () => 100,
       newId: () => 'fixed',
       clock: () => clock,
@@ -298,6 +301,48 @@ describe('session controls and observation', () => {
     assert.equal(result.quiescent, false)
     assert.equal(result.budgetExpired, true)
     assert.deepEqual(result.residualQueue, [])
+  })
+
+  it('keeps wait and stop inside the command budget while the first handshake is slow', async () => {
+    const delayed = new ControlRemote()
+    const slow = new DelegationService({
+      ledger,
+      remote: {
+        status: () => ({ state: 'connecting' }),
+        requireRemote: async () => {
+          await new Promise(resolve => setTimeout(resolve, 60))
+          return delayed
+        },
+        dispose: async () => {},
+      },
+      trust,
+      now: () => 100,
+      newId: () => 'fixed',
+      clock: () => clock,
+      sleep: async ms => { clock += ms },
+      pollIntervalMs: 1,
+      interactions,
+    })
+
+    const waitStarted = performance.now()
+    const waited = await slow.wait({ delegationId: 'd1', timeoutMs: 20 })
+    assert.ok(performance.now() - waitStarted < 1_000)
+    assert.equal(waited.status, 'timeout')
+    assert.equal(waited.slices, 0)
+    assert.equal(waited.state, null)
+
+    const stopStarted = performance.now()
+    const stopped = await slow.stop({ delegationId: 'd1', timeoutMs: 20 })
+    assert.ok(performance.now() - stopStarted < 1_000)
+    assert.equal(stopped.outcome, 'unknown')
+    assert.equal(stopped.budgetExpired, true)
+    assert.equal(stopped.stopped, false)
+    assert.equal(stopped.state, null)
+
+    await new Promise(resolve => setTimeout(resolve, 100))
+    assert.deepEqual(delayed.waitCalls, [], 'wait must not start after the handshake expires')
+    assert.deepEqual(delayed.queueCalls, [], 'stop must not mutate the queue after expiry')
+    assert.deepEqual(delayed.cancelled, [], 'stop must not cancel after the caller timed out')
   })
 
   it('returns unknown promptly when the stop state read is delayed past the budget', async () => {

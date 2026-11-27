@@ -368,15 +368,33 @@ export class DelegationService {
     readonly maxMessages?: number | undefined
   }): Promise<WaitResult> {
     const delegation = this.readyDelegation(input.delegationId)
-    const remote = await this.remote.requireRemote()
     const afterSeq = input.afterSeq ?? -1
     const timeoutMs = input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS
     const sliceTimeoutMs = Math.min(input.sliceTimeoutMs ?? 30_000, 30_000)
     const maxMessages = input.maxMessages ?? 500
     assertWaitBounds(afterSeq, timeoutMs, sliceTimeoutMs, maxMessages)
 
-    const startedAt = this.clock()
-    const deadline = startedAt + timeoutMs
+    const deadline = this.clock() + timeoutMs
+    const handshake = AbortSignal.timeout(timeoutMs)
+    let remote: DshRemote
+    try {
+      remote = await withinBudget(this.remote.requireRemote(), handshake)
+    } catch (error) {
+      if (handshake.aborted || this.clock() >= deadline) {
+        return waitResult(
+          delegation, afterSeq, afterSeq, 'timeout', 'timeout', null, 0,
+          new Map<number, SessionHistoryRecord>(), false, null, null,
+        )
+      }
+      throw error
+    }
+    if (handshake.aborted || this.clock() >= deadline) {
+      return waitResult(
+        delegation, afterSeq, afterSeq, 'timeout', 'timeout', null, 0,
+        new Map<number, SessionHistoryRecord>(), false, null, null,
+      )
+    }
+
     let cursor = afterSeq
     let lastState: RemoteSessionState | undefined
     let subagentCatalog: readonly unknown[] | null = null
@@ -538,7 +556,6 @@ export class DelegationService {
    */
   async stop(input: { readonly delegationId: string; readonly timeoutMs?: number | undefined }): Promise<StopResult> {
     const delegation = this.readyDelegation(input.delegationId)
-    const remote = await this.remote.requireRemote()
     const timeoutMs = input.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       throw new LiaisonError('usage', 'timeoutMs must be a positive safe integer', { timeoutMs })
@@ -552,6 +569,35 @@ export class DelegationService {
     let interrupted = false
     const errors: string[] = []
     let residual = new Set<string>()
+
+    const result = (budgetExpired: boolean): StopResult => {
+      const knownQuiet = lastKnown.state !== null && !lastKnown.state.running && residual.size === 0
+      const quiescent = interrupted
+        ? null
+        : lastKnown.state === null ? null : budgetExpired && knownQuiet ? null : knownQuiet
+      return {
+        delegationId: delegation.delegationId,
+        sessionId: delegation.sessionId,
+        outcome: quiescent === null ? 'unknown' : quiescent ? 'stopped' : 'running',
+        stopped: !budgetExpired && quiescent === true,
+        quiescent,
+        budgetExpired,
+        clearedQueue,
+        cancelled,
+        state: lastKnown.state,
+        residualQueue: [...residual],
+        errors,
+      }
+    }
+
+    let remote: DshRemote
+    try {
+      remote = await withinBudget(this.remote.requireRemote(), budget)
+    } catch (error) {
+      if (expired()) return result(true)
+      throw error
+    }
+    if (expired()) return result(true)
 
     const read = async (): Promise<boolean> => {
       if (expired()) return false
@@ -593,26 +639,6 @@ export class DelegationService {
       // A removal can race with dispatch: only a read taken after the last
       // mutation may decide that no queued work remains.
       return mutated ? read() : true
-    }
-
-    const result = (budgetExpired: boolean): StopResult => {
-      const knownQuiet = lastKnown.state !== null && !lastKnown.state.running && residual.size === 0
-      const quiescent = interrupted
-        ? null
-        : lastKnown.state === null ? null : budgetExpired && knownQuiet ? null : knownQuiet
-      return {
-        delegationId: delegation.delegationId,
-        sessionId: delegation.sessionId,
-        outcome: quiescent === null ? 'unknown' : quiescent ? 'stopped' : 'running',
-        stopped: !budgetExpired && quiescent === true,
-        quiescent,
-        budgetExpired,
-        clearedQueue,
-        cancelled,
-        state: lastKnown.state,
-        residualQueue: [...residual],
-        errors,
-      }
     }
 
     if (!await drain()) return result(true)
