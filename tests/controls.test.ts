@@ -104,7 +104,7 @@ describe('session controls and observation', () => {
       ledger,
       remote: {
         status: () => ({ state: 'connected', origin: remote.origin }),
-        requireRemote: () => remote,
+        requireRemote: async () => remote,
         dispose: async () => {},
       },
       trust: trustPolicyOf({

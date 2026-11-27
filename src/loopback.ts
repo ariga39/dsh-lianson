@@ -55,17 +55,20 @@ export class LoopbackClient {
   }
 
   /**
+   * Join the active connect round, or start a fresh lazy round when none is
+   * running. This keeps the first command after Host readiness from failing
+   * while the plugin's asynchronous authentication handshake is still in
+   * flight.
    * @returns the connected remote.
-   * @throws {LiaisonError} `dsh-unavailable` before a successful connect.
+   * @throws {LiaisonError} `dsh-unavailable` when the round settles unconnected.
    */
-  requireRemote(): DshRemote {
-    if (this.remote === undefined) {
-      const message = this.currentStatus.lastError ?? 'dsh loopback is not connected'
-      // Lazy retry: a command that arrives after a failed boot starts a new round.
-      if (!this.disposed && this.currentStatus.state !== 'connecting') this.start()
-      throw new LiaisonError('dsh-unavailable', message, { state: this.currentStatus.state })
-    }
-    return this.remote
+  async requireRemote(): Promise<DshRemote> {
+    if (this.remote !== undefined) return this.remote
+    if (this.disposed) throw unavailable(this.currentStatus)
+    if (this.running === undefined) this.start()
+    await this.running
+    if (this.remote !== undefined) return this.remote
+    throw unavailable(this.currentStatus)
   }
 
   /**
@@ -134,6 +137,10 @@ export class LoopbackClient {
     this.currentStatus = status
     this.options.onStatus?.(status)
   }
+}
+
+function unavailable(status: LoopbackStatus): LiaisonError {
+  return new LiaisonError('dsh-unavailable', status.lastError ?? 'dsh loopback is not connected', { state: status.state })
 }
 
 /** Abortable timer owned by the loopback lifetime. */

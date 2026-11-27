@@ -88,7 +88,12 @@ export interface LoopbackStatus {
 /** Supplies the connected remote to the delegation service. */
 export interface RemoteSource {
   status(): LoopbackStatus
-  /** @throws {LiaisonError} `dsh-unavailable` until the loopback client connects. */
-  requireRemote(): DshRemote
+  /**
+   * Join the current connect round or start one, then return the connected
+   * remote. The first command after Host readiness does not race the plugin's
+   * asynchronous authentication handshake.
+   * @throws {LiaisonError} `dsh-unavailable` when the round settles unconnected.
+   */
+  requireRemote(): Promise<DshRemote>
   dispose(): Promise<void>
 }

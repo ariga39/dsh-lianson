@@ -85,11 +85,11 @@ describe('loopback lifecycle', () => {
     assert.equal(connects, 2)
     assert.equal(states.at(-1)?.state, 'connected')
     assert.equal(states.at(-1)?.origin, 'http://127.0.0.1:3080')
-    assert.equal(client.requireRemote(), disposed.remote)
+    assert.equal(await client.requireRemote(), disposed.remote)
     await client.dispose()
     assert.equal(disposed.disposeCalls(), 1)
     assert.equal(client.status().state, 'disposed')
-    assert.throws(() => client.requireRemote(), (error: unknown) => error instanceof LiaisonError && error.code === 'dsh-unavailable')
+    await assert.rejects(client.requireRemote(), (error: unknown) => error instanceof LiaisonError && error.code === 'dsh-unavailable')
   })
 
   it('stops retrying after the configured attempts', async () => {
@@ -107,6 +107,35 @@ describe('loopback lifecycle', () => {
   })
 
 
+  it('joins the in-flight connect round instead of failing the first command', async () => {
+    const disposed = createRemote()
+    const gate = Promise.withResolvers<void>()
+    let entries = 0
+    let sleeps = 0
+    const client = new LoopbackClient({
+      collectEntries: () => {
+        entries += 1
+        return entries < 2 ? [] : [{ label: 'dsh web', url: 'http://127.0.0.1:3080/?token=launch', open: true }]
+      },
+      exchange: async () => ({ origin: 'http://127.0.0.1:3080', cookie: 'dsh=secret' }),
+      connect: async () => disposed.remote,
+      retryDelaysMs: [1],
+      maxAttempts: 2,
+      sleep: async () => {
+        sleeps += 1
+        if (sleeps === 1) await gate.promise
+      },
+    })
+    client.start()
+    await waitFor(() => sleeps === 1)
+    const pending = client.requireRemote()
+    assert.equal(client.status().state, 'unavailable')
+    gate.resolve()
+    assert.equal(await pending, disposed.remote)
+    assert.equal(client.status().state, 'connected')
+    await client.dispose()
+  })
+
   it('starts a fresh lazy attempt when a command arrives after failure', async () => {
     let entries = 0
     const client = new LoopbackClient({
@@ -119,9 +148,10 @@ describe('loopback lifecycle', () => {
     })
     await settled(client)
     assert.equal(entries, 1)
-    assert.throws(() => client.requireRemote())
-    await waitFor(() => entries > 1)
-    assert.throws(() => client.requireRemote())
+    await assert.rejects(client.requireRemote(), (error: unknown) => error instanceof LiaisonError && error.code === 'dsh-unavailable')
+    assert.equal(entries, 2)
+    await assert.rejects(client.requireRemote(), (error: unknown) => error instanceof LiaisonError && error.code === 'dsh-unavailable')
+    assert.equal(entries, 3)
   })
 
   it('aborts an in-flight connect and releases its resources on dispose', async () => {
@@ -144,7 +174,7 @@ describe('loopback lifecycle', () => {
     await waitFor(() => release !== undefined)
     await client.dispose()
     assert.equal(client.status().state, 'disposed')
-    assert.throws(() => client.requireRemote())
+    await assert.rejects(client.requireRemote())
   })
 })
 

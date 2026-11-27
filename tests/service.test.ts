@@ -48,7 +48,7 @@ describe('delegation service', () => {
       ledger,
       remote: {
         status: () => ({ state: 'connected', origin: remote.origin }),
-        requireRemote: () => remote,
+        requireRemote: async () => remote,
         dispose: async () => {},
       },
       trust: trustPolicyOf({
@@ -116,7 +116,7 @@ describe('delegation service', () => {
       ledger,
       remote: {
         status: () => ({ state: 'unavailable' }),
-        requireRemote: () => { throw new LiaisonError('dsh-unavailable', 'offline') },
+        requireRemote: async () => { throw new LiaisonError('dsh-unavailable', 'offline') },
         dispose: async () => {},
       },
       trust: trustPolicyOf({
