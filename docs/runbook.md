@@ -128,7 +128,7 @@ dsh-liaison interaction answer --delegation-id task-a --call-id call-... \
 ```
 
 `interaction list` shows pending requests with an `id`; use it with
-`--interaction-id`. A continued question has no pending id: list it by passing
+`--interaction-id`. A continued question has no pending id. Answer it by passing
 its `delegationId` and `callId` as `--delegation-id` and `--call-id`. Both
 identify that question within its own session, even when another session uses
 the same call id.
