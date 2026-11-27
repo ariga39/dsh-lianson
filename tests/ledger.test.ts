@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { mkdtemp, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DatabaseSync } from 'node:sqlite'
 import { LiaisonError } from '../src/errors.ts'
 import { Ledger } from '../src/ledger.ts'
 import type { DelegationRecord } from '../src/ledger.ts'
@@ -70,6 +71,24 @@ describe('SQLite ledger', () => {
       },
       (error: unknown) => error instanceof LiaisonError && error.code === 'conflict',
     )
+  })
+
+  it('reports a non-conflict insert fault as a ledger failure', async () => {
+    const faultRoot = await mkdtemp(join(tmpdir(), 'dsh-liaison-ledger-fault-'))
+    const faultPath = join(faultRoot, 'ledger.sqlite3')
+    const faultLedger = Ledger.open(faultPath)
+    const driver = new DatabaseSync(faultPath)
+    try {
+      driver.exec('DROP TABLE delegations')
+      assert.throws(
+        () => { faultLedger.insertDelegation({ ...record, delegationId: 'delegation-fault', sessionId: 'session-fault' }) },
+        (error: unknown) => error instanceof LiaisonError && error.code === 'ledger',
+      )
+    } finally {
+      driver.close()
+      faultLedger.close()
+      await rm(faultRoot, { recursive: true, force: true })
+    }
   })
 
   it('enforces non-empty identifiers at the database boundary', () => {
