@@ -243,9 +243,9 @@ export function createProgram(deps: CliDependencies): Command {
 
   interaction.command('answer')
     .description('Answer a pending or continued user question')
-    .option('--interaction-id <id>', 'pending interaction id')
-    .option('--delegation-id <id>', 'delegation for a continued question')
-    .option('--call-id <id>', 'question tool call id')
+    .option('--interaction-id <id>', 'pending interaction id from interaction list')
+    .option('--delegation-id <id>', 'delegation id for a continued question')
+    .option('--call-id <id>', 'question call id for a continued question')
     .requiredOption('--answers <json>', 'JSON answer array: [{"id":"q1","selected":["yes"]}]')
     .action(async (options: { interactionId?: string; delegationId?: string; callId?: string; answers: string }) => {
       await execute(deps, ROUTES.interactionAnswer, {

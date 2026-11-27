@@ -39,9 +39,12 @@ export interface InteractionView {
   readonly timed?: boolean
 }
 
-/** One settled question pulled from a Session projection. */
+/**
+ * One settled question pulled from a Session projection. It has no pending
+ * interaction id; `delegationId` plus `callId` are the arguments
+ * `interaction answer` accepts for it.
+ */
 export interface ContinuedQuestionView {
-  readonly id: string
   readonly delegationId: string
   readonly sessionId: string
   readonly kind: 'question'

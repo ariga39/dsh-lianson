@@ -563,6 +563,7 @@ describe('session controls and observation', () => {
 
     const rejection = interactions.offerApproval('session-fixed', { toolName: 'shell' })
     const rejectView = (await service.interactionList({ delegationId: 'd1' })).interactions[0]
+    assert.equal(rejectView?.kind, 'approval')
     assert.equal(service.interactionReject(rejectView?.id ?? '').outcome, 'rejected')
     assert.equal(await rejection, 'rejected')
 
@@ -571,6 +572,7 @@ describe('session controls and observation', () => {
       wait: { callId: brandString<ToolCallId>('call-1') },
     })
     const questionView = (await service.interactionList({ delegationId: 'd1' })).interactions[0]
+    assert.equal(questionView?.state, 'pending')
     const answered = await service.interactionAnswer({
       interactionId: questionView?.id ?? '',
       answers: [{ id: 'q1', selected: ['yes'] }],
@@ -585,7 +587,63 @@ describe('session controls and observation', () => {
       answers: [{ id: 'q2', selected: ['later'] }],
     })
     assert.equal(late.via, 'continued')
-    assert.deepEqual(remote.answers, [{ callId: 'late-call', answers: [{ id: 'q2', selected: ['later'] }] }])
+    assert.deepEqual(remote.answers, [{
+      sessionId: 'session-fixed',
+      callId: 'late-call',
+      answers: [{ id: 'q2', selected: ['later'] }],
+    }])
+  })
+
+  it('lists and answers the same continued call id in different sessions', async () => {
+    ledger.insertDelegation({
+      delegationId: 'd2',
+      sessionId: 'session-other',
+      cwd: project,
+      title: 'Task two',
+      model: 'fixture/model-a',
+      modelVerification: 'indeterminate',
+      status: 'ready',
+      createdAt: 101,
+      updatedAt: 101,
+    })
+    const continued: RemoteProjections = {
+      kind: 'sequenced',
+      asOfSeq: 1,
+      values: {
+        userQuestions: {
+          active: [{
+            callId: brandString<ToolCallId>('shared-call'),
+            state: 'continued',
+            questions: [{ id: 'q1', question: 'Proceed?' }],
+          }],
+          settled: [],
+        },
+      },
+    }
+    remote.projectionsBySession.set('session-fixed', continued)
+    remote.projectionsBySession.set('session-other', continued)
+
+    const listed = await service.interactionList({})
+    const questions = listed.interactions.filter(item => item.state === 'continued')
+    assert.deepEqual(questions.map(item => [item.delegationId, item.sessionId, item.callId]), [
+      ['d1', 'session-fixed', 'shared-call'],
+      ['d2', 'session-other', 'shared-call'],
+    ])
+    assert.equal(questions.some(item => 'id' in item), false)
+
+    const answered = await service.interactionAnswer({
+      delegationId: 'd2',
+      callId: 'shared-call',
+      answers: [{ id: 'q1', selected: ['yes'] }],
+    })
+    assert.equal(answered.delegationId, 'd2')
+    assert.equal(answered.sessionId, 'session-other')
+    assert.equal(answered.via, 'continued')
+    assert.deepEqual(remote.answers, [{
+      sessionId: 'session-other',
+      callId: 'shared-call',
+      answers: [{ id: 'q1', selected: ['yes'] }],
+    }])
   })
 })
 
@@ -598,11 +656,12 @@ class ControlRemote implements DshRemote {
   states: RemoteSessionState[] = []
   lastState: RemoteSessionState = { cursor: 5, active: true, running: false, queue: [], pendingInput: [] }
   projections: RemoteProjections = { kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [] } }
+  projectionsBySession = new Map<string, RemoteProjections>()
   prompts: { requestId: string; text: string; mode: 'queue' | 'steer' }[] = []
   queueCalls: { itemId: string; action: RemoteQueueAction }[] = []
   cancelled: string[] = []
   unarchived: string[] = []
-  answers: { callId: string; answers: AskUserQuestionAnswer['answers'] }[] = []
+  answers: { sessionId: string; callId: string; answers: AskUserQuestionAnswer['answers'] }[] = []
   answerResult = true
 
   async modelCatalog(): Promise<RemoteModelCatalog> {
@@ -638,8 +697,8 @@ class ControlRemote implements DshRemote {
     if (next === undefined) throw new Error('unscripted wait')
     return next
   }
-  async readProjections(): Promise<RemoteProjections> {
-    return this.projections
+  async readProjections(sessionId: string): Promise<RemoteProjections> {
+    return this.projectionsBySession.get(sessionId) ?? this.projections
   }
   async updateQueue(_sessionId: string, itemId: string, action: RemoteQueueAction): Promise<void> {
     this.queueCalls.push({ itemId, action })
@@ -650,8 +709,8 @@ class ControlRemote implements DshRemote {
   async unarchiveSession(sessionId: string): Promise<void> {
     this.unarchived.push(sessionId)
   }
-  async answerUserQuestion(_sessionId: string, callId: string, answer: AskUserQuestionAnswer): Promise<boolean> {
-    this.answers.push({ callId, answers: answer.answers })
+  async answerUserQuestion(sessionId: string, callId: string, answer: AskUserQuestionAnswer): Promise<boolean> {
+    this.answers.push({ sessionId, callId, answers: answer.answers })
     return this.answerResult
   }
   async dispose(): Promise<void> {}
