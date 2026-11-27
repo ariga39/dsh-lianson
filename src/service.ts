@@ -718,9 +718,10 @@ export class DelegationService {
       : [this.readyDelegation(input.delegationId)]
     for (const delegation of delegations) {
       for (const question of await continuedQuestionsOf(remote, delegation.sessionId)) {
-        if (pending.some(item => item.kind === 'question' && item.callId === question.callId)) continue
+        if (pending.some(item => item.kind === 'question'
+          && item.sessionId === delegation.sessionId
+          && item.callId === question.callId)) continue
         pending.push({
-          id: `continued-${question.callId}`,
           delegationId: delegation.delegationId,
           sessionId: delegation.sessionId,
           kind: 'question',

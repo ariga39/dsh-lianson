@@ -123,7 +123,15 @@ dsh-liaison interaction approve --interaction-id interaction-...
 dsh-liaison interaction reject --interaction-id interaction-...
 dsh-liaison interaction answer --interaction-id interaction-... \
   --answers '[{"id":"q1","selected":["Yes"]}]'
+dsh-liaison interaction answer --delegation-id task-a --call-id call-... \
+  --answers '[{"id":"q1","selected":["Yes"]}]'
 ```
+
+`interaction list` shows pending requests with an `id`; use it with
+`--interaction-id`. A continued question has no pending id. Answer it by passing
+its `delegationId` and `callId` as `--delegation-id` and `--call-id`. Both
+identify that question within its own session, even when another session uses
+the same call id.
 
 `interaction list`, `approve`, and `answer` were exercised live. `reject` is
 listed for operator completeness but was not part of the live suite.
