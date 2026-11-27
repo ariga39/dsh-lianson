@@ -1,0 +1,90 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "plugins": [
+    "typescript",
+    "unicorn"
+  ],
+  "categories": {
+    "correctness": "error"
+  },
+  "options": {
+    "typeAware": true,
+    "reportUnusedDisableDirectives": "warn"
+  },
+  "env": {
+    "builtin": true,
+    "node": true,
+    "es2024": true
+  },
+  "ignorePatterns": [
+    "deepseek-harness/**",
+    "**/node_modules/**",
+    "**/*.js",
+    "**/*.mjs"
+  ],
+  "rules": {
+    "no-var": "error",
+    "prefer-const": "error",
+    "no-unused-vars": [
+      "error",
+      {
+        "argsIgnorePattern": "^_",
+        "varsIgnorePattern": "^_",
+        "caughtErrorsIgnorePattern": "^_"
+      }
+    ],
+    "typescript/await-thenable": "error",
+    "typescript/no-array-delete": "error",
+    "typescript/no-base-to-string": "error",
+    "typescript/no-confusing-void-expression": "error",
+    "typescript/no-deprecated": "error",
+    "typescript/no-duplicate-type-constituents": "error",
+    "typescript/no-dynamic-delete": "error",
+    "typescript/no-explicit-any": "error",
+    "typescript/no-floating-promises": "error",
+    "typescript/no-for-in-array": "error",
+    "typescript/no-implied-eval": "error",
+    "typescript/no-meaningless-void-operator": "error",
+    "typescript/no-misused-new": "error",
+    "typescript/no-misused-promises": "error",
+    "typescript/no-misused-spread": "error",
+    "typescript/no-non-null-asserted-nullish-coalescing": "error",
+    "typescript/no-non-null-asserted-optional-chain": "error",
+    "typescript/no-redundant-type-constituents": "error",
+    "typescript/no-require-imports": "error",
+    "typescript/no-this-alias": "error",
+    "typescript/no-unnecessary-boolean-literal-compare": "error",
+    "typescript/no-unnecessary-template-expression": "error",
+    "typescript/no-unnecessary-type-arguments": "error",
+    "typescript/no-unnecessary-type-assertion": "error",
+    "typescript/no-unnecessary-type-constraint": "error",
+    "typescript/no-unnecessary-type-conversion": "error",
+    "typescript/no-unnecessary-type-parameters": "error",
+    "typescript/no-unsafe-argument": "error",
+    "typescript/no-unsafe-assignment": "error",
+    "typescript/no-unsafe-call": "error",
+    "typescript/no-unsafe-declaration-merging": "error",
+    "typescript/no-unsafe-enum-comparison": "error",
+    "typescript/no-unsafe-function-type": "error",
+    "typescript/no-unsafe-member-access": "error",
+    "typescript/no-unsafe-return": "error",
+    "typescript/no-unsafe-unary-minus": "error",
+    "typescript/no-useless-default-assignment": "error",
+    "typescript/no-wrapper-object-types": "error",
+    "typescript/prefer-as-const": "error",
+    "typescript/prefer-promise-reject-errors": "error",
+    "typescript/restrict-plus-operands": "error",
+    "typescript/restrict-template-expressions": "error",
+    "typescript/use-unknown-in-catch-callback-variable": "error"
+  },
+  "overrides": [
+    {
+      "files": [
+        "tests/**/*.test.ts"
+      ],
+      "rules": {
+        "typescript/no-floating-promises": "off"
+      }
+    }
+  ]
+}
