@@ -2,6 +2,9 @@
 
 import { existsSync, readFileSync } from 'node:fs'
 import { Command, CommanderError, Option } from 'commander'
+import {
+  DEFAULT_STOP_TIMEOUT_MS, DEFAULT_WAIT_TIMEOUT_MS, transportBudgetFor,
+} from './budgets.ts'
 import { sendCommand } from './client.ts'
 import { asLiaisonError, LiaisonError, redact } from './errors.ts'
 import { Ledger } from './ledger.ts'
@@ -13,7 +16,7 @@ import { PLUGIN_NAME, PLUGIN_VERSION } from './version.ts'
 /** Injectable process boundary for tests. */
 export interface CliDependencies {
   readonly env: NodeJS.ProcessEnv
-  readonly send: (route: (typeof ROUTES)[keyof typeof ROUTES], body: unknown) => Promise<unknown>
+  readonly send: (route: (typeof ROUTES)[keyof typeof ROUTES], body: unknown, timeoutMs?: number) => Promise<unknown>
   readonly stdout: (text: string) => void
   readonly stderr: (text: string) => void
   readonly setExitCode: (code: number) => void
@@ -24,9 +27,9 @@ export function defaultCliDependencies(env: NodeJS.ProcessEnv = process.env): Cl
   let socketPath: string | undefined
   return {
     env,
-    send: (route, body) => {
+    send: (route, body, timeoutMs) => {
       socketPath ??= resolveLiaisonPaths(env).socketPath
-      return sendCommand(socketPath, route, body)
+      return sendCommand(socketPath, route, body, timeoutMs)
     },
     stdout: (text) => { process.stdout.write(text) },
     stderr: (text) => { process.stderr.write(text) },
@@ -135,13 +138,14 @@ export function createProgram(deps: CliDependencies): Command {
     .option('--slice-ms <ms>', 'one Host wait window; capped at 30000')
     .option('--max-messages <count>', 'assistant-output budget per window')
     .action(async (options: { delegationId: string; afterSeq?: string; timeoutMs?: string; sliceMs?: string; maxMessages?: string }) => {
+      const budget = options.timeoutMs === undefined ? DEFAULT_WAIT_TIMEOUT_MS : integer(options.timeoutMs, 'timeout-ms')
       await execute(deps, ROUTES.wait, {
         delegationId: options.delegationId,
         ...(options.afterSeq === undefined ? {} : { afterSeq: integer(options.afterSeq, 'after-seq') }),
-        ...(options.timeoutMs === undefined ? {} : { timeoutMs: integer(options.timeoutMs, 'timeout-ms') }),
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: budget }),
         ...(options.sliceMs === undefined ? {} : { sliceTimeoutMs: integer(options.sliceMs, 'slice-ms') }),
         ...(options.maxMessages === undefined ? {} : { maxMessages: integer(options.maxMessages, 'max-messages') }),
-      })
+      }, transportBudgetFor(budget))
     })
 
   program.command('events')
@@ -192,10 +196,11 @@ export function createProgram(deps: CliDependencies): Command {
     .requiredOption('--delegation-id <id>', 'target delegation')
     .option('--timeout-ms <ms>', 'overall stop budget; defaults to 30000')
     .action(async (options: { delegationId: string; timeoutMs?: string }) => {
+      const budget = options.timeoutMs === undefined ? DEFAULT_STOP_TIMEOUT_MS : integer(options.timeoutMs, 'timeout-ms')
       await execute(deps, ROUTES.stop, {
         delegationId: options.delegationId,
-        ...(options.timeoutMs === undefined ? {} : { timeoutMs: integer(options.timeoutMs, 'timeout-ms') }),
-      })
+        ...(options.timeoutMs === undefined ? {} : { timeoutMs: budget }),
+      }, transportBudgetFor(budget))
     })
 
   program.command('rework')
@@ -258,9 +263,10 @@ async function execute(
   deps: CliDependencies,
   route: (typeof ROUTES)[keyof typeof ROUTES],
   body: unknown,
+  timeoutMs?: number,
 ): Promise<void> {
   try {
-    const value = await deps.send(route, body)
+    const value = await deps.send(route, body, timeoutMs)
     deps.stdout(print(value))
   } catch (error) {
     fail(deps, error)

@@ -4,6 +4,7 @@ import { existsSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { DEFAULT_STOP_TIMEOUT_MS, DEFAULT_WAIT_TIMEOUT_MS, RESULT_RETURN_GRACE_MS } from '../src/budgets.ts'
 import { sendCommand } from '../src/client.ts'
 import { runCli } from '../src/cli.ts'
 import type { CliDependencies } from '../src/cli.ts'
@@ -16,7 +17,7 @@ interface Captured {
   stdout: string[]
   stderr: string[]
   exitCode: number
-  sends: { route: string; body: unknown }[]
+  sends: { route: string; body: unknown; timeoutMs?: number }[]
 }
 
 function harness(env: NodeJS.ProcessEnv, responder: (route: string, body: unknown) => Promise<unknown>): { deps: CliDependencies; captured: Captured } {
@@ -25,8 +26,8 @@ function harness(env: NodeJS.ProcessEnv, responder: (route: string, body: unknow
     captured,
     deps: {
       env,
-      send: async (route, body) => {
-        captured.sends.push({ route, body })
+      send: async (route, body, timeoutMs) => {
+        captured.sends.push({ route, body, ...(timeoutMs === undefined ? {} : { timeoutMs }) })
         return responder(route, body)
       },
       stdout: text => { captured.stdout.push(text) },
@@ -200,16 +201,34 @@ describe('CLI JSON and offline behavior', () => {
     await runCli(['interaction', 'answer', '--interaction-id', 'i3', '--answers', '[{"id":"q1","selected":["yes"]}]'], deps)
 
     assert.deepEqual(captured.sends, [
-      { route: ROUTES.wait, body: { delegationId: 'd1', afterSeq: 4, timeoutMs: 900, sliceTimeoutMs: 20, maxMessages: 3 } },
+      { route: ROUTES.wait, body: { delegationId: 'd1', afterSeq: 4, timeoutMs: 900, sliceTimeoutMs: 20, maxMessages: 3 }, timeoutMs: 5_900 },
       { route: ROUTES.events, body: { delegationId: 'd1', afterSeq: 1, throughSeq: 9, pageSize: 2 } },
       { route: ROUTES.steer, body: { delegationId: 'd1', requestId: 's1', text: 'focus' } },
       { route: ROUTES.queue, body: { delegationId: 'd1', itemId: 'm1', action: { kind: 'edit', text: 'new' } } },
-      { route: ROUTES.stop, body: { delegationId: 'd1', timeoutMs: 50 } },
+      { route: ROUTES.stop, body: { delegationId: 'd1', timeoutMs: 50 }, timeoutMs: 5_050 },
       { route: ROUTES.rework, body: { delegationId: 'd1', requestId: 'r1', text: 'fix' } },
       { route: ROUTES.interactionList, body: { delegationId: 'd1' } },
       { route: ROUTES.interactionApprove, body: { interactionId: 'i1' } },
       { route: ROUTES.interactionReject, body: { interactionId: 'i2' } },
       { route: ROUTES.interactionAnswer, body: { interactionId: 'i3', answers: [{ id: 'q1', selected: ['yes'] }] } },
+    ])
+  })
+
+  it('gives default wait and stop transports their full budget plus result time', async () => {
+    const { deps, captured } = harness(env, async () => ({ accepted: true }))
+    await runCli(['wait', '--delegation-id', 'd1'], deps)
+    await runCli(['stop', '--delegation-id', 'd1'], deps)
+    assert.deepEqual(captured.sends, [
+      {
+        route: ROUTES.wait,
+        body: { delegationId: 'd1' },
+        timeoutMs: DEFAULT_WAIT_TIMEOUT_MS + RESULT_RETURN_GRACE_MS,
+      },
+      {
+        route: ROUTES.stop,
+        body: { delegationId: 'd1' },
+        timeoutMs: DEFAULT_STOP_TIMEOUT_MS + RESULT_RETURN_GRACE_MS,
+      },
     ])
   })
 

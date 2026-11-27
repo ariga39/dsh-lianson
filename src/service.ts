@@ -6,6 +6,7 @@ import type {
 } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { AskUserQuestionAnswerItem, AskUserQuestionItem } from '@deepseek-ai/dsh-user-questions/types'
 import { normalizeSessionTitle } from '@deepseek-ai/dsh-session-title'
+import { DEFAULT_STOP_TIMEOUT_MS, DEFAULT_WAIT_TIMEOUT_MS } from './budgets.ts'
 import { LiaisonError } from './errors.ts'
 import { EventReader } from './events.ts'
 import type { EventRange } from './events.ts'
@@ -117,6 +118,8 @@ export interface StopResult {
   readonly clearedQueue: number
   readonly cancelled: boolean
   readonly state: RemoteSessionState | null
+  /** Queue item ids still known or believed pending when the budget expired. */
+  readonly residualQueue: readonly string[]
   readonly errors: readonly string[]
 }
 
@@ -367,7 +370,7 @@ export class DelegationService {
     const delegation = this.readyDelegation(input.delegationId)
     const remote = this.remote.requireRemote()
     const afterSeq = input.afterSeq ?? -1
-    const timeoutMs = input.timeoutMs ?? 120_000
+    const timeoutMs = input.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS
     const sliceTimeoutMs = Math.min(input.sliceTimeoutMs ?? 30_000, 30_000)
     const maxMessages = input.maxMessages ?? 500
     assertWaitBounds(afterSeq, timeoutMs, sliceTimeoutMs, maxMessages)
@@ -532,77 +535,103 @@ export class DelegationService {
   async stop(input: { readonly delegationId: string; readonly timeoutMs?: number | undefined }): Promise<StopResult> {
     const delegation = this.readyDelegation(input.delegationId)
     const remote = this.remote.requireRemote()
-    const timeoutMs = input.timeoutMs ?? 30_000
+    const timeoutMs = input.timeoutMs ?? DEFAULT_STOP_TIMEOUT_MS
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs <= 0) {
       throw new LiaisonError('usage', 'timeoutMs must be a positive safe integer', { timeoutMs })
     }
-    const startedAt = this.clock()
-    const deadline = startedAt + timeoutMs
+    const deadline = this.clock() + timeoutMs
     const budget = AbortSignal.timeout(timeoutMs)
-    let state: RemoteSessionState | null = null
+    const expired = (): boolean => budget.aborted || this.clock() >= deadline
+    const lastKnown: { state: RemoteSessionState | null } = { state: null }
     let clearedQueue = 0
     let cancelled = false
+    let interrupted = false
     const errors: string[] = []
+    let residual = new Set<string>()
 
-    const drain = async (): Promise<RemoteSessionState> => {
-      const current = await remote.readState(delegation.sessionId)
-      for (const item of current.queue ?? []) {
-        try {
-          await remote.updateQueue(delegation.sessionId, item.id, { kind: 'remove' })
-          clearedQueue += 1
-        } catch (error) {
-          if (!isNotFound(error)) errors.push(messageOf(error))
-        }
-      }
-      return current
-    }
-
-    try {
-      state = await drain()
+    const read = async (): Promise<boolean> => {
+      if (expired()) return false
       try {
-        await remote.cancel(delegation.sessionId)
-        cancelled = true
+        const current = await withinBudget(remote.readState(delegation.sessionId), budget)
+        lastKnown.state = current
+        residual = new Set((current.queue ?? []).map(item => String(item.id)))
+        return true
       } catch (error) {
-        // A cold Session has no live Agent to cancel; quiet state still counts.
-        if (isNotFound(error)) cancelled = true
+        if (expired()) interrupted = true
         else errors.push(messageOf(error))
+        return false
       }
-      for (;;) {
-        if (budget.aborted || this.clock() >= deadline) break
-        await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
-        state = await drain()
-        if (state !== null && !state.running && (state.queue?.length ?? 0) === 0) {
-          return {
-            delegationId: delegation.delegationId,
-            sessionId: delegation.sessionId,
-            outcome: 'stopped',
-            stopped: true,
-            quiescent: true,
-            budgetExpired: false,
-            clearedQueue,
-            cancelled,
-            state,
-            errors,
-          }
-        }
-      }
-    } catch (error) {
-      if (!budget.aborted) errors.push(messageOf(error))
     }
 
-    const quiescent = state === null ? null : !state.running && (state.queue?.length ?? 0) === 0
-    return {
-      delegationId: delegation.delegationId,
-      sessionId: delegation.sessionId,
-      outcome: quiescent === true ? 'stopped' : quiescent === false ? 'running' : 'unknown',
-      stopped: quiescent === true,
-      quiescent,
-      budgetExpired: true,
-      clearedQueue,
-      cancelled,
-      state,
-      errors,
+    const drain = async (): Promise<boolean> => {
+      if (!await read()) return false
+      for (const item of lastKnown.state?.queue ?? []) {
+        // Every mutation is a new action: never start one after the budget.
+        if (expired()) return false
+        try {
+          await withinBudget(
+            remote.updateQueue(delegation.sessionId, item.id, { kind: 'remove' }),
+            budget,
+          )
+          clearedQueue += 1
+          residual.delete(String(item.id))
+        } catch (error) {
+          if (expired()) {
+            interrupted = true
+            return false
+          }
+          if (isNotFound(error)) residual.delete(String(item.id))
+          else errors.push(messageOf(error))
+        }
+      }
+      return true
     }
+
+    const result = (budgetExpired: boolean): StopResult => {
+      const quiescent = interrupted
+        ? null
+        : lastKnown.state === null ? null : !lastKnown.state.running && residual.size === 0
+      return {
+        delegationId: delegation.delegationId,
+        sessionId: delegation.sessionId,
+        outcome: interrupted
+          ? 'unknown'
+          : quiescent === true ? 'stopped' : quiescent === false ? 'running' : 'unknown',
+        stopped: quiescent === true && !interrupted,
+        quiescent,
+        budgetExpired,
+        clearedQueue,
+        cancelled,
+        state: lastKnown.state,
+        residualQueue: [...residual],
+        errors,
+      }
+    }
+
+    if (!await drain()) return result(true)
+
+    if (expired()) return result(true)
+    try {
+      await withinBudget(remote.cancel(delegation.sessionId), budget)
+      cancelled = true
+    } catch (error) {
+      // A cold Session has no live Agent to cancel; quiet state still counts.
+      if (expired()) interrupted = true
+      else if (isNotFound(error)) cancelled = true
+      else errors.push(messageOf(error))
+    }
+    if (expired()) return result(true)
+
+    for (;;) {
+      const remaining = deadline - this.clock()
+      if (remaining <= 0 || budget.aborted) break
+      await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, remaining)))
+      if (expired()) break
+      if (!await drain()) break
+      if (!interrupted && lastKnown.state !== null && !lastKnown.state.running && residual.size === 0) return result(false)
+    }
+
+    return result(true)
   }
 
   /**
@@ -952,6 +981,31 @@ async function continuedQuestionsOf(remote: DshRemote, sessionId: string): Promi
     result.push({ callId, questions: questions as readonly AskUserQuestionItem[] })
   }
   return result
+}
+
+/** Race one Remote await against the command's overall abort signal. */
+function withinBudget<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  if (signal.aborted) return Promise.reject(budgetError(signal))
+  return new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => { reject(budgetError(signal)) }
+    signal.addEventListener('abort', onAbort, { once: true })
+    work.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error instanceof Error ? error : new LiaisonError('internal', String(error)))
+      },
+    )
+  })
+}
+
+function budgetError(signal: AbortSignal): Error {
+  return signal.reason instanceof Error
+    ? signal.reason
+    : new LiaisonError('dsh-unavailable', 'command budget expired')
 }
 
 function isWaitTimeout(error: unknown): boolean {

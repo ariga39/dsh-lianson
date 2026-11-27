@@ -266,6 +266,61 @@ describe('session controls and observation', () => {
     assert.equal(result.stopped, false)
     assert.equal(result.quiescent, false)
     assert.equal(result.budgetExpired, true)
+    assert.deepEqual(result.residualQueue, [])
+  })
+
+  it('returns unknown promptly when the stop state read is delayed past the budget', async () => {
+    remote.readState = () => new Promise<RemoteSessionState>(() => {})
+    const started = performance.now()
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 20 })
+    assert.ok(performance.now() - started < 1_000)
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.quiescent, null)
+    assert.equal(result.state, null)
+    assert.equal(result.budgetExpired, true)
+    assert.deepEqual(remote.queueCalls, [])
+    assert.deepEqual(remote.cancelled, [])
+  })
+
+  it('does not start another queue mutation after expiry during an update', async () => {
+    const queued: RemoteSessionState = {
+      ...idle,
+      cursor: 11,
+      running: true,
+      queue: [
+        { id: brandString<MessageId>('queued-1'), placement: 'queued', content: [] },
+        { id: brandString<MessageId>('queued-2'), placement: 'queued', content: [] },
+      ],
+    }
+    remote.states = [queued]
+    let updates = 0
+    remote.updateQueue = () => {
+      updates += 1
+      return new Promise<void>(() => {})
+    }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 20 })
+    assert.equal(updates, 1, 'only the in-flight mutation may start')
+    assert.deepEqual(remote.cancelled, [], 'cancel must not start after expiry')
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.quiescent, null)
+    assert.equal(result.clearedQueue, 0)
+    assert.deepEqual(result.residualQueue, ['queued-1', 'queued-2'])
+  })
+
+  it('returns unknown when cancellation is delayed past the budget', async () => {
+    remote.states = [{ ...idle, cursor: 12, running: true }]
+    let cancels = 0
+    remote.cancel = () => {
+      cancels += 1
+      return new Promise<void>(() => {})
+    }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 20 })
+    assert.equal(cancels, 1)
+    assert.equal(result.cancelled, false)
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.quiescent, null)
+    assert.equal(result.budgetExpired, true)
+    assert.deepEqual(remote.queueCalls, [])
   })
 
   it('unarchives and submits rework to the original session id', async () => {
