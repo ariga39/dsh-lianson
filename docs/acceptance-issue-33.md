@@ -14,8 +14,8 @@ Web-observed and unattended variants. No product fix was required.
 - Model route declared through the pi-ai OpenAI-compatible adapter with
   `compat.supportsDeveloperRole: false` and `maxTokensField: max_tokens`.
   Credentials were read from the operator's authorized store into the Host
-  environment only; no credential, cookie, or launch URL appears in logs or in
-  this report.
+  environment. Two private startup records from a discarded run were redacted
+  during the final check of the retained logs and this report.
 - Target repository: `compte-rendu` baseline `352adace695e7ec1b184ca60c1ca4334e3865660`.
   Each variant used a separate local repository whose only history was a
   single-commit fetch of that baseline, so later routing history was not
@@ -25,12 +25,12 @@ Web-observed and unattended variants. No product fix was required.
 
 ## Delegations and accepted revisions
 
-| Variant | Delegation | Session | Delivered revision | Final accepted revision |
-| --- | --- | --- | --- | --- |
-| Web | A (`web-a-401`) | `session-7cb9ebe9-eee8-4edb-b9ee-74822b07286a` | `9b51d44c950aad926935dc217a559cc39ba4e787` | |
-| Web | B (`web-b-401`) | `session-7f1f8ab6-ff4c-4548-9f5a-28e9bd21bdf7` | `de40deff0e90c92e07e19b87ec0cc4a2ae9744db` | `de40deff0e90c92e07e19b87ec0cc4a2ae9744db` |
-| Unattended | A (`unatt-a-401`) | `session-900fb1e7-42a2-4ce3-80c9-4aa2af91add6` | `ff3be43f70e66a258d123962062a3bb172f0120d` | |
-| Unattended | B (`unatt-b-401`) | `session-c6a99105-787b-405d-83e3-ed068074f79b` | `54a733677e560367aae9a4433f4a8532e1108bc6` | `54a733677e560367aae9a4433f4a8532e1108bc6` |
+| Variant | Delegation | Session | Accepted revision |
+| --- | --- | --- | --- |
+| Web | A (`web-a-401`) | `session-7cb9ebe9-eee8-4edb-b9ee-74822b07286a` | `9b51d44c950aad926935dc217a559cc39ba4e787` |
+| Web | B (`web-b-401`) | `session-7f1f8ab6-ff4c-4548-9f5a-28e9bd21bdf7` | `de40deff0e90c92e07e19b87ec0cc4a2ae9744db` |
+| Unattended | A (`unatt-a-401`) | `session-900fb1e7-42a2-4ce3-80c9-4aa2af91add6` | `ff3be43f70e66a258d123962062a3bb172f0120d` |
+| Unattended | B (`unatt-b-401`) | `session-c6a99105-787b-405d-83e3-ed068074f79b` | `54a733677e560367aae9a4433f4a8532e1108bc6` |
 
 Each B branch started from its variant's first A revision, committed the test
 migration, then rebased onto the A revision that independent review approved.
@@ -125,9 +125,12 @@ synthetic forwarding remains in either final tree.
   keyless integration suite covers persistent installation.
 - Acceptance changes exist only as local commits in the isolated checkouts.
 
-## Reproduce the route check
+## Operator-local route check record
 
-Build and capture from any checkout, then compare:
+The commands below record the procedure used on the acceptance machine. The
+helper scripts and test revisions were retained locally. For each run,
+`CHECKOUT` was the worktree at the revision under test, `OUT` was a new
+artifact directory, and `BASELINE` was the baseline observation file listed below.
 
 ```sh
 node /home/kagami/work/dsh33/state/build.mjs "$CHECKOUT" "$OUT/bundle"
