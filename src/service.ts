@@ -380,6 +380,8 @@ export class DelegationService {
     let cursor = afterSeq
     let lastState: RemoteSessionState | undefined
     let subagentCatalog: readonly unknown[] | null = null
+    let childRunning = false
+    let childQueued = false
     let slices = 0
     const collected = new Map<number, SessionHistoryRecord>()
     let truncated = false
@@ -422,10 +424,12 @@ export class DelegationService {
       if (value.reason === 'idle') {
         const inspection = await this.inspectSubagents(remote, delegation.sessionId)
         subagentCatalog = inspection.catalog
+        childRunning = inspection.running > 0
+        childQueued = inspection.queued > 0
         if (inspection.indeterminateReason !== null) {
           return waitResult(delegation, afterSeq, cursor, 'indeterminate', 'indeterminate', lastState, slices, collected, truncated, subagentCatalog, inspection.indeterminateReason)
         }
-        if (inspection.running > 0) {
+        if (childRunning || childQueued) {
           if (this.clock() >= deadline) break
           await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
           continue
@@ -440,9 +444,9 @@ export class DelegationService {
 
     const status = lastState === undefined
       ? 'timeout'
-      : lastState.running
+      : lastState.running || childRunning
         ? 'running'
-        : (lastState.queue?.length ?? 0) > 0 ? 'queued' : 'timeout'
+        : (lastState.queue?.length ?? 0) > 0 || childQueued ? 'queued' : 'timeout'
     return waitResult(delegation, afterSeq, cursor, 'timeout', status, lastState ?? null, slices, collected, truncated, subagentCatalog, null)
   }
 
@@ -565,9 +569,11 @@ export class DelegationService {
 
     const drain = async (): Promise<boolean> => {
       if (!await read()) return false
+      let mutated = false
       for (const item of lastKnown.state?.queue ?? []) {
         // Every mutation is a new action: never start one after the budget.
         if (expired()) return false
+        mutated = true
         try {
           await withinBudget(
             remote.updateQueue(delegation.sessionId, item.id, { kind: 'remove' }),
@@ -584,20 +590,21 @@ export class DelegationService {
           else errors.push(messageOf(error))
         }
       }
-      return true
+      // A removal can race with dispatch: only a read taken after the last
+      // mutation may decide that no queued work remains.
+      return mutated ? read() : true
     }
 
     const result = (budgetExpired: boolean): StopResult => {
+      const knownQuiet = lastKnown.state !== null && !lastKnown.state.running && residual.size === 0
       const quiescent = interrupted
         ? null
-        : lastKnown.state === null ? null : !lastKnown.state.running && residual.size === 0
+        : lastKnown.state === null ? null : budgetExpired && knownQuiet ? null : knownQuiet
       return {
         delegationId: delegation.delegationId,
         sessionId: delegation.sessionId,
-        outcome: interrupted
-          ? 'unknown'
-          : quiescent === true ? 'stopped' : quiescent === false ? 'running' : 'unknown',
-        stopped: quiescent === true && !interrupted,
+        outcome: quiescent === null ? 'unknown' : quiescent ? 'stopped' : 'running',
+        stopped: !budgetExpired && quiescent === true,
         quiescent,
         budgetExpired,
         clearedQueue,
@@ -854,33 +861,38 @@ export class DelegationService {
   private async inspectSubagents(remote: DshRemote, sessionId: string): Promise<{
     readonly catalog: readonly unknown[] | null
     readonly running: number
+    readonly queued: number
     readonly indeterminateReason: string | null
   }> {
     let value: RemoteProjections
     try {
       value = await remote.readProjections(sessionId)
     } catch {
-      return { catalog: null, running: 0, indeterminateReason: 'subagent-status-unavailable' }
+      return { catalog: null, running: 0, queued: 0, indeterminateReason: 'subagent-status-unavailable' }
     }
     const catalog = catalogOf(value)
-    if (catalog === null) return { catalog: null, running: 0, indeterminateReason: null }
+    // A missing catalog is not a known-empty catalog: completion would claim
+    // more than this read can prove.
+    if (catalog === null) return { catalog: null, running: 0, queued: 0, indeterminateReason: 'subagent-catalog-unavailable' }
     let running = 0
+    let queued = 0
     for (const row of catalog) {
       const mode = recordField(row, 'mode')
       const id = stringField(recordField(row, 'id'))
-      if (mode === 'external') return { catalog, running, indeterminateReason: 'subagent-external-status-unavailable' }
-      if (mode === 'unknown') return { catalog, running, indeterminateReason: 'subagent-unknown-status-unavailable' }
-      if (id === undefined) return { catalog, running, indeterminateReason: 'subagent-status-unavailable' }
+      if (mode === 'external') return { catalog, running, queued, indeterminateReason: 'subagent-external-status-unavailable' }
+      if (mode === 'unknown') return { catalog, running, queued, indeterminateReason: 'subagent-unknown-status-unavailable' }
+      if (id === undefined) return { catalog, running, queued, indeterminateReason: 'subagent-status-unavailable' }
       let child: RemoteSessionState
       try {
         child = await remote.readState(id)
       } catch {
-        return { catalog, running, indeterminateReason: 'subagent-status-unavailable' }
+        return { catalog, running, queued, indeterminateReason: 'subagent-status-unavailable' }
       }
-      if (child.pendingInput.length > 0) return { catalog, running, indeterminateReason: 'subagent-input-required' }
+      if (child.pendingInput.length > 0) return { catalog, running, queued, indeterminateReason: 'subagent-input-required' }
       if (child.running) running += 1
+      if ((child.queue?.length ?? 0) > 0) queued += 1
     }
-    return { catalog, running, indeterminateReason: null }
+    return { catalog, running, queued, indeterminateReason: null }
   }
 
   private async completeCreate(remote: DshRemote, record: DelegationRecord): Promise<DelegationRecord> {

@@ -173,6 +173,37 @@ describe('session controls and observation', () => {
     assert.equal(result.subagentCatalog?.length, 1)
   })
 
+  it('does not claim completion when the subagent catalog is unavailable', async () => {
+    remote.waits = [{ reason: 'idle', state: { ...idle, cursor: 12 }, output: output([]) }]
+    remote.projections = null
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 1_000 })
+    assert.equal(result.status, 'indeterminate')
+    assert.equal(result.indeterminate, true)
+    assert.equal(result.indeterminateReason, 'subagent-catalog-unavailable')
+  })
+
+  it('does not claim completion while a local child still has queued work', async () => {
+    remote.waits = Array.from({ length: 10 }, () => ({
+      reason: 'idle' as const,
+      state: { ...idle, cursor: 12 },
+      output: output([]),
+    }))
+    remote.projections = {
+      kind: 'sequenced',
+      asOfSeq: 12,
+      values: { subagentCatalog: [{ id: brandString<SessionId>('child'), mode: 'one-shot', createdAt: 1 }] },
+    }
+    remote.states = [{
+      ...idle,
+      cursor: 4,
+      queue: [{ id: brandString<MessageId>('child-queued'), placement: 'queued', content: [] }],
+    }]
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 5, sliceTimeoutMs: 1 })
+    assert.notEqual(result.status, 'completed')
+    assert.equal(result.status, 'queued')
+    assert.equal(result.reason, 'timeout')
+  })
+
   it('waits for an attributable local child before reporting completion', async () => {
     remote.waits = [
       { reason: 'idle', state: { ...idle, cursor: 12 }, output: output([]) },
@@ -321,6 +352,33 @@ describe('session controls and observation', () => {
     assert.equal(result.quiescent, null)
     assert.equal(result.budgetExpired, true)
     assert.deepEqual(remote.queueCalls, [])
+  })
+
+  it('does not report stopped from a stale idle state after expiry', async () => {
+    remote.states = [{ ...idle, cursor: 12 }]
+    remote.cancel = async () => { clock = 100 }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 50 })
+    assert.equal(result.budgetExpired, true)
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.stopped, false)
+    assert.equal(result.quiescent, null)
+  })
+
+  it('requires a fresh read after a queue removal raced with dispatch', async () => {
+    const queued: RemoteSessionState = {
+      ...idle,
+      cursor: 11,
+      queue: [{ id: brandString<MessageId>('raced-1'), placement: 'queued', content: [] }],
+    }
+    remote.states = [queued]
+    remote.updateQueue = async () => {
+      throw new LiaisonError('not-found', 'queued item is no longer pending', { itemId: 'raced-1' })
+    }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 5 })
+    assert.equal(result.stopped, false)
+    assert.equal(result.outcome, 'running')
+    assert.deepEqual(result.residualQueue, ['raced-1'])
+    assert.equal(result.clearedQueue, 0)
   })
 
   it('unarchives and submits rework to the original session id', async () => {
