@@ -149,6 +149,16 @@ interface HeaderChoice {
   readonly execution?: SessionWireEvent
 }
 
+/** Direct-child observation used to decide whether a root idle is final. */
+interface SubagentInspection {
+  readonly catalog: readonly unknown[] | null
+  readonly running: number
+  readonly queued: number
+  readonly indeterminateReason: string | null
+  /** The overall wait budget expired while a projection or child read was outstanding. */
+  readonly expired: boolean
+}
+
 /** Clock and identity seams kept explicit so unit tests stay deterministic. */
 export interface ServiceOptions {
   readonly ledger: Ledger
@@ -375,25 +385,8 @@ export class DelegationService {
     assertWaitBounds(afterSeq, timeoutMs, sliceTimeoutMs, maxMessages)
 
     const deadline = this.clock() + timeoutMs
-    const handshake = AbortSignal.timeout(timeoutMs)
-    let remote: DshRemote
-    try {
-      remote = await withinBudget(this.remote.requireRemote(), handshake)
-    } catch (error) {
-      if (handshake.aborted || this.clock() >= deadline) {
-        return waitResult(
-          delegation, afterSeq, afterSeq, 'timeout', 'timeout', null, 0,
-          new Map<number, SessionHistoryRecord>(), false, null, null,
-        )
-      }
-      throw error
-    }
-    if (handshake.aborted || this.clock() >= deadline) {
-      return waitResult(
-        delegation, afterSeq, afterSeq, 'timeout', 'timeout', null, 0,
-        new Map<number, SessionHistoryRecord>(), false, null, null,
-      )
-    }
+    const budget = AbortSignal.timeout(timeoutMs)
+    const expired = (): boolean => budget.aborted || this.clock() >= deadline
 
     let cursor = afterSeq
     let lastState: RemoteSessionState | undefined
@@ -404,19 +397,40 @@ export class DelegationService {
     const collected = new Map<number, SessionHistoryRecord>()
     let truncated = false
 
+    const timeoutResult = (): WaitResult => {
+      const status = lastState === undefined
+        ? 'timeout'
+        : lastState.running || childRunning
+          ? 'running'
+          : (lastState.queue?.length ?? 0) > 0 || childQueued ? 'queued' : 'timeout'
+      return waitResult(
+        delegation, afterSeq, cursor, 'timeout', status, lastState ?? null, slices,
+        collected, truncated, subagentCatalog, null,
+      )
+    }
+
+    let remote: DshRemote
+    try {
+      remote = await withinBudget(this.remote.requireRemote(), budget)
+    } catch (error) {
+      if (expired()) return timeoutResult()
+      throw error
+    }
+    if (expired()) return timeoutResult()
+
     for (;;) {
       const remaining = deadline - this.clock()
-      if (remaining <= 0) break
+      if (remaining <= 0 || budget.aborted) break
       let value: SessionWaitValue
       try {
-        value = await remote.wait(delegation.sessionId, {
+        value = await withinBudget(remote.wait(delegation.sessionId, {
           afterSeq: cursor,
           timeoutMs: Math.max(1, Math.min(sliceTimeoutMs, remaining)),
           maxMessages,
-        })
+        }), budget)
       } catch (error) {
+        if (expired()) break
         if (!isWaitTimeout(error)) throw error
-        if (this.clock() >= deadline) break
         await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
         continue
       }
@@ -429,26 +443,27 @@ export class DelegationService {
       if (value.reason === 'input-required' || value.state.pendingInput.length > 0) {
         return waitResult(delegation, afterSeq, cursor, 'input-required', 'input-required', lastState, slices, collected, truncated, subagentCatalog, null)
       }
+      if (expired()) break
       if (value.state.running) {
         if (value.reason === 'timeout') continue
         // A running Session cannot stop a wait; keep polling within the budget.
         continue
       }
       if ((value.state.queue?.length ?? 0) > 0) {
-        if (this.clock() >= deadline) break
         await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
         continue
       }
       if (value.reason === 'idle') {
-        const inspection = await this.inspectSubagents(remote, delegation.sessionId)
+        const inspection = await this.inspectSubagents(remote, delegation.sessionId, budget, expired)
         subagentCatalog = inspection.catalog
         childRunning = inspection.running > 0
         childQueued = inspection.queued > 0
+        if (inspection.expired) break
         if (inspection.indeterminateReason !== null) {
           return waitResult(delegation, afterSeq, cursor, 'indeterminate', 'indeterminate', lastState, slices, collected, truncated, subagentCatalog, inspection.indeterminateReason)
         }
         if (childRunning || childQueued) {
-          if (this.clock() >= deadline) break
+          if (expired()) break
           await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
           continue
         }
@@ -457,15 +472,11 @@ export class DelegationService {
       // A window timeout with neither a running turn nor queued work still
       // leaves the caller's overall deadline in charge. A fixture that answers
       // immediately must not spin: yield briefly before the next window.
+      if (expired()) break
       await this.sleep(Math.max(1, Math.min(this.pollIntervalMs, deadline - this.clock())))
     }
 
-    const status = lastState === undefined
-      ? 'timeout'
-      : lastState.running || childRunning
-        ? 'running'
-        : (lastState.queue?.length ?? 0) > 0 || childQueued ? 'queued' : 'timeout'
-    return waitResult(delegation, afterSeq, cursor, 'timeout', status, lastState ?? null, slices, collected, truncated, subagentCatalog, null)
+    return timeoutResult()
   }
 
   /**
@@ -889,43 +900,57 @@ export class DelegationService {
   /**
    * Attribute idle to the root only when every direct child is observable and
    * finished. External or unknown catalog rows and unreadable local children
-   * make the result indeterminate instead of claiming completion.
+   * make the result indeterminate instead of claiming completion. Both the
+   * projection and each child read stay inside the caller's wait budget.
    */
-  private async inspectSubagents(remote: DshRemote, sessionId: string): Promise<{
-    readonly catalog: readonly unknown[] | null
-    readonly running: number
-    readonly queued: number
-    readonly indeterminateReason: string | null
-  }> {
-    let value: RemoteProjections
-    try {
-      value = await remote.readProjections(sessionId)
-    } catch {
-      return { catalog: null, running: 0, queued: 0, indeterminateReason: 'subagent-status-unavailable' }
-    }
-    const catalog = catalogOf(value)
-    // A missing catalog is not a known-empty catalog: completion would claim
-    // more than this read can prove.
-    if (catalog === null) return { catalog: null, running: 0, queued: 0, indeterminateReason: 'subagent-catalog-unavailable' }
+  private async inspectSubagents(
+    remote: DshRemote,
+    sessionId: string,
+    budget: AbortSignal,
+    expired: () => boolean,
+  ): Promise<SubagentInspection> {
+    let catalog: readonly unknown[] | null = null
     let running = 0
     let queued = 0
+    const expiredResult = (): SubagentInspection => ({
+      catalog, running, queued, indeterminateReason: null, expired: true,
+    })
+    const result = (indeterminateReason: string | null, nextCatalog = catalog): SubagentInspection => (
+      expired()
+        ? expiredResult()
+        : { catalog: nextCatalog, running, queued, indeterminateReason, expired: false }
+    )
+
+    if (expired()) return expiredResult()
+    let value: RemoteProjections
+    try {
+      value = await withinBudget(remote.readProjections(sessionId), budget)
+    } catch {
+      return result('subagent-status-unavailable')
+    }
+    catalog = catalogOf(value)
+    // A missing catalog is not a known-empty catalog: completion would claim
+    // more than this read can prove.
+    if (catalog === null) return result('subagent-catalog-unavailable')
     for (const row of catalog) {
+      if (expired()) return expiredResult()
       const mode = recordField(row, 'mode')
       const id = stringField(recordField(row, 'id'))
-      if (mode === 'external') return { catalog, running, queued, indeterminateReason: 'subagent-external-status-unavailable' }
-      if (mode === 'unknown') return { catalog, running, queued, indeterminateReason: 'subagent-unknown-status-unavailable' }
-      if (id === undefined) return { catalog, running, queued, indeterminateReason: 'subagent-status-unavailable' }
+      if (mode === 'external') return result('subagent-external-status-unavailable')
+      if (mode === 'unknown') return result('subagent-unknown-status-unavailable')
+      if (id === undefined) return result('subagent-status-unavailable')
       let child: RemoteSessionState
       try {
-        child = await remote.readState(id)
+        child = await withinBudget(remote.readState(id), budget)
       } catch {
-        return { catalog, running, queued, indeterminateReason: 'subagent-status-unavailable' }
+        return result('subagent-status-unavailable')
       }
-      if (child.pendingInput.length > 0) return { catalog, running, queued, indeterminateReason: 'subagent-input-required' }
       if (child.running) running += 1
       if ((child.queue?.length ?? 0) > 0) queued += 1
+      if (expired()) return expiredResult()
+      if (child.pendingInput.length > 0) return result('subagent-input-required')
     }
-    return { catalog, running, queued, indeterminateReason: null }
+    return result(null)
   }
 
   private async completeCreate(remote: DshRemote, record: DelegationRecord): Promise<DelegationRecord> {
