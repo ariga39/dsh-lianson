@@ -226,6 +226,90 @@ describe('session controls and observation', () => {
     assert.equal(result.slices, 2)
   })
 
+  it('returns the latest observation when a Host wait read stalls past the budget', async () => {
+    const message = assistant(6)
+    remote.waits = [{
+      reason: 'timeout',
+      state: { cursor: 7, active: true, running: true, queue: [], pendingInput: [] },
+      output: output([message]),
+    }]
+    let waits = 0
+    const scripted = remote.wait.bind(remote)
+    remote.wait = async (sessionId, request) => {
+      waits += 1
+      if (waits === 1) return scripted(sessionId, request)
+      return new Promise<SessionWaitValue>(() => {})
+    }
+
+    const started = performance.now()
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 20, sliceTimeoutMs: 5 })
+    assert.ok(performance.now() - started < 1_000)
+    assert.equal(waits, 2)
+    assert.equal(result.reason, 'timeout')
+    assert.equal(result.status, 'running')
+    assert.equal(result.slices, 1)
+    assert.equal(result.cursor, 7)
+    assert.equal(result.state?.cursor, 7)
+    assert.deepEqual(result.output.records.map(record => record.event.seq), [6])
+  })
+
+  it('returns structured timeout when the subagent projection read stalls', async () => {
+    remote.waits = [{ reason: 'idle', state: { ...idle, cursor: 12 }, output: output([]) }]
+    remote.readProjections = () => new Promise<RemoteProjections>(() => {})
+    let childReads = 0
+    remote.readState = async () => {
+      childReads += 1
+      return idle
+    }
+
+    const started = performance.now()
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 20, sliceTimeoutMs: 5 })
+    assert.ok(performance.now() - started < 1_000)
+    assert.equal(remote.waitCalls.length, 1, 'no Host wait may start after expiry')
+    assert.equal(childReads, 0, 'no child read may start without a completed catalog')
+    assert.equal(result.reason, 'timeout')
+    assert.equal(result.status, 'timeout')
+    assert.equal(result.slices, 1)
+    assert.equal(result.cursor, 12)
+    assert.equal(result.state?.cursor, 12)
+    assert.equal(result.subagentCatalog, null)
+    assert.equal(result.indeterminate, false)
+    assert.equal(result.indeterminateReason, null)
+  })
+
+  it('returns structured timeout when a child state read stalls', async () => {
+    remote.waits = [{ reason: 'idle', state: { ...idle, cursor: 12 }, output: output([]) }]
+    remote.projections = {
+      kind: 'sequenced',
+      asOfSeq: 12,
+      values: {
+        subagentCatalog: [
+          { id: brandString<SessionId>('child-1'), mode: 'one-shot', createdAt: 1 },
+          { id: brandString<SessionId>('child-2'), mode: 'one-shot', createdAt: 2 },
+        ],
+      },
+    }
+    let childReads = 0
+    remote.readState = () => {
+      childReads += 1
+      return new Promise<RemoteSessionState>(() => {})
+    }
+
+    const started = performance.now()
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 20, sliceTimeoutMs: 5 })
+    assert.ok(performance.now() - started < 1_000)
+    assert.equal(childReads, 1, 'only the in-flight child read may start')
+    assert.equal(remote.waitCalls.length, 1, 'no Host wait may start after expiry')
+    assert.equal(result.reason, 'timeout')
+    assert.equal(result.status, 'timeout')
+    assert.equal(result.slices, 1)
+    assert.equal(result.cursor, 12)
+    assert.equal(result.state?.cursor, 12)
+    assert.equal(result.subagentCatalog?.length, 2)
+    assert.equal(result.indeterminate, false)
+    assert.equal(result.indeterminateReason, null)
+  })
+
   it('reads contiguous events and exposes the subagent catalog', async () => {
     remote.pages = [{ cursor: 2, events: [fixture(0), fixture(1), fixture(2)], hasMore: false }]
     remote.projections = {
