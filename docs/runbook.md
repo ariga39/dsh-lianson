@@ -91,6 +91,12 @@ dsh-liaison events --delegation-id task-a
 dsh-liaison verify-model --delegation-id task-a --request-id review-1
 ```
 
+`verify-model` without `--request-id` checks the latest turn and records that
+verdict as the delegation's session-wide summary. With `--request-id`, it
+checks that historical turn without changing the summary. `get` and `list` show
+the last session-wide summary; it may be stale until another unscoped check,
+including when they fall back to the offline ledger.
+
 Repeat `create` with the same delegation id and parameters to reuse the stored
 session. Repeat `prompt` with the same request id and text to reuse its original
 cursor. Different content under the same key is reported as a conflict.
