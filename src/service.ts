@@ -795,6 +795,9 @@ export class DelegationService {
   /**
    * Inspect the persisted `request/header` for the requested turn (or the
    * latest turn when no request id is supplied) and compare its model route.
+   * A request-scoped check is historical and leaves the stored delegation
+   * summary untouched. Only an unscoped check records its verdict for the
+   * latest turn it observes.
    * @param input - delegation and optional exact prompt request id.
    * @returns a truthful `proven`, `mismatch`, or `indeterminate` verdict.
    */
@@ -867,7 +870,11 @@ export class DelegationService {
     observed: { provider: string; model: string } | null,
     evidence: VerifyEvidence | null,
   ): VerifyModelResult {
-    this.ledger.setModelVerification(delegation.delegationId, verification, this.now())
+    // `null` identifies the unscoped check of the latest turn. Scoped checks
+    // stay historical and must not overwrite what `get`/`list` report.
+    if (requestId === null) {
+      this.ledger.setModelVerification(delegation.delegationId, verification, this.now())
+    }
     return { delegationId: delegation.delegationId, requestId, verification, expected, observed, evidence }
   }
 

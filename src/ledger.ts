@@ -23,6 +23,7 @@ export interface DelegationRecord {
   readonly title: string
   /** `provider/model` selected for this delegation. */
   readonly model: string
+  /** Last session-wide `verify-model` summary; scoped checks do not update it. */
   readonly modelVerification: ModelVerification
   readonly status: DelegationStatus
   readonly createdAt: number
@@ -197,7 +198,8 @@ export class Ledger {
   }
 
   /**
-   * Store the verification verdict for one delegation.
+   * Store the latest session-wide verification verdict for one delegation.
+   * Request-scoped checks report their own result without calling this.
    * @param delegationId - delegation inspected.
    * @param verification - truthful verdict.
    * @param updatedAt - commit timestamp.
