@@ -111,6 +111,31 @@ describe('CLI JSON and offline behavior', () => {
     assert.equal(listed.offline, true)
   })
 
+
+  it('suppresses commander usage text on parse errors', async () => {
+    const { deps, captured } = harness(env, async () => ({ accepted: true }))
+    await runCli(['prompt'], deps)
+    assert.equal(captured.exitCode, 1)
+    assert.equal(captured.stdout.length, 0)
+    assert.equal(captured.stderr.length, 1)
+    assert.equal(captured.stderr[0]?.includes('Usage:'), false)
+    const document = JSON.parse(captured.stderr[0] ?? '') as { error: { code: string } }
+    assert.equal(document.error.code, 'usage')
+  })
+
+  it('preserves --help and --version output', async () => {
+    const help = harness(env, async () => { throw new Error('help must not send') })
+    await runCli(['--help'], help.deps)
+    assert.equal(help.captured.exitCode, 0)
+    assert.match(help.captured.stdout.join(''), /Usage: dsh-liaison/)
+    assert.equal(help.captured.stderr.length, 0)
+
+    const version = harness(env, async () => { throw new Error('version must not send') })
+    await runCli(['--version'], version.deps)
+    assert.equal(version.captured.exitCode, 0)
+    assert.equal(version.captured.stdout.join('').trim(), '0.0.0')
+    assert.equal(version.captured.stderr.length, 0)
+  })
   it('reports a missing offline delegation instead of printing undefined', async () => {
     const { deps, captured } = harness(env, async () => { throw new LiaisonError('plugin-offline', 'not running') })
     await runCli(['get', '--delegation-id', 'missing'], deps)

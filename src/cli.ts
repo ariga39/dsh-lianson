@@ -49,7 +49,9 @@ export function createProgram(deps: CliDependencies): Command {
     .exitOverride()
     .configureOutput({
       writeOut: text => { deps.stdout(text) },
-      writeErr: text => { deps.stderr(text) },
+      // Commander's own parse/usage text would precede the JSON failure
+      // document; the CLI reports every parse error as JSON instead.
+      writeErr: () => {},
     })
 
   program.command('status')

@@ -71,6 +71,30 @@ describe('trust boundaries', () => {
 
 
 
+
+  it('canonicalizes missing protected roots through a symlinked parent', async () => {
+    const base = join(root, 'canonical')
+    const real = join(base, 'real')
+    const link = join(base, 'link')
+    await mkdir(real, { recursive: true })
+    await symlink(real, link)
+    const paths = {
+      dshHome: join(link, 'missing-home'),
+      runtimeDir: join(link, 'missing-run'),
+      socketPath: join(link, 'missing-run', 's.sock'),
+      lockPath: join(link, 'missing-run', 's.sock.lock'),
+      ledgerPath: join(link, 'missing-data', 'ledger.sqlite3'),
+    }
+    const canonicalPolicy = trustPolicyOf(paths)
+    assert.throws(
+      () => assertTrustedCwd(real, canonicalPolicy),
+      (error: unknown) => error instanceof LiaisonError && error.code === 'unsafe-cwd',
+    )
+    const sibling = join(real, 'project')
+    await mkdir(sibling, { recursive: true })
+    assert.equal(assertTrustedCwd(sibling, canonicalPolicy), sibling)
+  })
+
   it('treats a literal ..project component as a protected descendant', async () => {
     const dotted = join(root, 'home', '..project')
     await mkdir(dotted, { recursive: true })

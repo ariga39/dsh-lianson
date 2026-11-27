@@ -423,7 +423,7 @@ function headerChoiceFor(
 ): HeaderChoice | undefined {
   const step = hasAnchorUser ? stepContaining(events, turn, anchor) : undefined
   const upperBound = step?.endSeq ?? turn.endSeq
-  const execution = events.find(event => (event.type === 'assistant/message' || event.type === 'assistant/attempt')
+  const execution = events.find(event => hasAssistantOutput(event)
     && event.seq > anchor
     && numberField(recordField(event.data, 'turn')) === turn.turn
     && (step === undefined || numberField(recordField(event.data, 'step')) === step.step)
@@ -455,6 +455,21 @@ function stepContaining(
     (event.type === 'step/start' && numberField(recordField(event.data, 'turn')) === turn.turn)
     || (event.type === 'turn/end' && numberField(recordField(event.data, 'turn')) === turn.turn)))
   return { step, ...(next === undefined ? {} : { endSeq: next.seq }) }
+}
+
+/**
+ * Whether an assistant event carries actual model output. `assistant/attempt`
+ * settles failed attempts too, including an adapter-less preparation failure
+ * whose stream is empty; only a non-empty stream is execution evidence. A
+ * committed `assistant/message` proves output through its content or stream.
+ */
+function hasAssistantOutput(event: SessionWireEvent): boolean {
+  if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') return false
+  const stream = recordField(event.data, 'stream')
+  if (Array.isArray(stream) && stream.length > 0) return true
+  if (event.type !== 'assistant/message') return false
+  const content = recordField(recordField(event.data, 'message'), 'content')
+  return Array.isArray(content) && content.length > 0
 }
 
 function numberField(value: unknown): number | undefined {

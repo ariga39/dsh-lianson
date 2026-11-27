@@ -1,7 +1,7 @@
 /** Trust-boundary checks for a delegation working directory. */
 
 import { realpathSync, statSync } from 'node:fs'
-import { dirname, isAbsolute, relative, resolve, sep } from 'node:path'
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { writableRoots } from '@deepseek-ai/dsh-sandbox'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { LiaisonError } from './errors.ts'
@@ -84,11 +84,25 @@ export function assertTrustedCwd(cwd: string, policy: TrustPolicy): string {
   return physical
 }
 
+/**
+ * Canonicalize a path whose final components may not exist yet by resolving
+ * its deepest existing ancestor. A fallback to `resolve()` would miss a
+ * symlinked parent until the directory is created.
+ */
 function canonical(path: string): string {
-  try {
-    return realpathSync.native(path)
-  } catch {
-    return resolve(path)
+  const absolute = resolve(path)
+  let current = absolute
+  const missing: string[] = []
+  while (true) {
+    try {
+      return join(realpathSync.native(current), ...missing.reverse())
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return absolute
+      const parent = dirname(current)
+      if (parent === current) return absolute
+      missing.push(basename(current))
+      current = parent
+    }
   }
 }
 

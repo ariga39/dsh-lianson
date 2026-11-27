@@ -348,14 +348,15 @@ describe('delegation service', () => {
 
 
 
-  it('treats a direct header without settlement as indeterminate', async () => {
+  it('does not treat an empty assistant attempt as execution evidence', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
-    remote.page = { cursor: 4, events: [
+    remote.page = { cursor: 5, events: [
       turnStart(1, 1),
       userMessage(2, 'request-1'),
       header(3, 'model-a'),
-      turnEnd(4, 1),
+      event('assistant/attempt', 4, { turn: 1, step: 1, stream: [] }),
+      turnEnd(5, 1),
     ] }
     const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
     assert.equal(result.verification, 'indeterminate')
@@ -580,7 +581,11 @@ function header(seq: number, model: string): SessionWireEvent {
 }
 
 function assistant(seq: number, turn: number): SessionWireEvent {
-  return event('assistant/attempt', seq, { turn, step: 1, stream: [] })
+  return event('assistant/attempt', seq, {
+    turn,
+    step: 1,
+    stream: [{ type: 'text-chunks', time0: seq, index: 0, dt: [], texts: ['output'] }],
+  })
 }
 
 function stepStart(seq: number, turn: number, step: number): SessionWireEvent {
