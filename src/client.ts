@@ -2,8 +2,10 @@
 
 import { request } from 'node:http'
 import type { IncomingMessage } from 'node:http'
+import { dirname } from 'node:path'
 import { LiaisonError } from './errors.ts'
 import type { RoutePath, ServerEnvelope } from './protocol.ts'
+import { inspectPrivateRuntimeDirectory } from './uds-server.ts'
 
 /** Maximum response body read from the plugin. */
 const MAX_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -23,6 +25,7 @@ export async function sendCommand(
   body: unknown,
   timeoutMs = 30_000,
 ): Promise<unknown> {
+  await assertPrivateSocketDirectory(socketPath)
   const payload = JSON.stringify(body)
   const envelope = await new Promise<ServerEnvelope>((resolve, reject) => {
     const req = request({
@@ -54,6 +57,27 @@ export async function sendCommand(
     envelope.error.message,
     envelope.error.details,
   )
+}
+
+/**
+ * Fail closed before placing a command on the socket when its runtime
+ * directory is unsafe. A missing directory or socket stays an offline read;
+ * this check never creates paths.
+ */
+async function assertPrivateSocketDirectory(socketPath: string): Promise<void> {
+  const directory = dirname(socketPath)
+  try {
+    await inspectPrivateRuntimeDirectory(directory)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new LiaisonError('plugin-offline', 'dsh-liaison runtime directory is missing', { socketPath })
+    }
+    if (error instanceof LiaisonError) throw error
+    throw new LiaisonError('unsafe-runtime-dir', `cannot verify runtime directory ${directory}`, {
+      directory,
+      reason: error instanceof Error ? error.message : String(error),
+    })
+  }
 }
 
 function codeOf(code: string): LiaisonError['code'] {

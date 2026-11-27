@@ -1,13 +1,16 @@
 import { after, before, describe, it } from 'node:test'
 import assert from 'node:assert/strict'
+import { existsSync } from 'node:fs'
 import { mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { sendCommand } from '../src/client.ts'
 import { runCli } from '../src/cli.ts'
 import type { CliDependencies } from '../src/cli.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { Ledger } from '../src/ledger.ts'
 import { ROUTES } from '../src/protocol.ts'
+import type { RoutePath } from '../src/protocol.ts'
 
 interface Captured {
   stdout: string[]
@@ -111,6 +114,19 @@ describe('CLI JSON and offline behavior', () => {
     assert.equal(listed.offline, true)
   })
 
+
+
+  it('falls back when the runtime directory is missing', async () => {
+    const runtime = join(root, 'absent-runtime')
+    const socketPath = join(runtime, 'dsh-liaison.sock')
+    const offline = harness(env, (route, body) => sendCommand(socketPath, route as RoutePath, body))
+    await runCli(['list'], offline.deps)
+    assert.equal(offline.captured.exitCode, 0)
+    assert.equal(existsSync(runtime), false)
+    const listed = JSON.parse(offline.captured.stdout[0] ?? '') as { delegations: { delegationId: string }[]; offline: boolean }
+    assert.deepEqual(listed.delegations.map(item => item.delegationId), ['d1'])
+    assert.equal(listed.offline, true)
+  })
 
   it('suppresses commander usage text on parse errors', async () => {
     const { deps, captured } = harness(env, async () => ({ accepted: true }))
