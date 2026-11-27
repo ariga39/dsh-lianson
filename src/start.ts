@@ -3,6 +3,7 @@
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { createLoopbackRemote, exchangeLoopbackCookie } from './dsh-remote.ts'
 import type { EntryUrl } from './dsh-remote.ts'
+import { InteractionBroker } from './interactions.ts'
 import { Ledger } from './ledger.ts'
 import { LoopbackClient } from './loopback.ts'
 import { resolveLiaisonPaths } from './paths.ts'
@@ -48,13 +49,18 @@ export interface LiaisonRuntime {
 export async function startLiaison(host: LiaisonHost): Promise<LiaisonRuntime> {
   const paths = resolveLiaisonPaths(host.env)
   const ledger = Ledger.open(paths.ledgerPath)
+  const bindingOfSession = (sessionId: string): string | undefined =>
+    ledger.findDelegationBySession(sessionId)?.delegationId
+  const interactions = new InteractionBroker({ bindingOfSession })
   const loopback = new LoopbackClient({
     collectEntries: () => {
       const origin = host.origin()
       return origin === undefined ? [] : host.collectEntries(`${origin}/`)
     },
     exchange: (entryUrl, signal) => exchangeLoopbackCookie(entryUrl, fetchWithSignal(signal)),
-    connect: (origin, cookie, signal) => createLoopbackRemote(origin, cookie, signal),
+    connect: (origin, cookie, signal) => createLoopbackRemote(origin, cookie, signal, {
+      interactions: { broker: interactions, bindingOfSession },
+    }),
     onStatus: (status) => {
       if (status.lastError !== undefined && status.state === 'unavailable') {
         host.logger.warn(new Error(`dsh-liaison loopback: ${status.lastError}`))
@@ -67,7 +73,7 @@ export async function startLiaison(host: LiaisonHost): Promise<LiaisonRuntime> {
     }),
   })
   const trust = trustPolicyOf(paths, host.sandboxPolicy())
-  const service = new DelegationService({ ledger, remote: loopback, trust })
+  const service = new DelegationService({ ledger, remote: loopback, trust, interactions })
   const server = new LiaisonServer({
     paths,
     ledger,
@@ -89,13 +95,19 @@ export async function startLiaison(host: LiaisonHost): Promise<LiaisonRuntime> {
     loopback,
     server,
     dispose: () => {
-      disposed ??= disposeAll(loopback, server, ledger)
+      disposed ??= disposeAll(loopback, server, ledger, interactions)
       return disposed
     },
   }
 }
 
-async function disposeAll(loopback: LoopbackClient, server: LiaisonServer, ledger: Ledger): Promise<void> {
+async function disposeAll(
+  loopback: LoopbackClient,
+  server: LiaisonServer,
+  ledger: Ledger,
+  interactions: InteractionBroker,
+): Promise<void> {
+  interactions.clear()
   await loopback.dispose()
   await server.stop()
   ledger.close()

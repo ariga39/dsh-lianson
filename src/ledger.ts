@@ -150,6 +150,13 @@ export class Ledger {
     return rows.map(delegationFromRow)
   }
 
+  /** @returns the delegation bound to one Host Session id, or undefined. */
+  findDelegationBySession(sessionId: string): DelegationRecord | undefined {
+    this.assertOpen()
+    const row = this.db.prepare('SELECT * FROM delegations WHERE session_id = ?').get(sessionId) as DelegationRow | undefined
+    return row === undefined ? undefined : delegationFromRow(row)
+  }
+
   /**
    * Insert one `creating` delegation. A duplicate delegation id or session id
    * surfaces as a conflict rather than replacing durable state.

@@ -160,7 +160,14 @@ function createRemote(): { remote: DshRemote; disposeCalls: () => number } {
     selectModel: unused,
     beforeCursor: unused,
     prompt: unused,
-    readEvents: unused,
+    readEventPage: unused,
+    readState: unused,
+    wait: unused,
+    readProjections: unused,
+    updateQueue: unused,
+    cancel: unused,
+    unarchiveSession: unused,
+    answerUserQuestion: unused,
     dispose: async () => { calls += 1 },
   }
   return { remote, disposeCalls: () => calls }

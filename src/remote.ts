@@ -1,6 +1,9 @@
 /** Remote operations the delegation service needs from the loopback Gateway client. */
 
-import type { ModelCatalog, SessionWireEvent } from '@deepseek-ai/dsh-api-session-controller/types'
+import type {
+  ModelCatalog, SessionProjectionsValue, SessionState, SessionWaitRequest, SessionWaitValue, SessionWireEvent,
+} from '@deepseek-ai/dsh-api-session-controller/types'
+import type { AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions/types'
 
 /** Visible model catalog subset consumed by `create`. */
 export type RemoteModelCatalog = Pick<ModelCatalog, 'default' | 'groups' | 'failures'>
@@ -11,11 +14,35 @@ export interface RemoteModelSelection {
   readonly model: string
 }
 
-/** One page of recent durable Session events. */
+/** One page of durable Session events. */
 export interface RemoteEventPage {
   readonly events: readonly SessionWireEvent[]
   readonly cursor: number
+  /** Omitted by lightweight fixtures; the reader treats omission as a final page. */
+  readonly hasMore?: boolean
 }
+
+/** One backwards history-page request. */
+export interface RemoteEventPageRequest {
+  readonly throughSeq?: number
+  readonly beforeSeq?: number
+  readonly maxMessages?: number
+}
+
+/** One pending queue mutation supplied by the CLI. */
+export type RemoteQueueAction =
+  | { readonly kind: 'edit'; readonly text: string }
+  | { readonly kind: 'remove' }
+  | { readonly kind: 'steer' }
+
+/** One requested wait window. */
+export type RemoteWaitRequest = Omit<SessionWaitRequest, 'sessionId'>
+
+/** Passive Session state read through the public Remote surface. */
+export type RemoteSessionState = SessionState
+
+/** Exact or cached projection values for one Session. */
+export type RemoteProjections = SessionProjectionsValue
 
 /** Connected Host operations; every method rejects with a structured failure. */
 export interface DshRemote {
@@ -28,9 +55,23 @@ export interface DshRemote {
   selectModel(sessionId: string, selection: RemoteModelSelection): Promise<void>
   /** Latest durable cursor before a prompt is admitted. */
   beforeCursor(sessionId: string): Promise<number>
-  prompt(sessionId: string, requestId: string, text: string): Promise<void>
-  /** Recent durable events, paged backwards far enough to inspect the last turns. */
-  readEvents(sessionId: string): Promise<RemoteEventPage>
+  prompt(sessionId: string, requestId: string, text: string, mode?: 'queue' | 'steer'): Promise<void>
+  /** Read one Host history page. */
+  readEventPage(sessionId: string, request: RemoteEventPageRequest): Promise<RemoteEventPage>
+  /** Passive execution, queue, and pending-input snapshot. */
+  readState(sessionId: string): Promise<RemoteSessionState>
+  /** One Host wait window, never cancelling execution. */
+  wait(sessionId: string, request: RemoteWaitRequest): Promise<SessionWaitValue>
+  /** Exact projections or migration hints for one Session. */
+  readProjections(sessionId: string): Promise<RemoteProjections>
+  /** Mutate one still-pending queue item. */
+  updateQueue(sessionId: string, itemId: string, action: RemoteQueueAction): Promise<void>
+  /** Cancel the active turn while retaining pending inbox work. */
+  cancel(sessionId: string): Promise<void>
+  /** Restore an archived Session before submitting follow-up work. */
+  unarchiveSession(sessionId: string): Promise<void>
+  /** Answer a timed question that outlived its foreground wait. */
+  answerUserQuestion(sessionId: string, callId: string, answer: AskUserQuestionAnswer): Promise<boolean>
   dispose(): Promise<void>
 }
 

@@ -36,8 +36,21 @@ dsh-liaison list
 dsh-liaison prompt --delegation-id task-1 --request-id review-1 --text "Please add the missing test"
 dsh-liaison prompt --delegation-id task-1 --file instruction.md
 dsh-liaison verify-model --delegation-id task-1 --request-id review-1
+dsh-liaison wait --delegation-id task-1 --timeout-ms 120000
+dsh-liaison events --delegation-id task-1 --after-seq -1
+dsh-liaison interaction list --delegation-id task-1
+dsh-liaison interaction approve --interaction-id interaction-...
+dsh-liaison interaction reject --interaction-id interaction-...
+dsh-liaison interaction answer --interaction-id interaction-... \
+  --answers '[{"id":"q1","selected":["yes"]}]'
+dsh-liaison steer --delegation-id task-1 --text "Focus on the failing test"
+dsh-liaison queue --delegation-id task-1 --item-id message-... --action remove
+dsh-liaison stop --delegation-id task-1 --timeout-ms 30000
+dsh-liaison rework --delegation-id task-1 --request-id review-2 --text "Address the review finding"
 ```
 
 `--cwd` must be an ordinary isolated directory. Harness state and the shared temp areas (including ancestors of Harness state) are rejected; ordinary sibling worktrees are accepted.
 
 `create` and `prompt` persist their business key before the remote call. Repeating `--delegation-id` reuses the stored session when parameters match, and repeating `--request-id` reuses the original pre-prompt cursor when content matches. A different value under the same key is reported as a conflict. `verify-model` reports `proven`, `mismatch`, or `indeterminate` from the persisted `request/header`, never from intent.
+
+`wait` reads Host waits in bounded windows and reports `completed`, `input-required`, `running`, `queued`, `timeout`, or `indeterminate`. `events` returns the exact contiguous range and fails with `events/sequence-gap` instead of hiding a hole; its `subagentCatalog` comes from Session projections. Approvals are never auto-approved: `approval/request` and `user-questions/request` are buffered only for bound delegation sessions and settle through `interaction approve|reject|answer`. A timed question that outlived its foreground wait can be answered later by passing `--delegation-id` and `--call-id` to `interaction answer`. `steer` and `queue` use the Host's steering and pending-inbox mutations, `stop` clears queued input and checks quiet state inside one overall time budget, and `rework` unarchives the original session before submitting follow-up work to its stored `sessionId`.
