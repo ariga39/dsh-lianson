@@ -578,12 +578,13 @@ export class DelegationService {
     let clearedQueue = 0
     let cancelled = false
     let interrupted = false
+    let readFailed = false
     const errors: string[] = []
     let residual = new Set<string>()
 
     const result = (budgetExpired: boolean): StopResult => {
       const knownQuiet = lastKnown.state !== null && !lastKnown.state.running && residual.size === 0
-      const quiescent = interrupted
+      const quiescent = interrupted || readFailed
         ? null
         : lastKnown.state === null ? null : budgetExpired && knownQuiet ? null : knownQuiet
       return {
@@ -619,7 +620,10 @@ export class DelegationService {
         return true
       } catch (error) {
         if (expired()) interrupted = true
-        else errors.push(messageOf(error))
+        else {
+          readFailed = true
+          errors.push(messageOf(error))
+        }
         return false
       }
     }
@@ -652,7 +656,7 @@ export class DelegationService {
       return mutated ? read() : true
     }
 
-    if (!await drain()) return result(true)
+    if (!await drain()) return result(expired())
 
     if (expired()) return result(true)
     try {
@@ -675,7 +679,7 @@ export class DelegationService {
       if (!interrupted && lastKnown.state !== null && !lastKnown.state.running && residual.size === 0) return result(false)
     }
 
-    return result(true)
+    return result(expired())
   }
 
   /**
