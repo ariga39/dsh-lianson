@@ -9,9 +9,12 @@ import { Context } from '@deepseek-ai/cordis'
 import { brandString } from '@deepseek-ai/dsh-brand'
 import { apply as gatewayApply, inject as gatewayInject } from '@deepseek-ai/dsh-api-gateway/client'
 import sessionRemote from '@deepseek-ai/dsh-api-session-controller/remote'
-import type { SessionRequestId, SessionWireEvent } from '@deepseek-ai/dsh-api-session-controller/types'
+import type { SessionRequestId, SessionWaitValue } from '@deepseek-ai/dsh-api-session-controller/types'
 import type { WorkspaceId } from '@deepseek-ai/dsh-api-workspace-controller/types'
+import type { MessageId, ToolCallId } from '@deepseek-ai/dsh-llm/types'
 import type { SessionId } from '@deepseek-ai/dsh-session/types'
+import type { AskUserQuestionAnswer } from '@deepseek-ai/dsh-user-questions/types'
+import userQuestionsRemote from '@deepseek-ai/dsh-user-questions/remote'
 import workspaceRemote from '@deepseek-ai/dsh-api-workspace-controller/remote'
 import { installConnection } from '@deepseek-ai/dsh-client-connection/client'
 import type { ConnectionWebSocket } from '@deepseek-ai/dsh-client-connection/client'
@@ -19,7 +22,11 @@ import TypertRegistry from '@deepseek-ai/dsh-typert-registry'
 import type { RemoteResult } from '@deepseek-ai/dsh-typert-protocol'
 import WebSocket from 'ws'
 import { LiaisonError } from './errors.ts'
-import type { DshRemote, RemoteEventPage, RemoteModelCatalog, RemoteModelSelection } from './remote.ts'
+import { InteractionBroker, installInteractionContexts } from './interactions.ts'
+import type {
+  DshRemote, RemoteEventPage, RemoteEventPageRequest, RemoteModelCatalog, RemoteModelSelection,
+  RemoteProjections, RemoteQueueAction, RemoteSessionState, RemoteWaitRequest,
+} from './remote.ts'
 
 /** One entry URL contributed by a Host authentication provider. */
 export interface EntryUrl {
@@ -79,24 +86,35 @@ export async function exchangeLoopbackCookie(
   return { origin: entry.origin, cookie }
 }
 
+/** Injectable transport and interaction seams for one loopback connection. */
+export interface LoopbackRemoteOptions {
+  readonly fetchImpl?: typeof fetch
+  readonly webSocketFactory?: (url: string) => ConnectionWebSocket
+  /** Bound-delegation lookup and interaction buffer installed on this client. */
+  readonly interactions?: {
+    readonly broker: InteractionBroker
+    readonly bindingOfSession: (sessionId: string) => string | undefined
+  }
+}
+
 /**
  * Create an isolated Cordis Context carrying Typert, Connection, the Gateway
- * client, and the Workspace/Session Remote namespaces.
+ * client, and the Workspace/Session/UserQuestions Remote namespaces.
  * @param origin - Host origin without credentials.
  * @param cookie - in-memory API cookie.
  * @param signal - connect lifetime; abort disposes the context.
- * @param fetchImpl - fetch implementation for the HTTP carrier.
- * @param webSocketFactory - WebSocket factory for the event carrier.
+ * @param options - transport overrides and interaction routing.
  * @returns connected Host operations.
  */
 export async function createLoopbackRemote(
   origin: string,
   cookie: string,
   signal: AbortSignal,
-  fetchImpl: typeof fetch = fetch,
-  webSocketFactory: (url: string) => ConnectionWebSocket = url => new WebSocket(url, { headers: { cookie } }),
+  options: LoopbackRemoteOptions = {},
 ): Promise<DshRemote> {
   const base = `${origin}/`
+  const fetchImpl = options.fetchImpl ?? fetch
+  const webSocketFactory = options.webSocketFactory ?? (url => new WebSocket(url, { headers: { cookie } }))
   const ctx = new Context()
   const abort = (): void => { void ctx.fiber.dispose() }
   signal.addEventListener('abort', abort, { once: true })
@@ -117,6 +135,10 @@ export async function createLoopbackRemote(
     await ctx.plugin({ apply: gatewayApply, inject: gatewayInject })
     await ctx.remote.$mount(workspaceRemote)
     await ctx.remote.$mount(sessionRemote)
+    await ctx.remote.$mount(userQuestionsRemote)
+    if (options.interactions !== undefined) {
+      installInteractionContexts(ctx, options.interactions.broker, options.interactions.bindingOfSession)
+    }
     await probe(ctx)
     if (signal.aborted) throw new LiaisonError('dsh-unavailable', 'loopback connection was disposed')
     return new GatewayRemote(ctx, origin)
@@ -179,36 +201,64 @@ class GatewayRemote implements DshRemote {
     return page.cursor
   }
 
-  async prompt(sessionId: string, requestId: string, text: string): Promise<void> {
+  async prompt(sessionId: string, requestId: string, text: string, mode: 'queue' | 'steer' = 'queue'): Promise<void> {
     await unwrap(this.ctx.remote.session.prompt({
       requestId: brandString<SessionRequestId>(requestId),
       sessionId: brandString<SessionId>(sessionId),
-      mode: 'queue',
+      mode,
       content: [{ type: 'text', text }],
     }))
   }
 
-  async readEvents(sessionId: string): Promise<RemoteEventPage> {
-    const address = { kind: 'session' as const, sessionId: brandString<SessionId>(sessionId) }
-    const events: SessionWireEvent[] = []
-    let cursor = 0
-    let beforeSeq: number | undefined
-    for (let pageIndex = 0; pageIndex < 12; pageIndex += 1) {
-      const page = await unwrap(this.ctx.remote.session.events({
-        address,
-        maxMessages: 200,
-        ...(beforeSeq === undefined ? {} : { beforeSeq }),
-      }))
-      cursor = Math.max(cursor, page.cursor)
-      for (const record of page.records) events.push(record.event)
-      const oldest = page.records.reduce<number | undefined>(
-        (minimum, record) => minimum === undefined || record.event.seq < minimum ? record.event.seq : minimum,
-        undefined,
-      )
-      if (!page.hasMore || oldest === undefined || oldest <= 0) break
-      beforeSeq = oldest
-    }
-    return { events, cursor }
+  async readEventPage(sessionId: string, request: RemoteEventPageRequest): Promise<RemoteEventPage> {
+    const page = await unwrap(this.ctx.remote.session.events({
+      address: { kind: 'session', sessionId: brandString<SessionId>(sessionId) },
+      ...(request.throughSeq === undefined ? {} : { throughSeq: request.throughSeq }),
+      ...(request.beforeSeq === undefined ? {} : { beforeSeq: request.beforeSeq }),
+      ...(request.maxMessages === undefined ? {} : { maxMessages: request.maxMessages }),
+    }))
+    return { events: page.records.map(record => record.event), cursor: page.cursor, hasMore: page.hasMore }
+  }
+
+  readState(sessionId: string): Promise<RemoteSessionState> {
+    return unwrap(this.ctx.remote.session.state({ sessionId: brandString<SessionId>(sessionId) }))
+  }
+
+  wait(sessionId: string, request: RemoteWaitRequest): Promise<SessionWaitValue> {
+    return unwrap(this.ctx.remote.session.wait({
+      sessionId: brandString<SessionId>(sessionId),
+      ...request,
+    }))
+  }
+
+  readProjections(sessionId: string): Promise<RemoteProjections> {
+    return unwrap(this.ctx.remote.session.projections({ sessionId: brandString<SessionId>(sessionId) }))
+  }
+
+  async updateQueue(sessionId: string, itemId: string, action: RemoteQueueAction): Promise<void> {
+    await unwrap(this.ctx.remote.session.updateQueue({
+      sessionId: brandString<SessionId>(sessionId),
+      itemId: brandString<MessageId>(itemId),
+      action: action.kind === 'edit'
+        ? { kind: 'edit', content: [{ type: 'text', text: action.text }] }
+        : action,
+    }))
+  }
+
+  async cancel(sessionId: string): Promise<void> {
+    await unwrap(this.ctx.remote.session.cancel({ sessionId: brandString<SessionId>(sessionId) }))
+  }
+
+  async unarchiveSession(sessionId: string): Promise<void> {
+    await unwrap(this.ctx.remote.workspace.unarchiveSession({ sessionId: brandString<SessionId>(sessionId) }))
+  }
+
+  answerUserQuestion(sessionId: string, callId: string, answer: AskUserQuestionAnswer): Promise<boolean> {
+    return unwrap(this.ctx.remote.userQuestions.answer(
+      brandString<SessionId>(sessionId),
+      brandString<ToolCallId>(callId),
+      answer,
+    ))
   }
 
   async dispose(): Promise<void> {

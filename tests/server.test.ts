@@ -6,7 +6,10 @@ import { sendCommand } from '../src/client.ts'
 import { LiaisonError } from '../src/errors.ts'
 import { Ledger } from '../src/ledger.ts'
 import { LiaisonServer } from '../src/server.ts'
-import type { DshRemote, RemoteEventPage, RemoteModelCatalog } from '../src/remote.ts'
+import type {
+  DshRemote, RemoteEventPage, RemoteEventPageRequest, RemoteModelCatalog, RemoteProjections, RemoteQueueAction,
+  RemoteSessionState, RemoteWaitRequest,
+} from '../src/remote.ts'
 import { DelegationService } from '../src/service.ts'
 import { trustPolicyOf } from '../src/trust.ts'
 import type { LiaisonPaths } from '../src/paths.ts'
@@ -114,6 +117,29 @@ describe('HTTP-over-UDS server', () => {
     assert.equal(verified.verification, 'proven')
   })
 
+  it('serves contiguous events and interaction lists through the socket', async () => {
+    remote.page = {
+      cursor: 2,
+      hasMore: false,
+      events: [
+        { type: 'fixture/event', seq: 0, time: 0, data: {} },
+        { type: 'fixture/event', seq: 1, time: 1, data: {} },
+        { type: 'fixture/event', seq: 2, time: 2, data: {} },
+      ],
+    }
+    const events = await sendCommand(paths.socketPath, '/events', { delegationId: 'd1' }) as {
+      events: { seq: number }[]
+      throughSeq: number
+      subagentCatalog: unknown[]
+    }
+    assert.deepEqual(events.events.map(event => event.seq), [0, 1, 2])
+    assert.equal(events.throughSeq, 2)
+    assert.deepEqual(events.subagentCatalog, [])
+
+    const listed = await sendCommand(paths.socketPath, '/interactions/list', { delegationId: 'd1' }) as { interactions: unknown[] }
+    assert.deepEqual(listed.interactions, [])
+  })
+
   it('maps validation and unknown-route failures to structured documents', async () => {
     await assert.rejects(
       sendCommand(paths.socketPath, '/prompts', {}),
@@ -160,8 +186,23 @@ class StubRemote implements DshRemote {
   async prompt(_sessionId: string, requestId: string): Promise<void> {
     this.prompts.push(requestId)
   }
-  async readEvents(): Promise<RemoteEventPage> {
+  async readEventPage(_sessionId: string, _request: RemoteEventPageRequest): Promise<RemoteEventPage> {
     return this.page
+  }
+  async readState(): Promise<RemoteSessionState> {
+    return { cursor: 0, active: true, running: false, queue: [], pendingInput: [] }
+  }
+  async wait(_sessionId: string, _request: RemoteWaitRequest): Promise<never> {
+    throw new Error('wait is not used by this fixture')
+  }
+  async readProjections(): Promise<RemoteProjections> {
+    return { kind: 'sequenced', asOfSeq: 0, values: { subagentCatalog: [] } }
+  }
+  async updateQueue(_sessionId: string, _itemId: string, _action: RemoteQueueAction): Promise<void> {}
+  async cancel(): Promise<void> {}
+  async unarchiveSession(): Promise<void> {}
+  async answerUserQuestion(): Promise<boolean> {
+    return true
   }
   async dispose(): Promise<void> {}
 }

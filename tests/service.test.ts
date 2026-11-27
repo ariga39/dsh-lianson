@@ -7,7 +7,9 @@ import type { SessionRequestId, SessionWireEvent } from '@deepseek-ai/dsh-api-se
 import type { SessionEventMap } from '@deepseek-ai/dsh-session/types'
 import { LiaisonError } from '../src/errors.ts'
 import { Ledger } from '../src/ledger.ts'
-import type { DshRemote, RemoteEventPage, RemoteModelCatalog } from '../src/remote.ts'
+import type {
+  DshRemote, RemoteEventPage, RemoteEventPageRequest, RemoteModelCatalog, RemoteProjections, RemoteSessionState,
+} from '../src/remote.ts'
 import { DelegationService } from '../src/service.ts'
 import { trustPolicyOf } from '../src/trust.ts'
 import { makeTestRoot, removeTestRoot } from './support.ts'
@@ -535,8 +537,30 @@ class FakeRemote implements DshRemote {
     this.onBeforePrompt?.()
   }
 
-  async readEvents(): Promise<RemoteEventPage> {
+  async readEventPage(_sessionId: string, _request: RemoteEventPageRequest): Promise<RemoteEventPage> {
     return this.page
+  }
+
+  async readState(): Promise<RemoteSessionState> {
+    return { cursor: this.cursor, active: true, running: false, queue: [], pendingInput: [] }
+  }
+
+  async wait(): Promise<never> {
+    throw new Error('wait is not used by this fixture')
+  }
+
+  async readProjections(): Promise<RemoteProjections> {
+    return { kind: 'sequenced', asOfSeq: this.cursor, values: { subagentCatalog: [] } }
+  }
+
+  async updateQueue(): Promise<void> {}
+
+  async cancel(): Promise<void> {}
+
+  async unarchiveSession(): Promise<void> {}
+
+  async answerUserQuestion(): Promise<boolean> {
+    return true
   }
 
   async dispose(): Promise<void> {}

@@ -6,7 +6,12 @@ import { asLiaisonError, LiaisonError, redact } from './errors.ts'
 import type { Ledger } from './ledger.ts'
 import type { LoopbackStatus, RemoteSource } from './remote.ts'
 import type { LiaisonPaths } from './paths.ts'
-import { ROUTES, createRequestSchema, getRequestSchema, listRequestSchema, promptRequestSchema, statusRequestSchema, verifyModelRequestSchema } from './protocol.ts'
+import {
+  ROUTES, createRequestSchema, eventsRequestSchema, getRequestSchema, interactionAnswerRequestSchema,
+  interactionApproveRequestSchema, interactionListRequestSchema, interactionRejectRequestSchema,
+  listRequestSchema, promptRequestSchema, queueRequestSchema, reworkRequestSchema, statusRequestSchema,
+  steerRequestSchema, stopRequestSchema, verifyModelRequestSchema, waitRequestSchema,
+} from './protocol.ts'
 import type { ServerEnvelope } from './protocol.ts'
 import type { DelegationService } from './service.ts'
 import { UdsServer } from './uds-server.ts'
@@ -102,6 +107,56 @@ export class LiaisonServer {
         const input = verifyModelRequestSchema.parse(body)
         return { ok: true, value: await this.options.service.verifyModel(input) }
       }
+      case ROUTES.wait: {
+        const input = waitRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.wait(input) }
+      }
+      case ROUTES.events: {
+        const input = eventsRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.events(input) }
+      }
+      case ROUTES.steer: {
+        const input = steerRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.steer(input) }
+      }
+      case ROUTES.queue: {
+        const input = queueRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.queue(input) }
+      }
+      case ROUTES.stop: {
+        const input = stopRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.stop(input) }
+      }
+      case ROUTES.rework: {
+        const input = reworkRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.rework(input) }
+      }
+      case ROUTES.interactionList: {
+        const input = interactionListRequestSchema.parse(body)
+        return { ok: true, value: await this.options.service.interactionList(input) }
+      }
+      case ROUTES.interactionApprove: {
+        const input = interactionApproveRequestSchema.parse(body)
+        return { ok: true, value: this.options.service.interactionApprove(input.interactionId) }
+      }
+      case ROUTES.interactionReject: {
+        const input = interactionRejectRequestSchema.parse(body)
+        return { ok: true, value: this.options.service.interactionReject(input.interactionId) }
+      }
+      case ROUTES.interactionAnswer: {
+        const input = interactionAnswerRequestSchema.parse(body)
+        return {
+          ok: true,
+          value: await this.options.service.interactionAnswer({
+            ...input,
+            answers: input.answers.map(answer => ({
+              id: answer.id,
+              selected: answer.selected,
+              ...(answer.custom === undefined ? {} : { custom: answer.custom }),
+            })),
+          }),
+        }
+      }
       default:
         throw new LiaisonError('usage', `unknown route ${pathname}`)
     }
@@ -131,6 +186,7 @@ function statusOf(code: string): number {
     case 'usage':
     case 'invalid-cwd':
     case 'unsafe-cwd':
+    case 'events/bad-range':
       return 400
     case 'not-found':
       return 404

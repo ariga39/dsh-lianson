@@ -201,6 +201,9 @@ importers:
       '@deepseek-ai/dsh-api-gateway':
         specifier: link:./deepseek-harness/packages/api/gateway
         version: link:deepseek-harness/packages/api/gateway
+      '@deepseek-ai/dsh-api-remotes':
+        specifier: link:./deepseek-harness/packages/api/remotes
+        version: link:deepseek-harness/packages/api/remotes
       '@deepseek-ai/dsh-api-session-controller':
         specifier: link:./deepseek-harness/packages/api/session-controller
         version: link:deepseek-harness/packages/api/session-controller
@@ -219,6 +222,9 @@ importers:
       '@deepseek-ai/dsh-host-webserver':
         specifier: link:./deepseek-harness/packages/host/webserver
         version: link:deepseek-harness/packages/host/webserver
+      '@deepseek-ai/dsh-llm':
+        specifier: link:./deepseek-harness/packages/llm/llm
+        version: link:deepseek-harness/packages/llm/llm
       '@deepseek-ai/dsh-sandbox':
         specifier: link:./deepseek-harness/packages/sandbox/sandbox
         version: link:deepseek-harness/packages/sandbox/sandbox
@@ -237,6 +243,12 @@ importers:
       '@deepseek-ai/dsh-typert-registry':
         specifier: link:./deepseek-harness/packages/typert/registry
         version: link:deepseek-harness/packages/typert/registry
+      '@deepseek-ai/dsh-user-approval':
+        specifier: link:./deepseek-harness/packages/interaction/user-approval
+        version: link:deepseek-harness/packages/interaction/user-approval
+      '@deepseek-ai/dsh-user-questions':
+        specifier: link:./deepseek-harness/packages/interaction/user-questions
+        version: link:deepseek-harness/packages/interaction/user-questions
       '@deepseek-ai/node-addon-system':
         specifier: link:./deepseek-harness/native/system/packages/entry
         version: link:deepseek-harness/native/system/packages/entry

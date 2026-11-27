@@ -94,6 +94,11 @@ function codeOf(code: string): LiaisonError['code'] {
     case 'unsafe-runtime-dir':
     case 'ledger':
     case 'protocol':
+    case 'events/sequence-gap':
+    case 'events/pagination-stalled':
+    case 'events/cursor-moved':
+    case 'events/page-contract':
+    case 'events/bad-range':
     case 'internal':
       return code
     default:

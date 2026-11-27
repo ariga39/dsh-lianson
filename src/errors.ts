@@ -14,6 +14,11 @@ export type LiaisonErrorCode =
   | 'unsafe-runtime-dir'
   | 'ledger'
   | 'protocol'
+  | 'events/sequence-gap'
+  | 'events/pagination-stalled'
+  | 'events/cursor-moved'
+  | 'events/page-contract'
+  | 'events/bad-range'
   | 'internal'
 
 /** One failure with a stable code and optional structured details. */

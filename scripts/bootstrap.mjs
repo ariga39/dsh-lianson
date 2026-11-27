@@ -19,16 +19,21 @@ const upstreamRoot = join(projectRoot, 'deepseek-harness')
 const REQUIRED = [
   ['cordis', 'vendor/cordis/lib/index.js'],
   ['api gateway client', 'packages/api/gateway/lib/client.node.js'],
+  ['api remotes client', 'packages/api/remotes/lib/client.js'],
   ['session controller', 'packages/api/session-controller/lib/typert.remote-client.js'],
   ['workspace controller', 'packages/api/workspace-controller/lib/typert.remote-client.js'],
   ['home paths', 'packages/util/home-paths/lib/index.js'],
   ['host webserver', 'packages/host/webserver/lib/index.js'],
+  ['llm', 'packages/llm/llm/lib/index.js'],
   ['sandbox', 'packages/sandbox/sandbox/lib/index.js'],
   ['sandbox policy', 'packages/sandbox/sandbox-policy/lib/index.js'],
   ['session', 'packages/core/session/lib/index.js'],
   ['session title', 'packages/session/session-title/lib/index.js'],
   ['typert protocol', 'packages/typert/protocol/lib/index.js'],
   ['typert registry', 'packages/typert/registry/lib/index.js'],
+  ['user approval', 'packages/interaction/user-approval/lib/index.js'],
+  ['user questions', 'packages/interaction/user-questions/lib/index.js'],
+  ['user questions remote', 'packages/interaction/user-questions/lib/typert.remote-client.js'],
   ['flock entry', 'native/system/packages/entry/lib/flock.js'],
 ]
 
