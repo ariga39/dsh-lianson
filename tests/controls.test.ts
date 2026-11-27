@@ -150,6 +150,34 @@ describe('session controls and observation', () => {
     assert.deepEqual(result.output.records.map(record => record.event.seq), [9])
   })
 
+  it('halves only the first wait window so a short deadline still observes state', async () => {
+    remote.waits = [
+      {
+        reason: 'timeout',
+        state: { cursor: 6, active: true, running: true, queue: [], pendingInput: [] },
+        output: output([]),
+      },
+      {
+        reason: 'timeout',
+        state: { cursor: 7, active: true, running: true, queue: [], pendingInput: [] },
+        output: output([]),
+      },
+      { reason: 'idle', state: { ...idle, cursor: 9 }, output: output([]) },
+    ]
+    remote.projections = { kind: 'sequenced', asOfSeq: 9, values: { subagentCatalog: [] } }
+    const scripted = remote.wait.bind(remote)
+    remote.wait = async (sessionId, request) => {
+      // The Host consumes the requested window plus snapshot and transport work.
+      clock += 100
+      return scripted(sessionId, request)
+    }
+
+    const result = await service.wait({ delegationId: 'd1', timeoutMs: 2_000 })
+    assert.deepEqual(remote.waitCalls.map(call => call.timeoutMs), [1_000, 1_900, 1_800])
+    assert.equal(result.status, 'completed')
+    assert.equal(result.slices, 3)
+  })
+
   it('reports input-required without claiming the turn completed', async () => {
     remote.waits = [{
       reason: 'input-required',
