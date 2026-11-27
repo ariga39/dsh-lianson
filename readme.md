@@ -14,7 +14,10 @@ Node 24 and the pinned `deepseek-harness/` checkout (`4b399c39a6d1479cd84ca591b4
 corepack pnpm install
 corepack pnpm run bootstrap   # asserts the pin and links the public @deepseek-ai packages
 corepack pnpm run verify      # typecheck, lint, fast node:test unit suite
+corepack pnpm run test:integration  # real dsh web + Playwright, kept out of the fast loop
 ```
+
+See the [operator runbook](docs/runbook.md) for persistent installation, delegation, Web observation, and rework.
 
 `bootstrap` builds only ignored upstream `lib/` artifacts when they are missing. Tracked files in `deepseek-harness/` are never changed.
 

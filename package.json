@@ -22,7 +22,8 @@
     "verify": "corepack pnpm run typecheck && corepack pnpm run lint && corepack pnpm run test:unit",
     "typecheck": "tsc --noEmit",
     "lint": "oxlint --type-aware --config .oxlintrc.json src tests scripts",
-    "test:unit": "node --test tests/*.test.ts"
+    "test:unit": "node --test tests/*.test.ts",
+    "test:integration": "node --test --test-concurrency=1 tests/integration/*.test.mjs"
   },
   "dependencies": {
     "commander": "15.0.0",

@@ -46,7 +46,7 @@ describe('HTTP-over-UDS server', () => {
       ledger,
       remote: {
         status: () => ({ state: 'connected', origin: remote.origin }),
-        requireRemote: () => remote,
+        requireRemote: async () => remote,
         dispose: async () => {},
       },
       trust: trustPolicyOf(paths, undefined),
@@ -59,7 +59,7 @@ describe('HTTP-over-UDS server', () => {
       service,
       remote: {
         status: () => ({ state: 'connected', origin: remote.origin }),
-        requireRemote: () => remote,
+        requireRemote: async () => remote,
         dispose: async () => {},
       },
       origin: () => remote.origin,
