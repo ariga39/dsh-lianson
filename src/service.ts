@@ -418,14 +418,22 @@ export class DelegationService {
     }
     if (expired()) return timeoutResult()
 
+    let firstWindow = true
     for (;;) {
       const remaining = deadline - this.clock()
       if (remaining <= 0 || budget.aborted) break
+      // The Host returns a wait's state only after its timeout plus snapshot and
+      // transport work. Halve the first window so a short command deadline still
+      // leaves room for at least one observation; later windows use the normal cap.
+      const windowCap = firstWindow
+        ? Math.max(1, Math.min(sliceTimeoutMs, Math.floor(remaining / 2)))
+        : sliceTimeoutMs
+      firstWindow = false
       let value: SessionWaitValue
       try {
         value = await withinBudget(remote.wait(delegation.sessionId, {
           afterSeq: cursor,
-          timeoutMs: Math.max(1, Math.min(sliceTimeoutMs, remaining)),
+          timeoutMs: Math.max(1, Math.min(windowCap, remaining)),
           maxMessages,
         }), budget)
       } catch (error) {
