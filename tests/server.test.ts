@@ -105,7 +105,7 @@ describe('HTTP-over-UDS server', () => {
       { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
       { type: 'user/message', seq: 3, time: 3, data: { source: { rpcId: 'request-1' } } },
       { type: 'request/header', seq: 5, time: 5, data: { header: { config: { provider: 'fixture', model: 'model-a' } } } },
-      { type: 'assistant/attempt', seq: 6, time: 6, data: { turn: 1, step: 1, stream: [{ type: 'text-chunks', time0: 6, index: 0, dt: [], texts: ['ok'] }] } },
+      { type: 'assistant/message', seq: 6, time: 6, data: { turn: 1, step: 1, message: { id: 'assistant-6', role: 'assistant', content: [{ type: 'text', text: 'ok' }], source: { kind: 'model', provider: 'fixture', model: 'model-a' } }, stream: [] } },
       { type: 'turn/end', seq: 7, time: 7, data: { turn: 1, reason: { kind: 'completed' } } },
     ] }
     const verified = await sendCommand(paths.socketPath, '/verify-model', {

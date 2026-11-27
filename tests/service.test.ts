@@ -348,14 +348,14 @@ describe('delegation service', () => {
 
 
 
-  it('does not treat an empty assistant attempt as execution evidence', async () => {
+  it('does not treat a terminal-only failed attempt as model output', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
     remote.page = { cursor: 5, events: [
       turnStart(1, 1),
       userMessage(2, 'request-1'),
       header(3, 'model-a'),
-      event('assistant/attempt', 4, { turn: 1, step: 1, stream: [] }),
+      adapterlessAttempt(4, 1),
       turnEnd(5, 1),
     ] }
     const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
@@ -581,10 +581,32 @@ function header(seq: number, model: string): SessionWireEvent {
 }
 
 function assistant(seq: number, turn: number): SessionWireEvent {
+  return event('assistant/message', seq, {
+    turn,
+    step: 1,
+    message: {
+      id: brandString<SessionEventMap['assistant/message']['message']['id']>(`assistant-${String(seq)}`),
+      role: 'assistant',
+      content: [{ type: 'text', text: 'output' }],
+      source: { kind: 'model', provider: 'fixture', model: 'model-a' },
+    },
+    stream: [],
+  })
+}
+
+/** The exact pinned-source shape for a NO_ADAPTER failure: one terminal finish/error chunk. */
+function adapterlessAttempt(seq: number, turn: number): SessionWireEvent {
   return event('assistant/attempt', seq, {
     turn,
     step: 1,
-    stream: [{ type: 'text-chunks', time0: seq, index: 0, dt: [], texts: ['output'] }],
+    stream: [{
+      type: 'chunk',
+      time: seq,
+      chunk: {
+        type: 'finish',
+        reason: { kind: 'error', failure: { message: 'no adapter registered', code: 'NO_ADAPTER' } },
+      },
+    }],
   })
 }
 

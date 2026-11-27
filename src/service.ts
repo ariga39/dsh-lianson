@@ -423,7 +423,8 @@ function headerChoiceFor(
 ): HeaderChoice | undefined {
   const step = hasAnchorUser ? stepContaining(events, turn, anchor) : undefined
   const upperBound = step?.endSeq ?? turn.endSeq
-  const execution = events.find(event => hasAssistantOutput(event)
+  const execution = events.find(event => event.type === 'assistant/message'
+    && hasAssistantContent(event.data)
     && event.seq > anchor
     && numberField(recordField(event.data, 'turn')) === turn.turn
     && (step === undefined || numberField(recordField(event.data, 'step')) === step.step)
@@ -458,17 +459,12 @@ function stepContaining(
 }
 
 /**
- * Whether an assistant event carries actual model output. `assistant/attempt`
- * settles failed attempts too, including an adapter-less preparation failure
- * whose stream is empty; only a non-empty stream is execution evidence. A
- * committed `assistant/message` proves output through its content or stream.
+ * Whether a committed assistant message carries actual model-produced
+ * content. Failed attempts settle as `assistant/attempt`; even a terminal
+ * finish/error chunk there is not output, so partial turns stay indeterminate.
  */
-function hasAssistantOutput(event: SessionWireEvent): boolean {
-  if (event.type !== 'assistant/message' && event.type !== 'assistant/attempt') return false
-  const stream = recordField(event.data, 'stream')
-  if (Array.isArray(stream) && stream.length > 0) return true
-  if (event.type !== 'assistant/message') return false
-  const content = recordField(recordField(event.data, 'message'), 'content')
+function hasAssistantContent(data: unknown): boolean {
+  const content = recordField(recordField(data, 'message'), 'content')
   return Array.isArray(content) && content.length > 0
 }
 
