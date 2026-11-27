@@ -229,7 +229,7 @@ export class Ledger {
         VALUES (?, ?, ?, ?, ?)
       `).run(receipt.delegationId, receipt.requestId, receipt.beforeCursor, receipt.promptHash, receipt.createdAt)
     } catch (error) {
-      throw conflictFromSqlite(error, `prompt receipt ${receipt.delegationId}/${receipt.requestId} already exists`)
+      throw conflictFromSqlite(error, `prompt receipt ${receipt.delegationId}/${receipt.requestId} cannot be inserted`)
     }
   }
 
