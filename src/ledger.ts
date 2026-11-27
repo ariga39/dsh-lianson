@@ -229,7 +229,7 @@ export class Ledger {
         VALUES (?, ?, ?, ?, ?)
       `).run(receipt.delegationId, receipt.requestId, receipt.beforeCursor, receipt.promptHash, receipt.createdAt)
     } catch (error) {
-      throw conflictFromSqlite(error, `prompt receipt ${receipt.delegationId}/${receipt.requestId} already exists`)
+      throw conflictFromSqlite(error, `prompt receipt ${receipt.delegationId}/${receipt.requestId} cannot be inserted`)
     }
   }
 
@@ -279,9 +279,12 @@ function receiptFromRow(row: ReceiptRow): PromptReceipt {
   }
 }
 
+/** SQLite primary result code for any constraint violation (`sqlite3.h`). */
+const SQLITE_CONSTRAINT = 19
+
 function conflictFromSqlite(error: unknown, message: string): LiaisonError {
-  const code = (error as { code?: unknown } | null)?.code
-  if (typeof code === 'string' && (code.startsWith('ERR_SQLITE_ERROR') || code === 'SQLITE_CONSTRAINT')) {
+  const errcode = (error as { errcode?: unknown } | null)?.errcode
+  if (typeof errcode === 'number' && (errcode & 0xff) === SQLITE_CONSTRAINT) {
     return new LiaisonError('conflict', message)
   }
   return new LiaisonError('ledger', `${message}: ${error instanceof Error ? error.message : String(error)}`)
