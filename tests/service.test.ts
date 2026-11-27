@@ -246,22 +246,24 @@ describe('delegation service', () => {
   it('attributes a header to the requested turn instead of a later turn', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
-    remote.page = { cursor: 8, events: [
+    remote.page = { cursor: 10, events: [
       turnStart(1, 1),
       userMessage(2, 'request-1'),
       header(3, 'model-a'),
-      turnEnd(4, 1),
-      turnStart(5, 2),
-      userMessage(6, 'request-2'),
-      header(7, 'model-b'),
-      turnEnd(8, 2),
+      assistant(4, 1),
+      turnEnd(5, 1),
+      turnStart(6, 2),
+      userMessage(7, 'request-2'),
+      header(8, 'model-b'),
+      assistant(9, 2),
+      turnEnd(10, 2),
     ] }
     const first = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
     assert.equal(first.verification, 'proven')
     assert.deepEqual(first.observed, { provider: 'fixture', model: 'model-a' })
     assert.deepEqual(first.evidence, {
-      turn: 1, turnStartSeq: 1, turnEndSeq: 4, userSeq: 2, headerSeq: 3,
-      headerSource: 'turn', inherited: false,
+      turn: 1, turnStartSeq: 1, turnEndSeq: 5, userSeq: 2, headerSeq: 3,
+      headerSource: 'turn', inherited: false, executionSeq: 4,
     })
     assert.equal(ledger.findDelegation('d1')?.modelVerification, 'proven')
 
@@ -345,6 +347,22 @@ describe('delegation service', () => {
   })
 
 
+
+  it('treats a direct header without settlement as indeterminate', async () => {
+    await mkdir(project, { recursive: true })
+    await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
+    remote.page = { cursor: 4, events: [
+      turnStart(1, 1),
+      userMessage(2, 'request-1'),
+      header(3, 'model-a'),
+      turnEnd(4, 1),
+    ] }
+    const result = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
+    assert.equal(result.verification, 'indeterminate')
+    assert.deepEqual(result.observed, { provider: 'fixture', model: 'model-a' })
+    assert.equal(result.evidence?.executionSeq, undefined)
+  })
+
   it('does not let a later step in the same turn prove an earlier prompt', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
@@ -366,11 +384,12 @@ describe('delegation service', () => {
   it('reports a mismatch and indeterminate cases truthfully', async () => {
     await mkdir(project, { recursive: true })
     await service.create({ delegationId: 'd1', cwd: project, title: 'Task one', model: 'fixture/model-a' })
-    remote.page = { cursor: 4, events: [
+    remote.page = { cursor: 5, events: [
       turnStart(1, 1),
       userMessage(2, 'request-1'),
       header(3, 'model-b'),
-      turnEnd(4, 1),
+      assistant(4, 1),
+      turnEnd(5, 1),
     ] }
     const mismatch = await service.verifyModel({ delegationId: 'd1', requestId: 'request-1' })
     assert.equal(mismatch.verification, 'mismatch')

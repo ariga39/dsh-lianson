@@ -101,11 +101,12 @@ describe('HTTP-over-UDS server', () => {
     assert.equal(prompted.beforeCursor, 5)
     assert.equal(remote.prompts.length, 1)
 
-    remote.page = { cursor: 6, events: [
+    remote.page = { cursor: 7, events: [
       { type: 'turn/start', seq: 1, time: 1, data: { turn: 1 } },
       { type: 'user/message', seq: 3, time: 3, data: { source: { rpcId: 'request-1' } } },
       { type: 'request/header', seq: 5, time: 5, data: { header: { config: { provider: 'fixture', model: 'model-a' } } } },
-      { type: 'turn/end', seq: 6, time: 6, data: { turn: 1, reason: { kind: 'completed' } } },
+      { type: 'assistant/attempt', seq: 6, time: 6, data: { turn: 1, step: 1, stream: [] } },
+      { type: 'turn/end', seq: 7, time: 7, data: { turn: 1, reason: { kind: 'completed' } } },
     ] }
     const verified = await sendCommand(paths.socketPath, '/verify-model', {
       delegationId: 'd1', requestId: 'request-1',

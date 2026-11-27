@@ -303,10 +303,10 @@ export class DelegationService {
       inherited: choice.header.seq < inheritedCut,
       ...(choice.execution === undefined ? {} : { executionSeq: choice.execution.seq }),
     }
-    // A carried header predates the target turn, and an inherited header was
-    // executed in the parent Session; both need an assistant settlement in
-    // this target step before the configuration proves anything here.
-    if ((choice.source === 'carried' || choice.header.seq < inheritedCut) && choice.execution === undefined) {
+    // A persisted header alone is not execution evidence: a request can be
+    // cancelled or fail before dispatch. Every source (direct, carried, or
+    // inherited) needs an assistant settlement in this target step.
+    if (choice.execution === undefined) {
       return this.finishVerification(delegation, input.requestId ?? null, 'indeterminate', expected, observed, evidence)
     }
     if (observed === null || expected === null) {
