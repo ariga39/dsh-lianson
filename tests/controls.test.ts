@@ -442,6 +442,39 @@ describe('session controls and observation', () => {
     assert.deepEqual(remote.cancelled, [])
   })
 
+  it('preserves an early state-read failure as unknown without claiming budget expiry', async () => {
+    remote.readState = async () => {
+      throw new Error('state read failed')
+    }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 100 })
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.stopped, false)
+    assert.equal(result.quiescent, null)
+    assert.equal(result.budgetExpired, false)
+    assert.equal(result.state, null)
+    assert.deepEqual(result.errors, ['state read failed'])
+    assert.deepEqual(remote.queueCalls, [])
+    assert.deepEqual(remote.cancelled, [])
+  })
+
+  it('preserves a post-cancel state-read failure as unknown without claiming budget expiry', async () => {
+    const running: RemoteSessionState = { ...idle, cursor: 11, running: true }
+    let reads = 0
+    remote.readState = async () => {
+      reads += 1
+      if (reads === 1) return running
+      throw new Error('state read failed after cancel')
+    }
+    const result = await service.stop({ delegationId: 'd1', timeoutMs: 100 })
+    assert.equal(result.outcome, 'unknown')
+    assert.equal(result.stopped, false)
+    assert.equal(result.quiescent, null)
+    assert.equal(result.budgetExpired, false)
+    assert.equal(result.cancelled, true)
+    assert.deepEqual(remote.cancelled, ['session-fixed'])
+    assert.deepEqual(result.errors, ['state read failed after cancel'])
+  })
+
   it('does not start another queue mutation after expiry during an update', async () => {
     const queued: RemoteSessionState = {
       ...idle,
